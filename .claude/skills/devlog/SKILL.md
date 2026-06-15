@@ -1,46 +1,52 @@
 ---
 name: devlog
-description: Scaffold a new devlog entry in docs/devlog/ for a script or design decision. Use when the user asks to write up, document, or log a devlog entry for something just built or decided.
+description: Create or update the per-script documentation file in docs/scripts/ for a script. Use when the user asks to write up, document, or log a script that was just created or changed.
 ---
 
-# Devlog entry skill
+# Script documentation skill
 
-Creates a new numbered devlog entry in `docs/devlog/`, following the format
-established in `docs/devlog/00-intro.md`.
+Maintains one documentation file per script in `docs/scripts/`, explaining what the
+script does and why it's built that way — meant as a reference for when the script
+needs to change later.
 
 ## Steps
 
-1. List existing files in `docs/devlog/` and find the highest-numbered entry
-   (e.g. `00-intro.md`, `01-foo.md` → next number is `02`).
-2. Slugify the title argument (lowercase, spaces → hyphens, strip punctuation) to build
-   the filename: `docs/devlog/NN-<slug>.md` (zero-padded two-digit number).
-3. Create the file with this structure, using today's date and filling in each section
-   based on the conversation context about what was just built/decided. Do not leave
-   placeholder text — write real content. If something genuinely isn't applicable
-   (e.g. no real alternatives were considered), say so briefly rather than omitting the
-   section.
+1. Determine the script name (e.g. `controller` for `src/controller.js`).
+2. Check if `docs/scripts/<script-name>.md` already exists.
+   - If it doesn't exist, create it using the structure below.
+   - If it exists, update it in place to reflect the current state of the script —
+     rewrite the relevant sections rather than appending a changelog.
+3. File structure:
 
 ```markdown
-# Devlog NN — <Title>
+# <script-name>
 
-**Date:** <YYYY-MM-DD>
+**Location:** `src/<path>`
 
-## Why
+## What it does
 
-<What problem or need this addresses — what prompted this script/decision.>
-
-## What
-
-<What was built: script name(s), location under src/, what it does.>
+<Plain description of the script's purpose and behavior.>
 
 ## How it works
 
-<Brief walkthrough of the logic/approach.>
+<Walkthrough of the logic/approach.>
+
+## Why it's built this way
+
+<Key design decisions and the reasoning behind them.>
 
 ## Alternatives considered
 
-<Other approaches considered and why this one was chosen instead.>
+<Other approaches considered and why this one was chosen instead. If none were
+seriously considered, say so briefly.>
 ```
 
-4. After creating the file, tell the user the filename and give a one-line summary of
-   what was recorded.
+4. Fill in each section with real content based on the conversation context about the
+   script — do not leave placeholder text.
+5. After creating or updating the file, tell the user the filename and a one-line
+   summary of what was recorded or changed.
+
+## Note
+
+`docs/devlog/` is a separate, chronological log of overall project decisions (see
+`docs/devlog/00-intro.md`) and is not affected by this skill.

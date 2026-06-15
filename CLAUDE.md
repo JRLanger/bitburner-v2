@@ -20,6 +20,11 @@ That project grew organically and became hard to follow.
 ## Documentation goal
 
 Document the process as we go: the logic behind each script, how it works, and why
-design decisions were made. For each meaningful script or decision, create a devlog
-entry in `docs/devlog/` using the `/devlog <short title>` skill — see
-`docs/devlog/00-intro.md` for the established format.
+design decisions were made.
+
+- For each script, maintain a per-script doc in `docs/scripts/<script-name>.md`
+  covering what it does, how it works, why it's built that way, and alternatives
+  considered — use the `/devlog` skill to create or update these. This is the primary
+  reference when a script needs to change later.
+- `docs/devlog/` is a separate, chronological log of overall project decisions — see
+  `docs/devlog/00-intro.md` for its format.
