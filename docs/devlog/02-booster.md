@@ -168,6 +168,9 @@ batch, or we'll badly over-commit. This is the central constraint for the
 | `SEC_MARGIN` | 0.05 | "prepped" if security ≤ minSecurity × (1 + this), i.e. within 5% above minimum |
 | `MONEY_EPSILON` | 0.01 | "prepped" if money within 1% of max |
 | grid step | 0.01 | hack-% table resolution |
+| `D_GAP` | 200 ms | gap between consecutive HWGW landings (to tune in-game later) |
+| `BATCH_PERIOD` | `4 × D_GAP` (800 ms) | interval between batch launches into the pipeline |
+| `HOME_RESERVE` | (TBD) | RAM kept free on `home` for `booster` (8.2 GB) + managers |
 
 ## Validation plan
 
@@ -202,6 +205,121 @@ drain / raise-security) so no manual setup is needed.
    server is at/near max money. (This is why the validation tool raises
    security via hack, not grow.)
 
+## Worker scripts
+
+Three single-shot workers live in `src/workers/` (in-game `/workers/hack.js`,
+`/workers/grow.js`, `/workers/weaken.js`). `booster`'s startup prerequisite
+check looks for these three paths and exits with a terminal error if any is
+missing.
+
+**Arg contract (all three identical):**
+
+| Arg | Meaning |
+|-----|---------|
+| `[0] target` | hostname to act on |
+| `[1] delay` | additional ms the **engine** waits before the op lands, passed as `{ additionalMsec: delay }`. Aligns batch landing order. |
+| `[2] batchId` | throwaway disambiguator so otherwise-identical concurrent workers are distinguishable to `ps`/`kill`. Not read by the worker. |
+
+**RAM (load-bearing — every batch's cost is built from these):**
+
+| Worker | RAM | = base + op |
+|--------|-----|-------------|
+| `hack.js` | 1.70 GB | 1.60 + 0.10 |
+| `grow.js` | 1.75 GB | 1.60 + 0.15 |
+| `weaken.js` | 1.75 GB | 1.60 + 0.15 |
+
+Workers are kept deliberately minimal — **no logging, no port writes** — because
+any extra NS call raises the per-thread cost and bloats every batch. The
+`additionalMsec` delay and arg parsing are free.
+
+**Why `additionalMsec` instead of `ns.sleep`:** the engine handles the wait
+internally, landing the op far more precisely than a JS `sleep` (which is
+subject to event-loop jitter — exactly what desyncs batches). Side effect: a
+worker's total runtime is `opTime + delay`, which the scheduler accounts for
+when reasoning about when a worker frees its RAM.
+
+**Why single-shot:** a worker does exactly one op and exits, so RAM is freed
+the moment its operation lands. This is what makes precise pipelined batch
+timing possible (vs. a persistent looping worker that holds RAM indefinitely).
+
+## HWGW scheduler
+
+### Timing model
+
+Times come from `getHackTime` / `getGrowTime` / `getWeakenTime` per target
+(in budget, 0.05 GB each; recomputed each tick so they track hacking-level
+changes). The four ops of a batch are launched **simultaneously** but given
+different `additionalMsec` delays so they **land** in staggered order, `D_GAP`
+apart, with W1 landing at the natural `weakenTime`:
+
+```
+op   lands at            additionalMsec (= landTime − opTime)
+H    weakenTime − D      (weakenTime − D)   − hackTime
+W1   weakenTime          0
+G    weakenTime + D      (weakenTime + D)   − growTime
+W2   weakenTime + 2D     2D
+```
+
+All delays are non-negative because `weakenTime ≫ hackTime` and
+`weakenTime > growTime`. Landing order H→W1→G→W2 means: hack steals, W1 repairs
+hack's security, grow restores money, W2 repairs grow's security — leaving the
+target back at baseline (min security, max money) after each batch.
+
+### Pipelining
+
+A new batch is launched every `BATCH_PERIOD = 4 × D_GAP`, so at steady state
+landings form a continuous stream spaced `D_GAP` apart
+(…H W1 G W2 H W1 G W2…). The number of batches in flight for a target is:
+
+```
+concurrentBatches = ceil(weakenTime / BATCH_PERIOD)
+pipelineRAM(target) = concurrentBatches × ramPerBatch(chosen f)
+```
+
+**This `pipelineRAM` — not a single batch — is what allocation checks against
+the RAM pool.** (The earlier "pipeline RAM, not single-batch RAM" caveat.)
+
+`booster`'s main loop wakes roughly every `BATCH_PERIOD`; on each wake it
+launches the next batch for each active target whose pipeline has a free slot
+and whose `pipelineRAM` still fits. Launch-time jitter only shifts which
+`BATCH_PERIOD` window a batch starts in — landing precision is handled by
+`additionalMsec`, so coarse loop timing is fine.
+
+### Thread splitting across servers
+
+Early servers are too small to hold a whole batch, so each op's threads are
+spread across the RAM pool (`home` + rooted servers, minus `HOME_RESERVE`):
+
+- **Weaken and grow** split freely — their effect is additive across threads
+  and across separate `exec` calls.
+- **Hack also splits** — total stolen = `threads × per-thread fraction`,
+  additive across `exec` calls **provided every hack split shares the same
+  `additionalMsec`** so they all act on the same money snapshot. They must land
+  together.
+- Each split `exec` is a distinct worker instance, so `batchId` must be unique
+  per instance (e.g. `${batchSeq}-${op}-${hostIndex}`) for clean `ps`/`kill`
+  accounting.
+
+### Desync self-heal
+
+Pre-Formulas timing isn't perfect, so batches will occasionally land out of
+order and leave a target off-baseline. Each tick, for every batching target:
+
+1. If money < `maxMoney × (1 − MONEY_EPSILON)` or security >
+   `minSecurity × (1 + SEC_MARGIN)`, the target has **drifted**.
+2. Stop launching new batches for it; let in-flight batches drain.
+3. Fire prep (weaken to min, then grow to max) until it's back at baseline.
+4. Resume batching.
+
+Simpler and more robust than trying to make timing perfect.
+
+### Leftover RAM → prep the pipeline
+
+Any RAM not consumed by active batch pipelines goes to prepping the next-best
+unprepped target (weaken/grow), so a queue of future good targets is always
+being readied. "Lower the hack %" step-down (see Allocation) applies only to
+the single marginal target at the bottom of the RAM pool.
+
 ## Alternatives considered
 
 - **Separate scanner script** (own file, exec'd on a timer): rejected for the
@@ -215,3 +333,13 @@ drain / raise-security) so no manual setup is needed.
 - **Single optimal `f` via ternary search** instead of a full 1–99% table:
   rejected — a table gives the same optimum *plus* the RAM-constrained
   step-down fallback in one structure, for negligible extra (free) compute.
+- **Persistent looping workers** instead of single-shot: rejected — they hold
+  RAM indefinitely and can't free it precisely as each op lands, which breaks
+  pipelined batch timing.
+- **`ns.sleep(delay)` for batch timing** instead of `additionalMsec`:
+  rejected — JS event-loop jitter desyncs landings; the engine-side
+  `additionalMsec` lands ops precisely for the same RAM cost.
+- **Shared `utils.js` helper library** imported by every script: rejected —
+  Bitburner's import RAM tax charges the importer the full function cost of
+  *everything* in the imported file. Only pure-constant config modules (0 NS
+  calls) are safe to share; `booster` is otherwise self-contained.
