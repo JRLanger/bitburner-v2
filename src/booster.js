@@ -39,8 +39,6 @@ import {
     D_GAP,
     BATCH_PERIOD,
     BATCH_SAFETY_MS,
-    BOOSTER_LOG,
-    SUMMARY_INTERVAL_MS,
 } from "/config/constants.js";
 
 /** Worker paths that must exist on home and get copied to every rooted server. */
@@ -78,15 +76,12 @@ const activeBatching = new Set();
  */
 const batchPlan = new Map();
 
-/** Hostnames that were batching last tick (to detect START/STOP transitions). */
+/** Hostnames admitted to batching last tick — drives selectBatchers hysteresis. */
 const wasBatching = new Set();
-
-/** Timestamp of the last SUMMARY line written to the event log. */
-let lastSummary = 0;
 
 /**
  * Per-target rolling samples of money fraction and security-over-min, used only
- * for the status/log display. Raw mid-cycle reads oscillate (a hack has landed
+ * for the status display. Raw mid-cycle reads oscillate (a hack has landed
  * but its counter-grow hasn't); reporting the window's peak money / floor
  * security shows the grid-aligned baseline instead, so genuine drift is easy to
  * spot. host -> { money: number[], sec: number[] }.
@@ -106,9 +101,6 @@ export async function main(ns) {
         ns.tprint("booster does not create workers. Add them, then re-run.");
         return;
     }
-
-    // Fresh event log for this run.
-    ns.write(BOOSTER_LOG, `=== booster run ${new Date().toISOString()} ===\n`, "w");
 
     // Main control loop. Stage 3a: discover/root + prep.
     // NOTE: stage 5 will restore the Formulas.exe handoff as the loop's exit
@@ -145,8 +137,12 @@ export async function main(ns) {
         // tick so it yields the instant batch/prep demand rises. Not built yet.
 
         updateDisplayStats(batchers);
-        logEvents(ns, batchers, needsPrep, pool);
         renderStatus(ns, servers, pool, batchers, needsPrep);
+
+        // Remember this tick's admitted set for next tick's admission hysteresis.
+        wasBatching.clear();
+        for (const t of batchers) wasBatching.add(t.hostname);
+
         await ns.sleep(LOOP_SLEEP);
     }
 }
@@ -606,61 +602,9 @@ function displayHealth(t) {
     return { moneyFrac: Math.max(...h.money), secOver: Math.min(...h.sec) };
 }
 
-// ── Event logging (to BOOSTER_LOG for offline inspection) ───────────────────
-
-/**
- * Write START/STOP transitions for batching targets and a periodic SUMMARY of
- * per-target health (money % of max, security above min) and expected income.
- * Uses only already-computed data — no extra NS calls.
- */
-function logEvents(ns, eligible, needsPrep, pool) {
-    const now = Date.now();
-    const current = new Set(eligible.map((t) => t.hostname));
-
-    for (const t of eligible) {
-        if (wasBatching.has(t.hostname)) continue;
-        const conc = Math.ceil(t.weakenTime / BATCH_PERIOD);
-        const eps = expectedIncome(t);
-        logLine(
-            ns,
-            `START ${t.hostname} f=${(t.f * 100).toFixed(0)}% ` +
-            `h=${t.h} g=${t.g} w1=${t.w1} w2=${t.w2} ` +
-            `ram/batch=${ns.format.ram(t.ramPerBatch)} x${conc} ~$${ns.format.number(eps)}/s`
-        );
-    }
-    for (const host of wasBatching) {
-        if (!current.has(host)) logLine(ns, `STOP  ${host} (drifted / unprepped / out of RAM)`);
-    }
-
-    wasBatching.clear();
-    for (const host of current) wasBatching.add(host);
-
-    if (now - lastSummary >= SUMMARY_INTERVAL_MS) {
-        lastSummary = now;
-        let total = 0;
-        const parts = [];
-        for (const t of eligible) {
-            total += expectedIncome(t);
-            const { moneyFrac, secOver } = displayHealth(t);
-            parts.push(`${t.hostname}(${(moneyFrac * 100).toFixed(0)}%,+${secOver.toFixed(2)})`);
-        }
-        logLine(
-            ns,
-            `SUMMARY batching=${eligible.length} prepping=${needsPrep.length} ` +
-            `poolFree=${ns.format.ram(poolFree(pool))} ~$${ns.format.number(total)}/s :: ` +
-            parts.join(" ")
-        );
-    }
-}
-
 /** Expected income for a batching target, $/s. */
 function expectedIncome(t) {
     return (t.maxMoney * t.f * t.chance) / (BATCH_PERIOD / 1000);
-}
-
-/** Append a timestamped line to the event log. */
-function logLine(ns, line) {
-    ns.write(BOOSTER_LOG, `[${new Date().toLocaleTimeString()}] ${line}\n`, "a");
 }
 
 /** Render a refreshing status table to the tail window each tick. */

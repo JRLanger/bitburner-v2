@@ -13,8 +13,8 @@ extraction via HWGW batching:
 - **Admission control** caps how many targets batch at once so aggregate RAM
   demand never exceeds what the pool can sustain.
 
-It also writes `/data/servers.json` (topology for managers) and an event log
-(`/data/booster-log.txt`) with START/STOP transitions and periodic SUMMARY lines.
+It also writes `/data/servers.json` (topology for managers) and refreshes a live
+status table in the tail window each tick.
 
 ## How it works
 
@@ -39,14 +39,14 @@ The main loop (`main`) each tick:
 6. `prepPhase` — spends remaining RAM driving `needsPrep` targets to baseline, one
    corrective wave per target (`prepWave`), skipping any with workers already in
    flight.
-7. `updateDisplayStats` / `logEvents` / `renderStatus` — log transitions/SUMMARY
-   and refresh the tail. Raw money/security reads land at a random phase of each
-   target's batch grid, so they oscillate (e.g. money flips between 100% and
-   `100% − hack%`). For display only, `updateDisplayStats` keeps a short rolling
-   window per batcher and `displayHealth` reports the window's **peak money /
-   floor security** — the grid-aligned baseline (~100% / +0.00 when healthy),
-   while a sustained drift still pulls the reported value off. This affects the
-   tail table and log SUMMARY only, never batching decisions.
+7. `updateDisplayStats` / `renderStatus` — refresh the tail-window status table.
+   Raw money/security reads land at a random phase of each target's batch grid, so
+   they oscillate (e.g. money flips between 100% and `100% − hack%`). For display
+   only, `updateDisplayStats` keeps a short rolling window per batcher and
+   `displayHealth` reports the window's **peak money / floor security** — the
+   grid-aligned baseline (~100% / +0.00 when healthy), while a sustained drift still
+   pulls the reported value off. This affects the tail table only, never batching
+   decisions.
 
 Thread placement (`placeThreads`) greedily bin-packs across the pool and returns
 how many threads actually landed.

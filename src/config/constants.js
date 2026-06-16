@@ -144,12 +144,6 @@ export const HACKNET_GATE = {
 /** Topology JSON written by booster for managers to consume. */
 export const SERVERS_JSON = "/data/servers.json";
 
-/** Event log booster writes for offline inspection. */
-export const BOOSTER_LOG = "/data/booster-log.txt";
-
-/** How often booster writes a SUMMARY line to the event log, ms. */
-export const SUMMARY_INTERVAL_MS = 5000;
-
 // ── Detection / handoff ────────────────────────────────────────────────────
 
 /** Presence of this file triggers handoff to the advanced controller. */
