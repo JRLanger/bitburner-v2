@@ -457,6 +457,20 @@ unprepped target (weaken/grow), so a queue of future good targets is always
 being readied. "Lower the hack %" step-down (see Allocation) applies only to
 the single marginal target at the bottom of the RAM pool.
 
+## RAM gotcha: property names that collide with NS functions
+
+Bitburner's RAM analyzer is **property-name based, not object-aware**. Any
+member access whose property name matches an NS function — `obj.hack`,
+`obj.grow`, `obj.weaken`, `obj.scan`, `obj.nuke`, etc. — gets charged that
+function's RAM, even if `obj` is a plain object and the function is never
+called. This was caught when `mem booster.js` showed phantom `hack`/`grow`/
+`weaken` charges (0.4 GB) from a `WORKER_RAM = { hack, grow, weaken }` config
+object. Fix: the keys are named `hackRam`/`growRam`/`weakenRam` instead.
+
+**Rule for this project: never name a variable or object property after an NS
+function.** When in doubt, run `mem <script>.js` and check the line-by-line
+breakdown for charges you didn't expect.
+
 ## Alternatives considered
 
 - **Separate scanner script** (own file, exec'd on a timer): rejected for the

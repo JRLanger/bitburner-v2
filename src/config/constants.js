@@ -53,11 +53,17 @@ export const HACK_WORKER = "/workers/hack.js";
 export const GROW_WORKER = "/workers/grow.js";
 export const WEAKEN_WORKER = "/workers/weaken.js";
 
-/** Worker RAM costs, GB (validated). Hardcoded to avoid a getScriptRam call. */
+/**
+ * Worker RAM costs, GB (validated). Hardcoded to avoid a getScriptRam call.
+ *
+ * NOTE: keys are intentionally NOT named hack/grow/weaken. Bitburner's RAM
+ * analyzer charges for any property access matching an NS function name, so a
+ * `.hack` key would phantom-charge 0.1 GB even though we never call ns.hack.
+ */
 export const WORKER_RAM = {
-    hack: 1.70,
-    grow: 1.75,
-    weaken: 1.75,
+    hackRam: 1.70,
+    growRam: 1.75,
+    weakenRam: 1.75,
 };
 
 // ── RAM reservation ────────────────────────────────────────────────────────
