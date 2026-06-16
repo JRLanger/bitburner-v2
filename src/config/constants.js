@@ -19,6 +19,9 @@ export const BATCH_PERIOD = 4 * D_GAP;
 /** Main loop sleep, ms. Wake often enough to never miss a grid launch window. */
 export const LOOP_SLEEP = BATCH_PERIOD / 2;
 
+/** Small buffer added to every batch's land base so all delays stay ≥ 0, ms. */
+export const BATCH_SAFETY_MS = 50;
+
 // ── Security deltas (single-core, validated exact in-game) ─────────────────
 
 /** Security removed per weaken thread. */
@@ -38,6 +41,14 @@ export const CHANCE_BATCH = 0.8;
 export const SEC_MARGIN = 0.05;
 /** "Prepped"/healthy if money ≥ maxMoney × (1 − this). */
 export const MONEY_EPSILON = 0.01;
+
+// Hysteresis: strict to START batching (above), loose to KEEP batching. A
+// healthy batch's money/security oscillate each cycle, so only pull a target
+// for re-prep if it has genuinely drifted past these looser bounds.
+/** Keep batching while money ≥ maxMoney × this. */
+export const BATCH_KEEP_MONEY_FRAC = 0.2;
+/** Keep batching while security ≤ minSecurity + this (absolute). */
+export const BATCH_KEEP_SEC_OVER = 5;
 
 // ── Hack-percentage table ──────────────────────────────────────────────────
 
@@ -98,6 +109,12 @@ export const HACKNET_GATE = {
 
 /** Topology JSON written by booster for managers to consume. */
 export const SERVERS_JSON = "/data/servers.json";
+
+/** Event log booster writes for offline inspection. */
+export const BOOSTER_LOG = "/data/booster-log.txt";
+
+/** How often booster writes a SUMMARY line to the event log, ms. */
+export const SUMMARY_INTERVAL_MS = 5000;
 
 // ── Detection / handoff ────────────────────────────────────────────────────
 

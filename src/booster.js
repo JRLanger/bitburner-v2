@@ -4,9 +4,8 @@
  * The cheap "first stage" controller that runs at the start of a BitNode cycle,
  * before Formulas.exe. See docs/devlog/02-booster.md for the full design.
  *
- * BUILD STATUS: Stage 3a — persistent loop, cross-server RAM pool, thread
- * placement, and prep execution (drive targets to min security / max money).
- * HWGW batching (3b), self-heal (3c), managers (4), and status table (5) follow.
+ * BUILD STATUS: Stage 3b — adds the rolling HWGW grid batcher on top of 3a's
+ * loop/pool/prep. Self-heal (3c), managers (4), and status table (5) follow.
  *
  * Prerequisites: the three worker scripts must already exist on home. booster
  * does NOT create them; it errors out and exits if any is missing.
@@ -19,6 +18,8 @@ import {
     SERVERS_JSON,
     SEC_MARGIN,
     MONEY_EPSILON,
+    BATCH_KEEP_MONEY_FRAC,
+    BATCH_KEEP_SEC_OVER,
     HACK_PCT_MIN,
     HACK_PCT_MAX,
     HACK_PCT_STEP,
@@ -29,6 +30,12 @@ import {
     LOOP_SLEEP,
     HOME_SAFETY_BUFFER_GB,
     FORMULAS_EXE,
+    CHANCE_BATCH,
+    D_GAP,
+    BATCH_PERIOD,
+    BATCH_SAFETY_MS,
+    BOOSTER_LOG,
+    SUMMARY_INTERVAL_MS,
 } from "/config/constants.js";
 
 /** Worker paths that must exist on home and get copied to every rooted server. */
@@ -43,6 +50,18 @@ let batchSeq = 0;
 /** Hosts we've already copied the workers onto this run (avoid re-scp each tick). */
 const provisioned = new Set();
 
+/** Per-target launch clock: target -> { nextLaunch } timestamp (ms). */
+const clocks = new Map();
+
+/** Targets currently in the batching rotation (persistent across ticks). */
+const activeBatching = new Set();
+
+/** Hostnames that were batching last tick (to detect START/STOP transitions). */
+const wasBatching = new Set();
+
+/** Timestamp of the last SUMMARY line written to the event log. */
+let lastSummary = 0;
+
 export async function main(ns) {
     ns.disableLog("ALL");
     ns.ui.openTail();
@@ -54,6 +73,9 @@ export async function main(ns) {
         ns.tprint("booster does not create workers. Add them, then re-run.");
         return;
     }
+
+    // Fresh event log for this run.
+    ns.write(BOOSTER_LOG, `=== booster run ${new Date().toISOString()} ===\n`, "w");
 
     // Main control loop. Stage 3a: discover/root + prep.
     // NOTE: stage 5 will restore the Formulas.exe handoff as the loop's exit
@@ -67,9 +89,15 @@ export async function main(ns) {
         const pool = buildPool(ns, rootedHosts);
         const inFlight = inFlightByTarget(ns, rootedHosts);
 
-        const prepped = prepPhase(ns, servers, pool, inFlight);
+        const { eligible, needsPrep } = classify(ns, servers);
 
-        printStatus(ns, servers, pool, prepped);
+        // Batch the prepped, eligible targets first (consumes RAM by rank),
+        // then spend whatever's left prepping the next-best targets.
+        batchPhase(ns, eligible, pool);
+        prepPhase(ns, needsPrep, pool, inFlight);
+
+        logEvents(ns, eligible, needsPrep, pool);
+        printStatus(ns, servers, pool, eligible, needsPrep);
         await ns.sleep(LOOP_SLEEP);
     }
 }
@@ -182,39 +210,63 @@ function inFlightByTarget(ns, rootedHosts) {
     return map;
 }
 
-// ── Prep phase ──────────────────────────────────────────────────────────────
+// ── Classification ──────────────────────────────────────────────────────────
 
 /**
- * Drive needs-prep targets toward baseline (min security, max money), most
- * valuable first, one corrective wave per target at a time (skip targets that
- * already have workers in flight). Returns the list of prepped hostnames.
+ * Split viable targets into:
+ *  - `eligible`: prepped + batch-worthy (chance ≥ CHANCE_BATCH), each with its
+ *    best hack-% table row attached, sorted by score (most profitable first).
+ *  - `needsPrep`: not yet at baseline, sorted by maxMoney (prep value first).
+ *
+ * The expensive hack-% table is only built for prepped eligible targets (few),
+ * never for the whole network.
  */
-function prepPhase(ns, servers, pool, inFlight) {
+function classify(ns, servers) {
     const level = ns.getHackingLevel();
-    const prepped = [];
+    const eligible = [];
     const needsPrep = [];
 
     for (const s of servers) {
         if (!s.hasRoot || s.maxMoney <= 0 || s.hackLevelReq > level) continue;
         const sec = ns.getServerSecurityLevel(s.hostname);
         const money = ns.getServerMoneyAvailable(s.hostname);
-        if (isPrepped(s, sec, money)) {
-            prepped.push(s.hostname);
-        } else {
+
+        // Already batching: keep going unless GENUINELY drifted (loose bounds —
+        // healthy batches oscillate within each cycle).
+        if (activeBatching.has(s.hostname)) {
+            const chance = ns.hackAnalyzeChance(s.hostname);
+            const healthy =
+                chance >= CHANCE_BATCH &&
+                money >= s.maxMoney * BATCH_KEEP_MONEY_FRAC &&
+                sec <= s.minSecurity + BATCH_KEEP_SEC_OVER;
+            if (healthy) {
+                const best = bestHackPct(ns, s, chance);
+                if (best) {
+                    eligible.push({ ...s, chance, sec, money, ...best });
+                    continue;
+                }
+            }
+            activeBatching.delete(s.hostname); // drifted out → re-prep below
+        }
+
+        // Not batching: STRICT prepped check to start (ensures table accuracy).
+        if (!isPrepped(s, sec, money)) {
             needsPrep.push({ ...s, sec, money });
+            continue;
+        }
+        const chance = ns.hackAnalyzeChance(s.hostname);
+        if (chance < CHANCE_BATCH) continue; // prepped but not worth batching
+
+        const best = bestHackPct(ns, s, chance);
+        if (best) {
+            activeBatching.add(s.hostname);
+            eligible.push({ ...s, chance, sec, money, ...best });
         }
     }
 
-    // Most valuable targets get prepped first.
+    eligible.sort((a, b) => b.score - a.score);
     needsPrep.sort((a, b) => b.maxMoney - a.maxMoney);
-
-    for (const t of needsPrep) {
-        if (poolFree(pool) <= 0) break;
-        if ((inFlight.get(t.hostname) ?? 0) > 0) continue; // wave already running
-        prepWave(ns, t, pool);
-    }
-
-    return prepped;
+    return { eligible, needsPrep };
 }
 
 /** True when a server is at (near) min security and (near) max money. */
@@ -223,6 +275,84 @@ function isPrepped(s, sec, money) {
         sec <= s.minSecurity * (1 + SEC_MARGIN) &&
         money >= s.maxMoney * (1 - MONEY_EPSILON)
     );
+}
+
+// ── Batch phase (rolling HWGW grid scheduler) ───────────────────────────────
+
+/**
+ * Launch rolling HWGW batches for each eligible target, in rank order, until
+ * RAM runs out. Pipeline depth is regulated by a per-target launch clock that
+ * advances by BATCH_PERIOD, so steady-state in-flight ≈ weakenTime/BATCH_PERIOD
+ * without needing to count batches.
+ */
+function batchPhase(ns, eligible, pool) {
+    const now = Date.now();
+
+    for (const t of eligible) {
+        const target = t.hostname;
+        const ramPerBatch = t.ramPerBatch;
+        if (ramPerBatch > poolFree(pool)) continue; // can't even fit one batch
+
+        const weakenTime = t.weakenTime; // from bestHackPct, no extra NS call
+        const growTime = ns.getGrowTime(target);
+        const hackTime = ns.getHackTime(target);
+
+        // Clock setup / re-anchor if it fell more than a full cycle behind.
+        let clock = clocks.get(target);
+        if (!clock || clock.nextLaunch < now - weakenTime) {
+            clock = { nextLaunch: now };
+            clocks.set(target, clock);
+        }
+
+        // Fire due batches, capped at one full pipeline's worth per tick.
+        const maxFires = Math.ceil(weakenTime / BATCH_PERIOD);
+        let k = 0;
+        while (
+            clock.nextLaunch <= now &&
+            k < maxFires &&
+            ramPerBatch <= poolFree(pool)
+        ) {
+            const base = now + weakenTime + k * BATCH_PERIOD + BATCH_SAFETY_MS;
+            fireBatch(ns, pool, t, base, now, hackTime, growTime, weakenTime);
+            clock.nextLaunch += BATCH_PERIOD;
+            k++;
+        }
+    }
+}
+
+/**
+ * Place one batch's four ops with per-op delays so they land H, W1, G, W2 in
+ * order, D_GAP apart, with W1 landing at `base`. The whole batch is known to
+ * fit (checked by the caller) so it never half-fires.
+ */
+function fireBatch(ns, pool, t, base, now, hackTime, growTime, weakenTime) {
+    const target = t.hostname;
+    // Clamp to ≥ 0; only addH can go negative (on very fast servers), and since
+    // hackTime < weakenTime the H→W1 order still holds when it lands ASAP.
+    const addH = Math.max(0, base - D_GAP - now - hackTime);
+    const addW1 = Math.max(0, base - now - weakenTime);
+    const addG = Math.max(0, base + D_GAP - now - growTime);
+    const addW2 = Math.max(0, base + 2 * D_GAP - now - weakenTime);
+
+    placeThreads(ns, pool, HACK_WORKER, WORKER_RAM.hackRam, t.h, target, addH);
+    placeThreads(ns, pool, WEAKEN_WORKER, WORKER_RAM.weakenRam, t.w1, target, addW1);
+    placeThreads(ns, pool, GROW_WORKER, WORKER_RAM.growRam, t.g, target, addG);
+    placeThreads(ns, pool, WEAKEN_WORKER, WORKER_RAM.weakenRam, t.w2, target, addW2);
+}
+
+// ── Prep phase ──────────────────────────────────────────────────────────────
+
+/**
+ * Drive needs-prep targets toward baseline (min security, max money), most
+ * valuable first, one corrective wave per target at a time (skip targets that
+ * already have workers in flight).
+ */
+function prepPhase(ns, needsPrep, pool, inFlight) {
+    for (const t of needsPrep) {
+        if (poolFree(pool) <= 0) break;
+        if ((inFlight.get(t.hostname) ?? 0) > 0) continue; // wave already running
+        prepWave(ns, t, pool);
+    }
 }
 
 /**
@@ -304,13 +434,71 @@ function bestHackPct(ns, server, chance) {
 
 // ── Status / helpers ────────────────────────────────────────────────────────
 
+// ── Event logging (to BOOSTER_LOG for offline inspection) ───────────────────
+
+/**
+ * Write START/STOP transitions for batching targets and a periodic SUMMARY of
+ * per-target health (money % of max, security above min) and expected income.
+ * Uses only already-computed data — no extra NS calls.
+ */
+function logEvents(ns, eligible, needsPrep, pool) {
+    const now = Date.now();
+    const current = new Set(eligible.map((t) => t.hostname));
+
+    for (const t of eligible) {
+        if (wasBatching.has(t.hostname)) continue;
+        const conc = Math.ceil(t.weakenTime / BATCH_PERIOD);
+        const eps = expectedIncome(t);
+        logLine(
+            ns,
+            `START ${t.hostname} f=${(t.f * 100).toFixed(0)}% ` +
+            `h=${t.h} g=${t.g} w1=${t.w1} w2=${t.w2} ` +
+            `ram/batch=${ns.format.ram(t.ramPerBatch)} x${conc} ~$${ns.format.number(eps)}/s`
+        );
+    }
+    for (const host of wasBatching) {
+        if (!current.has(host)) logLine(ns, `STOP  ${host} (drifted / unprepped / out of RAM)`);
+    }
+
+    wasBatching.clear();
+    for (const host of current) wasBatching.add(host);
+
+    if (now - lastSummary >= SUMMARY_INTERVAL_MS) {
+        lastSummary = now;
+        let total = 0;
+        const parts = [];
+        for (const t of eligible) {
+            total += expectedIncome(t);
+            const moneyPct = ((t.money / t.maxMoney) * 100).toFixed(0);
+            const secOver = (t.sec - t.minSecurity).toFixed(2);
+            parts.push(`${t.hostname}(${moneyPct}%,+${secOver})`);
+        }
+        logLine(
+            ns,
+            `SUMMARY batching=${eligible.length} prepping=${needsPrep.length} ` +
+            `poolFree=${ns.format.ram(poolFree(pool))} ~$${ns.format.number(total)}/s :: ` +
+            parts.join(" ")
+        );
+    }
+}
+
+/** Expected income for a batching target, $/s. */
+function expectedIncome(t) {
+    return (t.maxMoney * t.f * t.chance) / (BATCH_PERIOD / 1000);
+}
+
+/** Append a timestamped line to the event log. */
+function logLine(ns, line) {
+    ns.write(BOOSTER_LOG, `[${new Date().toLocaleTimeString()}] ${line}\n`, "a");
+}
+
 /** Concise per-tick status to the script log (tail window). */
-function printStatus(ns, servers, pool, prepped) {
+function printStatus(ns, servers, pool, eligible, needsPrep) {
     const rooted = servers.filter((s) => s.hasRoot).length;
     ns.print(
         `[${new Date().toLocaleTimeString()}] ` +
-        `rooted ${rooted}/${servers.length} | prepped ${prepped.length} | ` +
-        `pool free ${ns.format.ram(poolFree(pool))}`
+        `rooted ${rooted}/${servers.length} | batching ${eligible.length} | ` +
+        `prepping ${needsPrep.length} | pool free ${ns.format.ram(poolFree(pool))}`
     );
 }
 
