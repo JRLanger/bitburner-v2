@@ -11,7 +11,7 @@
 // ── HWGW batch timing ──────────────────────────────────────────────────────
 
 /** Gap between consecutive HWGW landings, ms. Tune in-game later. */
-export const D_GAP = 200;
+export const D_GAP = 100;
 
 /** Interval between batch launches into the pipeline, ms. One batch per period. */
 export const BATCH_PERIOD = 4 * D_GAP;
@@ -58,6 +58,31 @@ export const BATCH_KEEP_SEC_OVER = 5;
 export const RECOVER_MONEY_FRAC = 0.95;
 /** Fire recovery weaken when a batching target's security > minSecurity + this. */
 export const RECOVER_SEC_OVER = 1;
+
+// ── Batcher admission control ──────────────────────────────────────────────
+
+// Each batching target sustains a full pipeline of ceil(weakenTime/BATCH_PERIOD)
+// concurrent batches. The sum across all prepped targets can far exceed the pool,
+// which drains RAM to zero — starving prep and desyncing batches (partial fires →
+// money/security drift). To prevent overcommit, batchers are admitted in rank
+// order only while their cumulative pipeline RAM stays under this fraction of the
+// TOTAL pool. The remainder is real headroom for prep, recovery, and jitter.
+/** Fraction of total pool RAM usable for batch pipelines. Tune in-game. */
+export const BATCH_BUDGET_FRAC = 0.80;
+
+// A starved target's launch clock can fall a full pipeline behind; without a cap
+// it dumps the entire backlog (hundreds of batches) in one tick, spiking RAM and
+// re-starving the pool. Steady state only needs ~1 launch per couple of ticks, so
+// a small cap fills/heals a pipeline gradually without spikes.
+/** Max HWGW batches a single target may launch in one tick. */
+export const MAX_FIRES_PER_TICK = 2;
+
+// Over-provision grow and weaken threads by this factor. Each batch then grows
+// slightly past max (clamps, harmless) and weakens slightly past min, which
+// absorbs the small per-cycle under-restore that otherwise lets long-pipeline
+// targets slowly drift down. Hack threads are NOT scaled. Tune in-game.
+/** Multiplier applied to all grow/weaken thread counts. */
+export const THREAD_MARGIN = 1.05;
 
 // ── Hack-percentage table ──────────────────────────────────────────────────
 

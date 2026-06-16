@@ -17,6 +17,7 @@ home RAM). Source: `src/booster.js`, workers in `src/workers/`, tunables in
 | 3a | Control loop, RAM pool, thread placement, prep | ✅ done |
 | 3b | Rolling HWGW grid batcher + enter/stay hysteresis | ✅ done |
 | 3c | Recovery grow (climb drifted targets back to max) | ✅ done |
+| 3d | Stabilization: RAM-budgeted admission, plan locking, fire cap, recovery rate-limit, drift tuning | ✅ done |
 | 5 (partial) | Live status table (tail window) | ✅ done |
 | 4 | Manager orchestration (managers not yet written) | ⬜ pending |
 | 5 | Formulas.exe handoff | ⬜ **deliberately disabled** — loop is `while(true)` so it can be tested on a save that already owns Formulas.exe. Restore the `while(!fileExists(FORMULAS_EXE))` exit when moving to a fresh BN. |
@@ -191,9 +192,12 @@ batch, or we'll badly over-commit. This is the central constraint for the
 | `SEC_MARGIN` | 0.05 | "prepped" if security ≤ minSecurity × (1 + this), i.e. within 5% above minimum |
 | `MONEY_EPSILON` | 0.01 | "prepped" if money within 1% of max |
 | grid step | 0.01 | hack-% table resolution |
-| `D_GAP` | 200 ms | gap between consecutive HWGW landings (to tune in-game later) |
-| `BATCH_PERIOD` | `4 × D_GAP` (800 ms) | interval between batch launches into the pipeline |
+| `D_GAP` | 100 ms (was 200) | gap between consecutive HWGW landings (tuned down to cut overlap jitter) |
+| `BATCH_PERIOD` | `4 × D_GAP` (400 ms) | interval between batch launches into the pipeline |
 | `HOME_RESERVE` | (TBD) | RAM kept free on `home` for `booster` (8.2 GB) + managers |
+| `BATCH_BUDGET_FRAC` | 0.80 | fraction of total pool usable for batch pipelines (rest reserved for prep) |
+| `MAX_FIRES_PER_TICK` | 2 | cap on batches one target may launch per tick (anti-burst) |
+| `THREAD_MARGIN` | 1.05 | over-provision factor for grow/weaken threads (drift absorption) |
 
 ## Validation plan
 
@@ -479,6 +483,59 @@ Any RAM not consumed by active batch pipelines goes to prepping the next-best
 unprepped target (weaken/grow), so a queue of future good targets is always
 being readied. "Lower the hack %" step-down (see Allocation) applies only to
 the single marginal target at the bottom of the RAM pool.
+
+## Stabilization (stage 3d): from chaos to steady state
+
+The first full multi-hour runs surfaced a cascade of failures that only appear at
+scale (many targets, a huge RAM pool). Each fix exposed the next layer, so they're
+recorded here in the order they were found and solved.
+
+1. **Unbounded admission → permanent overcommit.** Every prepped target was batched
+   with no global RAM cap. Each target independently sustains a full pipeline of
+   `weakenTime / BATCH_PERIOD` concurrent batches; summed across ~15 targets that
+   far exceeds the pool, so RAM drained to zero, starved prep (large servers never
+   finished prepping after 10 h), and forced under-funded batches that drifted.
+   **Fix: `selectBatchers`** admits targets in score order only while cumulative
+   *pipeline* RAM stays under `BATCH_BUDGET_FRAC` (0.80) of the *total* pool; the
+   rest idle (prepped, un-hacked, zero cost). Keeps a real proportional reserve for
+   prep. Un-admitted-target selection is keep-first (`wasBatching`) for hysteresis.
+
+2. **Per-tick re-optimisation → grid desync + admission flap → worker accumulation.**
+   `bestHackPct` was recomputed every tick for already-batching targets, so the
+   batch shape (and its RAM estimate) wobbled. The wobble flipped marginal targets
+   in and out of the admitted set; each re-admit fired fresh batches while the
+   dropped admission's workers kept running for a full weaken time. The pile-up
+   collapsed the pool to ~40 GB and produced a START/STOP storm (dozens/second).
+   **Fix: lock the plan** (`batchPlan`) at admission and reuse it until the target
+   drifts out; recompute only on re-admission. Stable estimates ⇒ no flap ⇒ no
+   accumulation.
+
+3. **Catch-up bursts.** A target whose launch clock fell behind could fire its whole
+   pipeline (hundreds of batches) in one tick, re-spiking RAM. **Fix:
+   `MAX_FIRES_PER_TICK = 2`** — pipelines fill/heal gradually; steady state only
+   needs ~1 launch per couple of ticks.
+
+4. **Recovery-grow accumulation.** `maybeRecover` re-fired a full deficit-sized grow
+   *every tick* for any target below `RECOVER_MONEY_FRAC`, with no in-flight check
+   (unlike `prepPhase`). Those grows live for the grow time and stacked, bleeding the
+   pool from tens of TB to tens of GB and spiralling. **Fix: per-target cooldown**
+   (`recoverClock`, ~`growTime`) so one corrective wave lands and is measured before
+   the next fires.
+
+5. **Residual per-cycle drift.** Even stable, the longest-pipeline targets (e.g.
+   `iron-gym`) leak a fraction of a percent per cycle — inherent to a fixed-shape,
+   `Date.now`-clocked batcher without Formulas-exact timing. Mitigations:
+   `THREAD_MARGIN` (1.05) over-provisions grow/weaken (not hack) so each batch grows
+   just past max / weakens just past min (both clamp harmlessly), and `D_GAP` was
+   tightened 200→100 ms to reduce overlap jitter. Note `BATCH_PERIOD = 4 × D_GAP`,
+   so smaller `D_GAP` deepens every pipeline and raises per-target RAM — a
+   throughput/headroom trade-off. The true cure for sub-percent drift is the
+   Formulas-based stage 5 controller; `iron-gym`-class outliers are accepted here.
+
+**Display aid:** raw money/security reads land at a random phase of each target's
+grid and oscillate; `displayHealth` reports the rolling-window peak money / floor
+security so the status table shows the grid-aligned baseline (~100 % / +0.00) and
+genuine drift still stands out.
 
 ## RAM gotcha: property names that collide with NS functions
 

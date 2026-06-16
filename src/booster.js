@@ -29,10 +29,13 @@ import {
     WEAKEN_SEC,
     GROW_SEC,
     HACK_SEC,
+    THREAD_MARGIN,
     LOOP_SLEEP,
     HOME_SAFETY_BUFFER_GB,
     FORMULAS_EXE,
     CHANCE_BATCH,
+    BATCH_BUDGET_FRAC,
+    MAX_FIRES_PER_TICK,
     D_GAP,
     BATCH_PERIOD,
     BATCH_SAFETY_MS,
@@ -55,14 +58,42 @@ const provisioned = new Set();
 /** Per-target launch clock: target -> { nextLaunch } timestamp (ms). */
 const clocks = new Map();
 
+/**
+ * Per-target recovery cooldown: target -> earliest timestamp (ms) a new recovery
+ * wave may fire. A recovery grow takes growTime to land; without this gate
+ * maybeRecover re-fires a full deficit-sized grow every tick, stacking many
+ * in-flight grows that drain the pool and starve normal batches.
+ */
+const recoverClock = new Map();
+
 /** Targets currently in the batching rotation (persistent across ticks). */
 const activeBatching = new Set();
+
+/**
+ * Locked batch plan per batching target: the bestHackPct result captured when the
+ * target was admitted. Reused every tick while batching (never recomputed) so the
+ * HWGW grid shape and its RAM footprint stay constant — recomputing each tick
+ * desyncs the in-flight grid and wobbles the admission estimate, causing flap.
+ * Deleted when a target drifts out and must re-prep. host -> bestHackPct result.
+ */
+const batchPlan = new Map();
 
 /** Hostnames that were batching last tick (to detect START/STOP transitions). */
 const wasBatching = new Set();
 
 /** Timestamp of the last SUMMARY line written to the event log. */
 let lastSummary = 0;
+
+/**
+ * Per-target rolling samples of money fraction and security-over-min, used only
+ * for the status/log display. Raw mid-cycle reads oscillate (a hack has landed
+ * but its counter-grow hasn't); reporting the window's peak money / floor
+ * security shows the grid-aligned baseline instead, so genuine drift is easy to
+ * spot. host -> { money: number[], sec: number[] }.
+ */
+const displayHistory = new Map();
+/** How many recent ticks to keep for the display peak/floor (covers a few cycles). */
+const DISPLAY_WINDOW = 6;
 
 export async function main(ns) {
     ns.disableLog("ALL");
@@ -93,13 +124,29 @@ export async function main(ns) {
 
         const { eligible, needsPrep } = classify(ns, servers);
 
-        // Batch the prepped, eligible targets first (consumes RAM by rank),
-        // then spend whatever's left prepping the next-best targets.
-        batchPhase(ns, eligible, pool);
+        // Admission control: cap the actively-batched set to what the pool can
+        // sustain (full pipelines), leaving real headroom for prep. Total pool
+        // RAM mirrors renderStatus's tally; no extra NS calls.
+        const poolTotal =
+            servers.reduce((sum, s) => (s.hasRoot ? sum + s.maxRam : sum), 0) -
+            HOME_SAFETY_BUFFER_GB;
+        const batchers = selectBatchers(eligible, poolTotal);
+
+        // Batch the admitted targets first (consumes RAM by rank), then spend
+        // whatever's left prepping the next-best targets.
+        batchPhase(ns, batchers, pool);
         prepPhase(ns, needsPrep, pool, inFlight);
 
-        logEvents(ns, eligible, needsPrep, pool);
-        renderStatus(ns, servers, pool, eligible, needsPrep);
+        // Future hook (RAM-share): once prep is clear, the genuine excess is
+        //   excess = poolFree(pool) - poolTotal * (1 - BATCH_BUDGET_FRAC)
+        // i.e. free RAM beyond the reserved prep headroom. A future
+        // sharePhase(ns, pool, excess) would place ns.share() workers into that
+        // residual only when excess > 0 and needsPrep is empty, recomputed each
+        // tick so it yields the instant batch/prep demand rises. Not built yet.
+
+        updateDisplayStats(batchers);
+        logEvents(ns, batchers, needsPrep, pool);
+        renderStatus(ns, servers, pool, batchers, needsPrep);
         await ns.sleep(LOOP_SLEEP);
     }
 }
@@ -242,13 +289,17 @@ function classify(ns, servers) {
                 money >= s.maxMoney * BATCH_KEEP_MONEY_FRAC &&
                 sec <= s.minSecurity + BATCH_KEEP_SEC_OVER;
             if (healthy) {
-                const best = bestHackPct(ns, s, chance);
+                // Reuse the locked plan (don't re-optimise mid-pipeline); only
+                // compute if somehow missing.
+                const best = batchPlan.get(s.hostname) ?? bestHackPct(ns, s, chance);
                 if (best) {
+                    batchPlan.set(s.hostname, best);
                     eligible.push({ ...s, chance, sec, money, ...best });
                     continue;
                 }
             }
             activeBatching.delete(s.hostname); // drifted out → re-prep below
+            batchPlan.delete(s.hostname); // recompute a fresh plan on re-admission
         }
 
         // Not batching: STRICT prepped check to start (ensures table accuracy).
@@ -262,6 +313,7 @@ function classify(ns, servers) {
         const best = bestHackPct(ns, s, chance);
         if (best) {
             activeBatching.add(s.hostname);
+            batchPlan.set(s.hostname, best); // lock the plan for this batching run
             eligible.push({ ...s, chance, sec, money, ...best });
         }
     }
@@ -277,6 +329,40 @@ function isPrepped(s, sec, money) {
         sec <= s.minSecurity * (1 + SEC_MARGIN) &&
         money >= s.maxMoney * (1 - MONEY_EPSILON)
     );
+}
+
+/**
+ * Admission control. Of the prepped, eligible targets (already score-sorted),
+ * admit the highest-ranked subset whose cumulative steady-state pipeline RAM
+ * stays under BATCH_BUDGET_FRAC of the total pool — the rest idle (they stay
+ * prepped at zero RAM cost since they aren't hacked). This caps aggregate batch
+ * demand below pool capacity so admitted pipelines never starve for RAM and
+ * never half-fire (the cause of money/security drift), and guarantees prep keeps
+ * the reserved headroom.
+ *
+ * Hysteresis: last tick's batchers (tracked in `wasBatching`) are considered for
+ * admission before new candidates, so the active set doesn't flap tick-to-tick.
+ */
+function selectBatchers(eligible, poolTotal) {
+    const budget = poolTotal * BATCH_BUDGET_FRAC;
+    const pipelineRam = (t) => Math.ceil(t.weakenTime / BATCH_PERIOD) * t.ramPerBatch;
+
+    const admitted = [];
+    let used = 0;
+    // Pass 1 keeps already-batching targets; pass 2 admits new ones with the
+    // budget that's left. Each pass walks `eligible` in its existing rank order.
+    for (const keepPass of [true, false]) {
+        for (const t of eligible) {
+            if (wasBatching.has(t.hostname) !== keepPass) continue;
+            const need = pipelineRam(t);
+            if (used + need > budget) continue;
+            used += need;
+            admitted.push(t);
+        }
+    }
+
+    admitted.sort((a, b) => b.score - a.score); // restore global rank order
+    return admitted;
 }
 
 // ── Batch phase (rolling HWGW grid scheduler) ───────────────────────────────
@@ -306,8 +392,9 @@ function batchPhase(ns, eligible, pool) {
             clocks.set(target, clock);
         }
 
-        // Fire due batches, capped at one full pipeline's worth per tick.
-        const maxFires = Math.ceil(weakenTime / BATCH_PERIOD);
+        // Fire due batches, capped to a few per tick so a clock that fell behind
+        // refills gradually instead of dumping its whole pipeline at once.
+        const maxFires = Math.min(MAX_FIRES_PER_TICK, Math.ceil(weakenTime / BATCH_PERIOD));
         let k = 0;
         while (
             clock.nextLaunch <= now &&
@@ -322,7 +409,7 @@ function batchPhase(ns, eligible, pool) {
 
         // Pull the target back to baseline if it has drifted below max (the
         // batch alone maintains but never recovers lost ground).
-        maybeRecover(ns, t, pool);
+        maybeRecover(ns, t, pool, growTime);
     }
 }
 
@@ -332,24 +419,36 @@ function batchPhase(ns, eligible, pool) {
  * weaken if security has crept above min. Grow/weaken clamp at max/min, so
  * over-firing is harmless. Delays are 0; grow lands at growTime and the weaken
  * at the longer weakenTime, so the weaken cleans up after the grow.
+ *
+ * Rate-limited per target: after a wave fires we wait ~growTime (the time for it
+ * to land) before firing another, so a persistently-drifted target doesn't stack
+ * a fresh deficit-sized grow every tick and drain the pool.
  */
-function maybeRecover(ns, t, pool) {
+function maybeRecover(ns, t, pool, growTime) {
     const target = t.hostname;
+    const now = Date.now();
+    if ((recoverClock.get(target) ?? 0) > now) return; // a wave is still landing
+
+    let fired = false;
 
     if (t.money < t.maxMoney * RECOVER_MONEY_FRAC) {
         const mult = t.maxMoney / Math.max(t.money, 1);
-        const need = Math.ceil(ns.growthAnalyze(target, mult));
+        const need = Math.ceil(ns.growthAnalyze(target, mult) * THREAD_MARGIN);
         const placed = placeThreads(ns, pool, GROW_WORKER, WORKER_RAM.growRam, need, target, 0);
         if (placed > 0) {
-            const counter = Math.ceil((placed * GROW_SEC) / WEAKEN_SEC);
+            const counter = Math.ceil((placed * GROW_SEC) / WEAKEN_SEC * THREAD_MARGIN);
             placeThreads(ns, pool, WEAKEN_WORKER, WORKER_RAM.weakenRam, counter, target, 0);
+            fired = true;
         }
     }
 
     if (t.sec > t.minSecurity + RECOVER_SEC_OVER) {
-        const need = Math.ceil((t.sec - t.minSecurity) / WEAKEN_SEC);
-        placeThreads(ns, pool, WEAKEN_WORKER, WORKER_RAM.weakenRam, need, target, 0);
+        const need = Math.ceil((t.sec - t.minSecurity) / WEAKEN_SEC * THREAD_MARGIN);
+        const placed = placeThreads(ns, pool, WEAKEN_WORKER, WORKER_RAM.weakenRam, need, target, 0);
+        if (placed > 0) fired = true;
     }
+
+    if (fired) recoverClock.set(target, now + growTime);
 }
 
 /**
@@ -398,17 +497,20 @@ function prepWave(ns, t, pool) {
     const target = t.hostname;
 
     if (t.sec > t.minSecurity * (1 + SEC_MARGIN)) {
-        const need = Math.ceil((t.sec - t.minSecurity) / WEAKEN_SEC);
-        placeThreads(ns, pool, WEAKEN_WORKER, WORKER_RAM.weakenRam, need, target, 0);
-        return;
+        const need = Math.ceil((t.sec - t.minSecurity) / WEAKEN_SEC * THREAD_MARGIN);
+        const placed = placeThreads(ns, pool, WEAKEN_WORKER, WORKER_RAM.weakenRam, need, target, 0);
+        // Only count this wave as handled if weaken threads actually landed; if
+        // the pool was momentarily empty, fall through / retry next tick rather
+        // than falsely signalling progress.
+        if (placed > 0) return;
     }
 
     // Security is fine; restore money.
     const mult = t.maxMoney / Math.max(t.money, 1);
-    const growNeed = Math.ceil(ns.growthAnalyze(target, mult));
+    const growNeed = Math.ceil(ns.growthAnalyze(target, mult) * THREAD_MARGIN);
     const placed = placeThreads(ns, pool, GROW_WORKER, WORKER_RAM.growRam, growNeed, target, 0);
     if (placed > 0) {
-        const counter = Math.ceil((placed * GROW_SEC) / WEAKEN_SEC);
+        const counter = Math.ceil((placed * GROW_SEC) / WEAKEN_SEC * THREAD_MARGIN);
         placeThreads(ns, pool, WEAKEN_WORKER, WORKER_RAM.weakenRam, counter, target, 0);
     }
 }
@@ -450,9 +552,10 @@ function bestHackPct(ns, server, chance) {
 
     for (let f = HACK_PCT_MIN; f <= HACK_PCT_MAX + 1e-9; f += HACK_PCT_STEP) {
         const h = Math.ceil(f / hackFrac);
-        const g = Math.ceil(ns.growthAnalyze(target, 1 / (1 - f)));
-        const w1 = Math.ceil((h * HACK_SEC) / WEAKEN_SEC);
-        const w2 = Math.ceil((g * GROW_SEC) / WEAKEN_SEC);
+        // Over-provision grow/weaken (not hack) to absorb per-cycle drift.
+        const g = Math.ceil(ns.growthAnalyze(target, 1 / (1 - f)) * THREAD_MARGIN);
+        const w1 = Math.ceil((h * HACK_SEC) / WEAKEN_SEC * THREAD_MARGIN);
+        const w2 = Math.ceil((g * GROW_SEC) / WEAKEN_SEC * THREAD_MARGIN);
         const ramPerBatch =
             h * WORKER_RAM.hackRam + g * WORKER_RAM.growRam + (w1 + w2) * WORKER_RAM.weakenRam;
         const moneyPerBatch = server.maxMoney * f * chance;
@@ -465,6 +568,43 @@ function bestHackPct(ns, server, chance) {
 }
 
 // ── Status / helpers ────────────────────────────────────────────────────────
+
+/**
+ * Push this tick's raw money/security reads into each batcher's rolling window
+ * and drop targets that are no longer batching. Call once per tick before the
+ * display functions.
+ */
+function updateDisplayStats(batchers) {
+    const live = new Set();
+    for (const t of batchers) {
+        live.add(t.hostname);
+        let h = displayHistory.get(t.hostname);
+        if (!h) {
+            h = { money: [], sec: [] };
+            displayHistory.set(t.hostname, h);
+        }
+        h.money.push(t.money / t.maxMoney);
+        h.sec.push(t.sec - t.minSecurity);
+        if (h.money.length > DISPLAY_WINDOW) h.money.shift();
+        if (h.sec.length > DISPLAY_WINDOW) h.sec.shift();
+    }
+    for (const host of displayHistory.keys()) {
+        if (!live.has(host)) displayHistory.delete(host);
+    }
+}
+
+/**
+ * Grid-aligned display health for a target: peak money fraction and floor
+ * security-over across the recent window. Falls back to the instantaneous read
+ * if no history yet. Returns { moneyFrac, secOver }.
+ */
+function displayHealth(t) {
+    const h = displayHistory.get(t.hostname);
+    if (!h || h.money.length === 0) {
+        return { moneyFrac: t.money / t.maxMoney, secOver: t.sec - t.minSecurity };
+    }
+    return { moneyFrac: Math.max(...h.money), secOver: Math.min(...h.sec) };
+}
 
 // ── Event logging (to BOOSTER_LOG for offline inspection) ───────────────────
 
@@ -501,9 +641,8 @@ function logEvents(ns, eligible, needsPrep, pool) {
         const parts = [];
         for (const t of eligible) {
             total += expectedIncome(t);
-            const moneyPct = ((t.money / t.maxMoney) * 100).toFixed(0);
-            const secOver = (t.sec - t.minSecurity).toFixed(2);
-            parts.push(`${t.hostname}(${moneyPct}%,+${secOver})`);
+            const { moneyFrac, secOver } = displayHealth(t);
+            parts.push(`${t.hostname}(${(moneyFrac * 100).toFixed(0)}%,+${secOver.toFixed(2)})`);
         }
         logLine(
             ns,
@@ -548,8 +687,9 @@ function renderStatus(ns, servers, pool, eligible, needsPrep) {
         "$/s".padStart(11)
     );
     for (const t of eligible) {
-        const monPct = Math.round((t.money / t.maxMoney) * 100);
-        const secOver = (t.sec - t.minSecurity).toFixed(2);
+        const { moneyFrac, secOver: secOverNum } = displayHealth(t);
+        const monPct = Math.round(moneyFrac * 100);
+        const secOver = secOverNum.toFixed(2);
         const conc = Math.ceil(t.weakenTime / BATCH_PERIOD);
         ns.print(
             "║ " +

@@ -1,2 +1,5 @@
 node_modules/
 .DS_Store
+
+# Runtime test log pasted into the repo root for analysis
+booster_log.md
