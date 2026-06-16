@@ -10,7 +10,7 @@ If you provide the wrong answer too many times and exceed the number of attempts
 
 Coding Contracts are randomly generated and spawn over time. Initially, you'll only see a small range of the easier contracts, but as you progress further through the game more challenging ones will unlock.
 
-They can appear on non-darknet [servers](servers.md) that are not owned by the player (`Server.purchasedByPlayer` is false).
+They can appear on any [server](servers.md) (including your home computer), except for your purchased servers. By default a contract is generated on the host that is executing the generation, rather than on a random server.
 
 ## Contract generation
 

@@ -1,94 +1,4 @@
-# Which BitNode Should I Try Next?
-
-After destroying their first [BitNode](bitnodes.md), many players wonder which [BitNode](bitnodes.md) they should tackle next.
-This guide hopefully helps answer that question.
-As a player, you are not forced to tackle the [BitNodes](bitnodes.md) in any particular order.
-You are free to choose whichever ones you want.
-The "best" order can vary between players, depending on what you like to do any what kind of player you are.
-
-## TL;DR
-
-- BN1, BN2, and BN5 are great starters.
-- BN4 and BN6/BN7 are also good to do early if their mechanics appeal to you.
-- BN10 has interesting mechanics if you can generate lots of money.
-- BN9, BN13, BN14, and BN15 are tough but have interesting new mechanics.
-- BN3 has a very tough mechanic to automate but gives unparalleled power.
-- BN8 and BN11 are tough but offer little benefit to new players.
-- BN12 is easy to start but quickly ramps up in difficulty.
-
-### Good early BitNodes
-
-BN1 is the introductory [BitNode](bitnodes.md) with no difficulty modifiers to slow you down.
-Its [Source-File](sourcefiles.md) is extremely powerful as it raises all multipliers by a significant amount.
-There are no other [BitNodes](bitnodes.md) which significantly simplify this one or make it particularly easier, so BN1.2 and BN1.3 are natural first choices.
-
-BN2 introduces the [Gang](gang.md) mechanic.
-This mechanic provides both a good source of income and a large supply of [Augmentations](../basic/augmentations.md) from a single faction.
-Using the mechanic in other [BitNodes](bitnodes.md) requires a sufficiently low karma which requires a significant time investment or [Sleeves](sleeves.md).
-
-BN5 grants [Intelligence](intelligence.md), a stat that persists between [BitNodes](bitnodes.md).
-The [Source-File](sourcefiles.md) bonuses are very helpful for [hacking](../basic/hacking.md) and also give `Formulas.exe`.
-Because of all the benefits this [BitNode](bitnodes.md) provides, it's definitely worth getting early.
-
-### Depends on your priorities
-
-BN4 gives access to the [Singularity API](https://github.com/bitburner-official/bitburner-src/blob/stable/markdown/bitburner.singularity.md).
-This mechanic allows the automation of many actions directly affecting the player.
-If this appeals to you then you should prioritize this BitNode.
-Due to the [RAM](../basic/ram.md) cost, it's strongly recommended to complete BN4.3 before using the Singularity API in other [BitNodes](bitnodes.md).
-
-BN6 introduces the [Bladeburner](bladeburners.md) mechanic and its corresponding [Bladeburner API](https://github.com/bitburner-official/bitburner-src/blob/stable/markdown/bitburner.bladeburner.md).
-Bladeburner is an alternative method to beat BitNodes which doesn't rely on money or hacking skill.
-[Sleeves](sleeves.md) help complete BN6 more quickly since they can share some Bladeburner tasks with the player but aren't a requirement.
-
-BN7 also unlocks Bladeburner like BN6, but it's a bit harder than BN6 while giving more Bladeburner-specific rewards,
-such as an augmentation that lets you perform Bladeburner and non-Bladeburner actions at the same time.
-
-BN10 unlocks two new mechanics: [Sleeves](sleeves.md) and [Grafting](grafting.md).
-[Sleeves](sleeves.md) act as additional players and can perform tasks like studying, training, committing crime and working for factions independently of the player.
-[Grafting](grafting.md) installs augmentations without a soft reset.
-Both are very useful to have but require large amounts of money to use to their fullest extent.
-Each [Source-File](sourcefiles.md) grants an additional sleeve and up to five additional sleeves may be purchased from a faction only in this BitNode.
-
-### Tough but has new mechanics
-
-BN3 makes available the [Corporation](corporations.md) mechanic.
-This mechanic can provide effectively limitless wealth and [Faction](../basic/factions.md) [Reputation](../basic/reputation.md), but is very complex and documentation-dependent.
-Using the mechanic in other [BitNodes](bitnodes.md) requires $150 billion so another source of starting wealth is still needed.
-Overall, this [BitNode](bitnodes.md) is considered an advanced one even if there are no particular [BitNodes](bitnodes.md) that should go before it.
-
-BN9 introduces the [Hacknet Server](hacknetservers.md) mechanic to replace the [Hacknet Nodes](../basic/hacknet_nodes.md) mechanic.
-[Hacknet Servers](hacknetservers.md) generate hashes instead of money directly and these hashes can be traded for various benefits.
-Players who find [RAM](../basic/ram.md) tight at the beginning of a [BitNode](bitnodes.md) will find BN9.2's bonus to start with 128GiB in their home machine useful.
-
-BN13 introduces [Stanek's Gift](stanek.md), a powerful augmentation that can provide bonuses to skills, [hacknet](../basic/hacknet_nodes.md) production and costs, working and [crime](../basic/crimes.md) gains, and [hacking](../basic/hacking.md) power and speed.
-These bonuses are versatile but not enough to offset the challenge of the BitNode itself.
-
-BN14 is a relatively new BitNode focused on [IPvGO](../programming/go_algorithms.md).
-Automating the mechanic is challenging, but it provides a wide variety of bonuses.
-
-BN15 expands on the darknet mechanic unlocked via the DarkscapeNavigator.exe program.
-It encourages solving a number of practical problems (e.g. passing data around between scripts, handling servers disappearing) as well as solving many small programming puzzles to get servers' passwords. The deeper levels of the darknet have significantly more complex puzzles.
-It provides a variety of useful bonuses.
-
-### Save these for later
-
-BN8 focuses on the stock market to the point that there's no other way to make money.
-Completing at least BN10.1 is highly recommended in order to have [Grafting](grafting.md).
-This ensures that you don't need to install [Augmentations](../basic/augmentations.md) and lose market gains realized so far.
-Having a good hacking script can also help in order to manipulate the market.
-
-BN11 doesn't have any new mechanics associated with it beyond a mild bonus to work income.
-The [Source-File](sourcefiles.md) makes buying large numbers of [Augmentations](../basic/augmentations.md) cheaper but isn't worth going out of your way for.
-Overall, this [BitNode](bitnodes.md) is very difficult for not much in return.
-
-BN12 is BN1, just a little bit harder each time you complete it and continuing forever.
-This requires a variety of strategies using different mechanics as the penalties grow.
-The reason this isn't an early recommendation is that the [Source-File](sourcefiles.md) is relatively weak for the increasing amount of effort required.
-
----
-
-## Introduction
+# Introduction
 
 After a player destroys their first [BitNode](./bitnodes.md), they are usually overwhelmed and do not know which BitNode they should do next. Some BitNodes even have peculiarities that tend to catch newbies off guard and ruin their run.
 
@@ -96,7 +6,7 @@ At first, we need to make this clear: There is no "perfect" BitNode order. Every
 
 Doing BitNodes in chronological order (BN1->BN2->BN3->BN4->BN5->etc.) is a classic mistake. Don't do that.
 
-## BitNode characteristic
+# BitNode characteristic
 
 With each BitNode, you need to consider:
 
@@ -131,13 +41,13 @@ Some mechanics have peculiarities that you should know beforehand. For example, 
 
 All BitNodes have a unique set of multipliers that affect the difficulty of that BitNode. You can see these multipliers when choosing a BitNode in the BitVerse. [Source-File](./sourcefiles.md) 5 gives you access to these multipliers when you are already in a BitNode. Some BitNodes are much harder than others. It's recommended to unlock other Source-Files before trying to beat these hard BitNodes.
 
-## BitNode analysis
+# BitNode analysis
 
-### BitNode 1
+## BitNode 1
 
 This is the easiest BitNode, and its Source-File gives a very strong buff to most multipliers. You should repeat this BitNode to get its powerful buff.
 
-### BitNode 2
+## BitNode 2
 
 This BitNode unlocks [Gang](./gang.md). Gang is a simple and useful mechanic.
 
@@ -152,13 +62,13 @@ When you enter this BitNode, there are two things that you need to keep in mind:
 - There is no karma requirement in BitNode 2, but creating a gang too soon is a mistake. Having an adequate income boosts the early stage of Gang significantly. Outside BitNode 2, this is not a problem. When you finish farming karma, you usually have a decent income.
 - Territory is important. Enabling territory clashes when your gang is still too weak is a serious mistake. You may lose all territory. On the other hand, enabling territory clashes too late is also bad. You need to find a balance here. In short, do it soon, but not too soon.
 
-### BitNode 3
+## BitNode 3
 
 This BitNode unlocks [Corporation](./corporations.md). Corporation is one of the most controversial mechanics in Bitburner. As I said before, it's extremely complicated, extremely powerful, and extremely fast. If you have a good corporation script, you can ignore all other mechanics and speedrun most BitNodes. However, "having a good corporation script" is a serious challenge. Writing that "good script" may take days or weeks, assuming that you read the documentation carefully and have good advice from other experienced players (please join our [Discord](https://discord.gg/TFc3hKD) server and discuss there). If you try to do it blindly, Corporation is the worst mechanic.
 
 If you want to try this mechanic, you must remember this advice: When in doubt, check the in-game documentation. Corporation has the most extensive documentation in Bitburner. Note that you do not have to read all of them in one go. I recommend that you read the first 4 sections. They are the most important sections for newbies. After that, you can read the following sections at your leisure.
 
-### BitNode 4
+## BitNode 4
 
 This BitNode unlocks Singularity APIs in the `singularity` namespace (`ns.singularity`). Do you hate doing things manually (e.g., buying TOR, buying programs, connecting servers, installing backdoor)? These APIs let you do all of them programmatically.
 
@@ -166,7 +76,7 @@ If you use these APIs outside BitNode 4 and do not have Source-File 4.2 or Sourc
 
 This BitNode's multipliers are a bit harsh, especially if you only have Source-File 1. Keep this in mind if you choose it as the second BitNode after completing BitNode 1.
 
-### BitNode 5
+## BitNode 5
 
 This BitNode unlocks:
 
@@ -176,7 +86,7 @@ This BitNode unlocks:
 
 Source-File 5 also buffs hacking-related multipliers. Hacking is a core mechanic, so it's always good to have higher hacking-related multipliers.
 
-### BitNode 6 and BitNode 7
+## BitNode 6 and BitNode 7
 
 These BitNodes unlock [Bladeburner](./bladeburners.md). Bladeburner gives you an alternative way to destroy WD. In Bladeburner, you can do many actions (General, Contracts, Operations, Black Operations) to get money, experience, Bladeburner's rank, etc. You can destroy WD after completing the last Black Operation.
 
@@ -193,7 +103,7 @@ This mechanic is time-gated by the slow generation speed of contracts/operations
 
 You must be careful with chaos and Synthoid population. The UI shows you many hints about the effect of dangerous actions on chaos and Synthoid population. You should keep an eye on those hints. Generally, you must keep the chaos level low and not kill too much Synthoid population.
 
-### BitNode 8
+## BitNode 8
 
 This BitNode unlocks 2 new features for the stock market: short stock and limit/stop order.
 
@@ -201,7 +111,7 @@ This is a very challenging BitNode. It disables most normal ways to earn money s
 
 Grafting is very useful in this BitNode. Losing capital after each reset sets you back a lot. Grafting allows you to continuously install augmentations without resetting.
 
-### BitNode 9
+## BitNode 9
 
 This BitNode replaces HackNet Node with [HackNet Server](./hacknetservers.md).
 
@@ -216,7 +126,7 @@ This BitNode's multipliers are extremely harsh. You should prepare carefully bef
 
 This BitNode disables private servers and significantly raises the RAM cost of your home computer. It also heavily nerfs hacking-related multipliers. You must find a way to properly utilize HackNet servers and their variety of upgrades. Inside this BitNode, you get the effect of Source-File 9.3 even before getting that Source-File. The free highly upgraded Hacknet Server is an extremely important asset at the start of the run.
 
-### BitNode 10
+## BitNode 10
 
 This BitNode unlocks [Sleeves](./sleeves.md) and [Grafting](./grafting.md).
 
@@ -232,12 +142,12 @@ Grafting is a special way of installing augmentations.
 You should keep these things in mind:
 
 - You cannot buy Sleeves and their memory upgrades outside this BitNode.
-- Sleeves are expensive. The last Sleeve costs 100e15 (100q). You will need a [batcher](../programming/hacking_algorithms.md) or a corporation.
+- Sleeves are expensive. The last Sleeve costs 100e15 (100q). You will need a [batcher](../programming/hackingalgorithms.md) or a corporation.
 - Due to the debuff, grafting is sometimes underestimated and underutilized. When grafting, you need to choose the augmentations carefully. If you choose appropriate ones, grafting is a very strong mechanic.
 
 This BitNode's multipliers are fairly harsh. You will need a source of high income for the last Sleeve anyway, so harsh multipliers should not be a big problem. Utilizing the grafting mechanic properly lessens the harsh multipliers.
 
-### BitNode 11
+## BitNode 11
 
 This BitNode does not unlock or enhance any mechanics.
 
@@ -249,7 +159,7 @@ Its Source-File's rewards:
 
 This BitNode's multipliers are harsh, but its rewards are mediocre, especially when comparing them to rewards in other BitNodes.
 
-### BitNode 12
+## BitNode 12
 
 This is a special BitNode. In other BitNodes, the BitNode's multipliers are always the same, regardless of how many times you enter it, and the rewards only scale up to Source-File level 3. In BitNode 12, the BitNode's multipliers and the rewards scale to the Source File level, and the Source File level does not have a theoretical upper limit. For example, if you complete BitNode 12 one hundred times, you will have Source-File 12.100, and both the BitNode's multipliers and the rewards scale up to that level.
 
@@ -259,7 +169,7 @@ In this BitNode, you need to constantly change your strategy, depending on the c
 
 Note that, although there is no limit in theory, there is still a practical limit to how high you can go. You won't need to worry about that limit for a long time, though.
 
-### BitNode 13
+## BitNode 13
 
 This BitNode unlocks [Stanek's Gift](./stanek.md). Stanek's Gift is a grid that you can freely put fragments on. There are many types of fragments, and each type boosts a different mechanic.
 
@@ -271,7 +181,7 @@ You must accept Stanek's Gift before purchasing any augmentations. NFG is the on
 
 This BitNode's multipliers are extremely harsh. You should prepare carefully before entering it. Utilizing the Gift's bonuses is crucial to lessen the harsh multipliers.
 
-### BitNode 14
+## BitNode 14
 
 This BitNode's Source-File buffs IPvGO's benefits and unlocks the ability to use cheat APIs. Cheat APIs may help you tremendously if you use them strategically, especially when playing against hard opponents. The Source-File's rewards:
 
@@ -283,7 +193,7 @@ The last reward is pretty interesting. If you can consistently win several games
 
 This BitNode's multipliers are fairly harsh, but IPvGO's multipliers are buffed significantly. If you use IPvGO, even a slightly improved version of the tutorial script will help you complete this BitNode without much trouble.
 
-### BitNode 15
+## BitNode 15
 
 This BitNode increases the size and depth of the dark net. This increases the reward potential from the darknet in general. Since there are more servers, there are more opportunities for reward caches and more ram to run `phishingAttack` for money and `promoteStock` for boosting a stock with a good forecast. The Source-File's rewards:
 
@@ -295,9 +205,9 @@ The first Source-File level also allows the use of the dark net to get The Red P
 
 However, the complexity of dealing with the deep dark net and the number of different puzzles to solve make BN15 not a simple BitNode to approach. Before tackling BN15, you will want to experiment with the basic version in other nodes to get a feel for it.
 
-## Order advice
+# Order advice
 
-### The first choice
+## The first choice
 
 Repeating BitNode 1 is the best choice.
 
@@ -306,13 +216,13 @@ Repeating BitNode 1 is the best choice.
 
 You should repeat it at least once to get Source-File 1.2. Most people complete this BitNode in one go and get Source-File 1.3.
 
-### Early BitNodes
+## Early BitNodes
 
 If you want to try different gameplay, BitNode 2 is a good choice. Gang is simple and useful in most BitNodes.
 
 BitNode 5 is another good choice. Intelligence boosts many things, and it's permanent. Free access to Formulas APIs is very nice. A buff to hacking-related multipliers is useful in all BitNodes.
 
-### Situational BitNodes and Hard BitNodes
+## Situational BitNodes and Hard BitNodes
 
 If you hate doing things manually and want to automate everything, you will have to use Singularity APIs of BitNode 4. Note that this BitNode is not easy. Its multipliers are harsh, especially if you skip early BitNodes and only have Source-File 1. You also need to complete it entirely and get Source-File 4.3. Otherwise, you will have to pay the massive RAM cost. If you don't mind doing things manually, Source-File 4 is not really important.
 
@@ -326,7 +236,7 @@ BitNode 9 and BitNode 13 unlock HackNet server and Stanek's Gift, respectively. 
 
 BitNode 15 enhances the dark net. Darknet is _not_ locked behind this BitNode. It's available at the start of the game. You can unlock it by buying the `DarkscapeNavigator.exe` from the terminal once you have a TOR router. If you haven't experimented with the mechanic, you should do so before entering BN15. You _can_ complete BN15 with a simple script that only solves a few of the basic server puzzle types to get passwords and copies itself around, but it will be much slower than going through and solving a good fraction of the authentication puzzles.
 
-### Challenging BitNodes
+## Challenging BitNodes
 
 It's hard to recommend the priority of these BitNodes. They offer unique challenges. Some people can tackle them as early BitNodes without any problems. Some people complete them at the end, for the sake of completion. Some people despise and never touch them.
 
@@ -334,10 +244,10 @@ BitNode 3: This BitNode is not exactly hard. You can avoid the Corporation mecha
 
 BitNode 8: You are forced to engage the stock market in this BitNode. The hardest part is to write a good (or at least usable) pre-4S stock market script. Even with good scripts, it still takes a long time to complete this BitNode. This is an interesting challenge.
 
-### Special BitNodes
+## Special BitNodes
 
 BitNode 12 is a unique BitNode. In the first dozen levels, it's an easy one, and you can beat it with any mechanics. When the difficulty ramps up due to increasingly harsher multipliers, you have to constantly change your strategy and use different mechanics. Thinking outside the box and exploiting oversights in the interaction of mechanics are the keys to success. You should try this BitNode after unlocking all mechanics.
 
-### Bad BitNodes
+## Bad BitNodes
 
 BitNode 11 is hard, but its rewards are mediocre. You should only do it at the end, for the sake of completion.

@@ -54,7 +54,7 @@ The only things that will persist through destroying BitNodes are:
 
 If you want to get advice on choosing your next BitNode, you can check this BitNode recommendation guide:
 
-- [BitNode recommendations](bitnode-recommendations.md)
+- BitNode recommendations: [short guide](bitnode_recommendation_short_guide.md) · [comprehensive guide](bitnode_recommendation_comprehensive_guide.md)
 
 ## BitNode list
 

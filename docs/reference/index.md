@@ -41,7 +41,7 @@ This `docs/` tree holds two kinds of material:
 
 - [List of factions and their requirements](advanced/faction_list.md)
 - [BitNodes](advanced/bitnodes.md)
-- [BitNode recommendations](advanced/bitnode-recommendations.md)
+- BitNode recommendations: [short guide](advanced/bitnode_recommendation_short_guide.md) · [comprehensive guide](advanced/bitnode_recommendation_comprehensive_guide.md)
 - [Source-Files](advanced/sourcefiles.md)
 - [Gangs](advanced/gang.md) · [full gang guide](advanced/gang-guide.md)
 - [Corporation](advanced/corporations.md) (deep dives under [corporation/](advanced/corporation/))
@@ -64,6 +64,14 @@ This `docs/` tree holds two kinds of material:
 - [Learn to program](programming/learn.md)
 - [TypeScript and React](programming/typescript_react.md)
 - [Game frozen or stuck?](programming/game_frozen.md)
+
+## Game reference — API migration guides
+
+Guides for updating scripts when the Netscript API changes between major versions.
+
+- [Netscript 2 migration](migrations/ns2.md) — moving off the removed NS1 (`.script`) interpreter
+- [v1.0.0 migration](migrations/v1.md)
+- [v2.0.0 migration](migrations/v2.md)
 
 ## Help
 

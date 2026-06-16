@@ -2717,7 +2717,7 @@ export interface Singularity {
   /**
    * Hospitalize the player.
    * @remarks
-   * RAM cost: 0.5 GB * 16/4/1
+   * RAM cost: 0.25 GB * 16/4/1
    */
   hospitalize(): void;
 
@@ -2820,7 +2820,7 @@ export interface Singularity {
   /**
    * Get a list of programs offered on the dark web.
    * @remarks
-   * RAM cost: 0.5 GB * 16/4/1
+   * RAM cost: 1 GB * 16/4/1
    *
    *
    * This function allows the player to get a list of programs available for purchase
@@ -4375,19 +4375,6 @@ export interface Format {
    * @returns The formatted time.
    */
   time(milliseconds: number, milliPrecision?: boolean): string;
-
-  /**
-   * Format a number as an amount of money.
-   * @remarks
-   * RAM cost: 0 GB
-   *
-   * Converts a number into a numeric string, using the user-defined currency prefix/suffix.
-   *
-   * @param n - Amount of money to format.
-   * @param exponential - Whether or not to use exponential form for small numbers (between 0 and 0.001). Defaults to false.
-   * @returns Formatted amount of money.
-   */
-  money(n: number, exponential?: boolean): string;
 }
 
 /**
@@ -4430,22 +4417,7 @@ export type DarknetResult = { success: boolean; code: DarknetResponseCode; messa
 export type CacheResult = {
   success: boolean;
   message: string;
-} & CacheReward;
-
-/** @public */
-export type CacheReward = {
   karmaLoss: number;
-  wseAccount: boolean;
-  tixApiAccess: boolean;
-  fourSigmaData: boolean;
-
-  money?: number;
-  programName?: ProgramName;
-  stockSymbol?: string;
-  stockShares?: number;
-  dataFilePaths?: string[];
-  contractFilePaths?: string[];
-  augmentationName?: string;
 };
 
 /**
@@ -5179,7 +5151,7 @@ type GoOpponent =
   | "????????????";
 
 /** @public */
-interface SimpleOpponentStats {
+type SimpleOpponentStats = {
   /** Number of wins since last reset */
   wins: number;
   /** Number of losses since last reset*/
@@ -5194,7 +5166,7 @@ interface SimpleOpponentStats {
   bonusPercent: number;
   /** Description of stat boost */
   bonusDescription: string;
-}
+};
 
 /**
  * Tools to analyze the IPvGO subnet.
@@ -5330,6 +5302,22 @@ export interface GoAnalysis {
   /**
    * Displays the game history, captured nodes, and gained bonuses for each opponent you have played against.
    *
+   * The details are keyed by opponent name, in this structure:
+   *
+   * ```
+   * {
+   *   <OpponentName>: {
+   *     wins: number,
+   *     losses: number,
+   *     winStreak: number,
+   *     highestWinStreak: number,
+   *     favor: number,
+   *     bonusPercent: number,
+   *     bonusDescription: string,
+   *   }
+   * }
+   * ```
+   *
    * @remarks
    * RAM cost: 0 GB
    *
@@ -5435,7 +5423,7 @@ export interface GoCheat {
   /**
    * Attempts to remove an existing router, leaving an empty node behind.
    *
-   * Success chance can be seen via ns.go.cheat.getCheatSuccessChance()
+   * Success chance can be seen via ns.go.getCheatSuccessChance()
    *
    * Warning: if you fail to play a cheat move, your turn will be skipped. After your first cheat attempt, if you fail, there is a
    * small (~10%) chance you will instantly be ejected from the subnet.
@@ -5463,7 +5451,7 @@ export interface GoCheat {
    * Attempts to place two routers at once on empty nodes. Note that this ignores other move restrictions, so you can
    * suicide your own routers if they have no access to empty ports and do not capture any enemy routers.
    *
-   * Success chance can be seen via ns.go.cheat.getCheatSuccessChance()
+   * Success chance can be seen via ns.go.getCheatSuccessChance()
    *
    * Warning: if you fail to play a cheat move, your turn will be skipped. After your first cheat attempt, if you fail, there is a
    * small (~10%) chance you will instantly be ejected from the subnet.
@@ -5495,7 +5483,7 @@ export interface GoCheat {
   /**
    * Attempts to repair an offline node, leaving an empty playable node behind.
    *
-   * Success chance can be seen via ns.go.cheat.getCheatSuccessChance()
+   * Success chance can be seen via ns.go.getCheatSuccessChance()
    *
    * Warning: if you fail to play a cheat move, your turn will be skipped. After your first cheat attempt, if you fail, there is a
    * small (~10%) chance you will instantly be ejected from the subnet.
@@ -5524,7 +5512,7 @@ export interface GoCheat {
    * Attempts to destroy an empty node, leaving an offline dead space that does not count as territory or
    * provide open node access to adjacent routers.
    *
-   * Success chance can be seen via ns.go.cheat.getCheatSuccessChance()
+   * Success chance can be seen via ns.go.getCheatSuccessChance()
    *
    * Warning: if you fail to play a cheat move, your turn will be skipped. After your first cheat attempt, if you fail, there is a
    * small (~10%) chance you will instantly be ejected from the subnet.
@@ -6308,7 +6296,7 @@ interface HackingFormulas {
    * Calculate the security decrease from a weaken operation.
    * Unlike other hacking formulas, weaken effect depends only on thread count and
    * core count, not on server or player properties. The core bonus formula is
-   * `1 + (cores - 1) / 16`.
+   * `1 + (cores - 1) / 16}`.
    * @param threads - Number of threads running weaken.
    * @param cores - Number of cores on the host server. Default 1.
    * @returns The security decrease amount.
@@ -6706,7 +6694,7 @@ interface Stanek {
   /**
    * Get placed fragment at location.
    * @remarks
-   * RAM cost: 2 GB
+   * RAM cost: 5 GB
    *
    * @param rootX - X against which to align the top left of the fragment.
    * @param rootY - Y against which to align the top left of the fragment.
@@ -7011,34 +6999,16 @@ interface UserInterface {
   /**
    * Clear the Terminal window, as if the player ran `clear` in the terminal
    * @remarks
-   * RAM cost: 0 GB
+   * RAM cost: 0.2 GB
    */
   clearTerminal(): void;
-
-  /**
-   * Opens the specified file(s) in the code editor.
-   *
-   * @remarks
-   * RAM cost: 0 GB
-   *
-   * This opens files from the server the script is running on, which may be different than the server the terminal is connected to.
-   *
-   * @example
-   * ```js
-   *   ns.ui.openCodeEditor("foo.js");
-   *   ns.ui.openCodeEditor(["bar.js", "data.json"], { vim: true });
-   * ```
-   *
-   * @param files - Optional. The file(s) to open in the editor. If not provided, opens the editor to the last edited file, if any.
-   * @param editorOptions - Optional. Settings for opening the editor, such as `vim` mode
-   */
-  openCodeEditor(files?: string | string[], editorOptions?: EditorOptions): void;
 }
 
 /**
  * Collection of all functions passed to scripts
  * @public
- * @example
+ * @remarks
+ * <b>Basic usage example:</b>
  * ```js
  * export async function main(ns) {
  *  // Basic ns functions can be accessed on the ns object
@@ -7980,7 +7950,7 @@ export interface NS {
    * @param threadOrOptions - Either an integer number of threads for new script, or a {@link SpawnOptions} object. Threads defaults to 1 and spawnDelay defaults to 10,000 ms.
    * @param args - Additional arguments to pass into the new script that is being run.
    */
-  spawn(script: string, threadOrOptions?: number | SpawnOptions, ...args: ScriptArg[]): never;
+  spawn(script: string, threadOrOptions?: number | SpawnOptions, ...args: ScriptArg[]): void;
 
   /**
    * Returns the currently running script.
@@ -9628,7 +9598,7 @@ export type CodingContractSignatures = {
   "Encryption I: Caesar Cipher": [[string, number], string];
   "Encryption II: Vigenère Cipher": [[string, string], string];
   "Square Root": [bigint, bigint, [string, string]];
-  "Total Number of Primes": [[number, number], number];
+  "Total Number of Primes": [number[], number];
   "Largest Rectangle in a Matrix": [(1 | 0)[][], [[number, number], [number, number]]];
 };
 
@@ -11049,18 +11019,6 @@ interface GameInfo {
   commit: string;
   /** Platform that the game is running on */
   platform: "Browser" | "Steam";
-}
-
-/**
- * Options for opening the code editor
- * @public
- */
-interface EditorOptions {
-  /**
-   * Optional. If true, opens the editor in vim mode. If false, opens the editor in nano mode.
-   * If not provided, uses the user's default editor settings
-   */
-  vim?: boolean;
 }
 
 /**

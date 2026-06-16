@@ -14,4 +14,5 @@ Contents:
 - `basic/` — core game mechanics (hacking, servers, scripts, stock market, etc.)
 - `advanced/` — endgame mechanics (gangs, bladeburners, corporations, BitNodes, etc.)
 - `programming/` — Netscript API reference, algorithms, remote API
+- `migrations/` — API migration guides for major version bumps (NS2, v1, v2)
 - `NetscriptDefinitions.d.ts` — full TypeScript type definitions for the Netscript API
