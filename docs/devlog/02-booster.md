@@ -1,7 +1,30 @@
 # Devlog 02 — `booster`: The Early-Game Bootstrap Controller
 
-**Date:** 2026-06-15
-**Status:** Design (no code written yet)
+**Date:** 2026-06-15 (design); 2026-06-16 (implementation in progress)
+**Status:** Core hacking engine built and validated in-game; managers + Formulas
+handoff pending.
+
+## Implementation status
+
+Built in stages, each verified in-game (test save with rooted network + large
+home RAM). Source: `src/booster.js`, workers in `src/workers/`, tunables in
+`src/config/constants.js`.
+
+| Stage | Scope | Status |
+|-------|-------|--------|
+| 1 | Discovery, rooting, worker provisioning, topology JSON | ✅ done |
+| 2 | Hack-% tables, target scoring, ranking | ✅ done |
+| 3a | Control loop, RAM pool, thread placement, prep | ✅ done |
+| 3b | Rolling HWGW grid batcher + enter/stay hysteresis | ✅ done |
+| 3c | Recovery grow (climb drifted targets back to max) | ✅ done |
+| 5 (partial) | Live status table (tail window) | ✅ done |
+| 4 | Manager orchestration (managers not yet written) | ⬜ pending |
+| 5 | Formulas.exe handoff | ⬜ **deliberately disabled** — loop is `while(true)` so it can be tested on a save that already owns Formulas.exe. Restore the `while(!fileExists(FORMULAS_EXE))` exit when moving to a fresh BN. |
+
+Key lessons captured during implementation: the NS-property RAM collision (see
+section below), the hysteresis fix for false-drift churn, and the recovery-grow
+insight (a pure HWGW batch *maintains* money but has no surplus to *recover* it,
+so low-growth targets settle below max without a top-up).
 
 ## What it is
 

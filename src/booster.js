@@ -99,7 +99,7 @@ export async function main(ns) {
         prepPhase(ns, needsPrep, pool, inFlight);
 
         logEvents(ns, eligible, needsPrep, pool);
-        printStatus(ns, servers, pool, eligible, needsPrep);
+        renderStatus(ns, servers, pool, eligible, needsPrep);
         await ns.sleep(LOOP_SLEEP);
     }
 }
@@ -524,14 +524,51 @@ function logLine(ns, line) {
     ns.write(BOOSTER_LOG, `[${new Date().toLocaleTimeString()}] ${line}\n`, "a");
 }
 
-/** Concise per-tick status to the script log (tail window). */
-function printStatus(ns, servers, pool, eligible, needsPrep) {
+/** Render a refreshing status table to the tail window each tick. */
+function renderStatus(ns, servers, pool, eligible, needsPrep) {
+    ns.clearLog();
+    const level = ns.getHackingLevel();
     const rooted = servers.filter((s) => s.hasRoot).length;
+    const totalRam = servers.reduce((sum, s) => (s.hasRoot ? sum + s.maxRam : sum), 0);
+    const free = poolFree(pool);
+    const income = eligible.reduce((sum, t) => sum + expectedIncome(t), 0);
+
+    const W = 58;
+    ns.print(`╔═ BOOSTER ═ ${new Date().toLocaleTimeString()} ${"═".repeat(Math.max(0, W - 24))}`);
+    ns.print(`║ Hack Lv ${level}  |  Rooted ${rooted}/${servers.length}  |  Pool ${ns.format.ram(free)} free / ${ns.format.ram(totalRam)}`);
+    ns.print(`║ Batching ${eligible.length}  |  Prepping ${needsPrep.length}  |  Est income $${ns.format.number(income)}/s`);
+    ns.print(`╠${"═".repeat(W)}`);
     ns.print(
-        `[${new Date().toLocaleTimeString()}] ` +
-        `rooted ${rooted}/${servers.length} | batching ${eligible.length} | ` +
-        `prepping ${needsPrep.length} | pool free ${ns.format.ram(poolFree(pool))}`
+        "║ " +
+        "TARGET".padEnd(16) +
+        "MON%".padStart(5) +
+        "SEC".padStart(7) +
+        "HK%".padStart(5) +
+        "BATCH".padStart(7) +
+        "$/s".padStart(11)
     );
+    for (const t of eligible) {
+        const monPct = Math.round((t.money / t.maxMoney) * 100);
+        const secOver = (t.sec - t.minSecurity).toFixed(2);
+        const conc = Math.ceil(t.weakenTime / BATCH_PERIOD);
+        ns.print(
+            "║ " +
+            t.hostname.padEnd(16) +
+            `${monPct}%`.padStart(5) +
+            `+${secOver}`.padStart(7) +
+            `${(t.f * 100).toFixed(0)}%`.padStart(5) +
+            `x${conc}`.padStart(7) +
+            ns.format.number(expectedIncome(t)).padStart(11)
+        );
+    }
+    if (needsPrep.length > 0) {
+        ns.print(`╠═ Prepping ${"═".repeat(W - 11)}`);
+        const items = needsPrep
+            .slice(0, 8)
+            .map((t) => `${t.hostname}(${Math.round((t.money / t.maxMoney) * 100)}%)`);
+        ns.print("║ " + items.join("  "));
+    }
+    ns.print(`╚${"═".repeat(W)}`);
 }
 
 /** Strip a leading slash so script paths compare consistently. */
