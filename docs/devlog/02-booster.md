@@ -205,6 +205,69 @@ drain / raise-security) so no manual setup is needed.
    server is at/near max money. (This is why the validation tool raises
    security via hack, not grow.)
 
+## Manager orchestration
+
+`booster` auto-launches the manager scripts on `home`, but only *orchestrates*
+them — each manager is an independent script with its own internal spending
+logic. This costs `booster` **zero extra RAM**: launching needs only `exec`,
+`ps`, and `getServerMoneyAvailable`, all already in the budget.
+
+### Fixed dependency order
+
+`booster` holds an **ordered** list of managers, each with a `gate()`. Each
+tick it launches the **first not-yet-running** manager whose gate passes — and
+**will not launch a later manager until all earlier ones are already
+running**. That ordering is what makes the sequence "fixed."
+
+| Order | Manager | Gate | Rationale |
+|-------|---------|------|-----------|
+| 1 | contracts solver | none (network rooted) → immediate | free money/rep, trivial cost |
+| 2 | pserver buyer/upgrader | `money ≥ cost of smallest useful server` | highest compounding ROI — purchased servers feed the batch RAM pool |
+| 3 | hacknet buyer/upgrader | pserver fleet **fully built**: 25 servers each with `maxRam ≥ 32 TB` (32768 GB) | weak early ROI; defer until the synergistic RAM investment is exhausted |
+| 4 | gang (future) | BN/karma-gated | deferred |
+| 5 | bladeburner (future) | unlock-gated | deferred |
+
+Affordability/launch decisions live in `booster`; **spending** decisions live
+inside each manager (e.g. the pserver manager only reinvests a budget
+fraction). `booster` does not micromanage.
+
+The hacknet gate is computed from existing scan data — `booster` counts
+topology entries whose hostname starts with the shared `PSERVER_PREFIX` and
+whose `maxRam ≥ 32 TB`. No new NS calls; `PSERVER_PREFIX` lives in
+`config/constants.js` so the pserver manager and `booster` agree on the name.
+
+### Avoiding double-launch
+
+Managers are persistent loops. Before `exec`-ing one, `booster` checks
+`ns.ps("home")` for that script's filename, so a `booster` restart never spawns
+duplicates (in-memory tracking alone is insufficient — `booster` itself can be
+restarted).
+
+### RAM interaction
+
+Managers run on `home` and consume its RAM, which automatically shrinks the
+worker pool (`booster` reads real free RAM via `getServerUsedRam` each tick).
+Running managers therefore need no special accounting — they show up in
+`getServerUsedRam`.
+
+The key choice is **gated launch, not run-idle**: a manager launched early but
+blocked on an internal gate would sit in a loop holding its full RAM while
+doing nothing — wasting it for the whole deferred period (and *forever* for
+gang/bladeburner if that BN never unlocks them). Gating the launch instead
+keeps that RAM in the hacking pool — earning money — until the manager is
+genuinely wanted.
+
+Crucially, `booster` does **not** pre-reserve the whole manager suite. It
+reserves only `booster` itself (8.2 GB) plus headroom for the **next** pending
+manager (so it can `exec` when its gate trips, reclaiming RAM from marginal
+workers if needed). Far-future managers (hacknet, gang, bladeburner) reserve
+nothing until they're next in line — their RAM stays available to workers
+meanwhile. This is strictly more RAM-efficient than launching managers idle.
+
+(For contracts and pservers the distinction is moot — their gates trip almost
+immediately, so they start working right away either way. The gate earns its
+keep on the deferred managers.)
+
 ## Worker scripts
 
 Three single-shot workers live in `src/workers/` (in-game `/workers/hack.js`,
@@ -279,11 +342,75 @@ pipelineRAM(target) = concurrentBatches × ramPerBatch(chosen f)
 **This `pipelineRAM` — not a single batch — is what allocation checks against
 the RAM pool.** (The earlier "pipeline RAM, not single-batch RAM" caveat.)
 
-`booster`'s main loop wakes roughly every `BATCH_PERIOD`; on each wake it
-launches the next batch for each active target whose pipeline has a free slot
-and whose `pipelineRAM` still fits. Launch-time jitter only shifts which
-`BATCH_PERIOD` window a batch starts in — landing precision is handled by
-`additionalMsec`, so coarse loop timing is fine.
+### Absolute land-time grid (the key to a permanently-full pipeline)
+
+The goal is steady-state: the pipeline stays full at all times, with no
+correction waves that stop earning money. The mechanism is to anchor landings
+to a **fixed absolute time grid** per target, not to the loop's timing.
+
+Per target, keep a launch clock: a time base `t0` and a batch index `n`.
+Batch `n`'s W1 is *defined* to land at:
+
+```
+L_n = t0 + n × BATCH_PERIOD
+```
+
+When `booster` actually fires batch `n`, it computes each worker's delay from
+the **real current time against the fixed grid**:
+
+```
+additionalMsec(op) = (L_n + opOffset) − now − opBaseDuration
+```
+
+(where `opOffset` is 0 for W1, `−D` for H, `+D` for G, `+2D` for W2.)
+
+The crucial property: **the op lands at `L_n` exactly, regardless of when
+within the launch window `booster` actually fired the exec.** If the loop wakes
+80 ms late, the engine adds 80 ms less delay and the landing still hits the
+grid. Loop jitter is absorbed (up to nearly a full `weakenTime` of slack), so
+batches land exactly `BATCH_PERIOD` apart, in order, indefinitely — **no drift
+accumulates, so no correction waves are needed.**
+
+Because exactly one batch is fired per `BATCH_PERIOD` and each lives
+`weakenTime`, the steady-state in-flight count is
+`weakenTime / BATCH_PERIOD = concurrentBatches`, continuously and gapless. The
+loop only needs to wake often enough (e.g. every `BATCH_PERIOD / 2`) to hit
+each slot's launch window; lateness within the window is corrected by the
+`additionalMsec` recomputation above.
+
+### Control loop: stateless truth + phase clock
+
+State is deliberately minimal — only the per-target launch clock (`t0`, `n`).
+Everything else is re-derived from live truth each tick, which keeps `booster`
+**restart-safe** (kill and relaunch → re-anchor `t0` to now, read `ps` to see
+the pipeline is already full, resume; the one-time phase hiccup is smoothed by
+self-heal).
+
+```
+loop forever:
+  (periodically) scan + root + scp + rewrite topology JSON
+  build RAM pool: per server free RAM (getServerMaxRam − getServerUsedRam − reserve)
+  derive in-flight batches per target from ps across rooted servers
+  rebuild each target's hack-% table IF hacking level changed
+  classify targets from live money/security: prepped / needs-prep / drifted
+  for each drifted target: pause launches, prep back to baseline (self-heal)
+  for each prepped target by rank:
+      while now is at/after the next grid launch (S_n = L_n − weakenTime)
+            and pipelineRAM still fits:
+          fire batch n (threads from table at chosen f; delays from the grid)
+          n += 1
+  leftover RAM → prep next needs-prep target
+  launch next pending manager if its gate trips
+  redraw status table
+  sleep ~BATCH_PERIOD / 2
+```
+
+- **`ps`-derived in-flight count** decides *how many* batches to fire (top-up);
+  the **grid** decides *when each lands*. The two are independent — order is the
+  engine's job via `additionalMsec`, never the loop's.
+- **Cold start** is the trivial case: the pipeline is empty, so the loop fires
+  the whole pipeline's worth of batches in one pass (each on its grid slot,
+  perfectly spaced) and then settles into one-per-`BATCH_PERIOD` top-up.
 
 ### Thread splitting across servers
 
@@ -300,10 +427,20 @@ spread across the RAM pool (`home` + rooted servers, minus `HOME_RESERVE`):
   per instance (e.g. `${batchSeq}-${op}-${hostIndex}`) for clean `ps`/`kill`
   accounting.
 
-### Desync self-heal
+### Desync self-heal (safety net, not the primary mechanism)
 
-Pre-Formulas timing isn't perfect, so batches will occasionally land out of
-order and leave a target off-baseline. Each tick, for every batching target:
+The absolute land-time grid prevents *timing-driven* desync — batches land in
+order regardless of loop jitter. So self-heal is no longer the workhorse; it's
+a rarely-triggered safety net. The one genuine remaining drift source is
+**mid-flight hacking level-ups**: if your level rises after a batch is sized
+but before it lands, that batch's hack steals slightly more than its grow
+restores, nudging the target off baseline. Two things keep this from
+cascading: the thread table is rebuilt on level change (new batches stay
+correct), and grow's safe-direction over-provisioning (~4% over + `ceil`
+rounding) gives each batch a buffer to fully restore baseline. Level-ups also
+become rarer as the BN progresses.
+
+When drift does occur, each tick, for every batching target:
 
 1. If money < `maxMoney × (1 − MONEY_EPSILON)` or security >
    `minSecurity × (1 + SEC_MARGIN)`, the target has **drifted**.
