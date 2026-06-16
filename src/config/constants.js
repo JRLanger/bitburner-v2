@@ -50,6 +50,15 @@ export const BATCH_KEEP_MONEY_FRAC = 0.2;
 /** Keep batching while security ≤ minSecurity + this (absolute). */
 export const BATCH_KEEP_SEC_OVER = 5;
 
+// Recovery: a pure HWGW batch maintains money but provides no surplus to climb
+// back to max if a target ever dips below it. When a batching target sits below
+// this fraction of max (a sustained drift, not a healthy mid-cycle dip), inject
+// supplemental grow to pull it back up.
+/** Fire recovery grow when a batching target's money < maxMoney × this. */
+export const RECOVER_MONEY_FRAC = 0.95;
+/** Fire recovery weaken when a batching target's security > minSecurity + this. */
+export const RECOVER_SEC_OVER = 1;
+
 // ── Hack-percentage table ──────────────────────────────────────────────────
 
 /** Resolution of the per-target hack-% table. */

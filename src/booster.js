@@ -20,6 +20,8 @@ import {
     MONEY_EPSILON,
     BATCH_KEEP_MONEY_FRAC,
     BATCH_KEEP_SEC_OVER,
+    RECOVER_MONEY_FRAC,
+    RECOVER_SEC_OVER,
     HACK_PCT_MIN,
     HACK_PCT_MAX,
     HACK_PCT_STEP,
@@ -317,6 +319,36 @@ function batchPhase(ns, eligible, pool) {
             clock.nextLaunch += BATCH_PERIOD;
             k++;
         }
+
+        // Pull the target back to baseline if it has drifted below max (the
+        // batch alone maintains but never recovers lost ground).
+        maybeRecover(ns, t, pool);
+    }
+}
+
+/**
+ * Supplemental correction for a batching target that has drifted off baseline.
+ * Fires extra grow (and counter-weaken) to climb money back to max, and extra
+ * weaken if security has crept above min. Grow/weaken clamp at max/min, so
+ * over-firing is harmless. Delays are 0; grow lands at growTime and the weaken
+ * at the longer weakenTime, so the weaken cleans up after the grow.
+ */
+function maybeRecover(ns, t, pool) {
+    const target = t.hostname;
+
+    if (t.money < t.maxMoney * RECOVER_MONEY_FRAC) {
+        const mult = t.maxMoney / Math.max(t.money, 1);
+        const need = Math.ceil(ns.growthAnalyze(target, mult));
+        const placed = placeThreads(ns, pool, GROW_WORKER, WORKER_RAM.growRam, need, target, 0);
+        if (placed > 0) {
+            const counter = Math.ceil((placed * GROW_SEC) / WEAKEN_SEC);
+            placeThreads(ns, pool, WEAKEN_WORKER, WORKER_RAM.weakenRam, counter, target, 0);
+        }
+    }
+
+    if (t.sec > t.minSecurity + RECOVER_SEC_OVER) {
+        const need = Math.ceil((t.sec - t.minSecurity) / WEAKEN_SEC);
+        placeThreads(ns, pool, WEAKEN_WORKER, WORKER_RAM.weakenRam, need, target, 0);
     }
 }
 
