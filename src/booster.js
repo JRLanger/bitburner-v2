@@ -36,6 +36,8 @@ import {
     CHANCE_BATCH,
     BATCH_BUDGET_FRAC,
     MAX_FIRES_PER_TICK,
+    MAX_BATCH_TARGETS,
+    PREP_LOOKAHEAD,
     D_GAP,
     BATCH_PERIOD,
     BATCH_SAFETY_MS,
@@ -122,12 +124,23 @@ export async function main(ns) {
         const poolTotal =
             servers.reduce((sum, s) => (s.hasRoot ? sum + s.maxRam : sum), 0) -
             HOME_SAFETY_BUFFER_GB;
-        const batchers = selectBatchers(eligible, poolTotal);
+        const { batchers, reserved } = selectBatchers(ns, eligible, poolTotal);
 
         // Batch the admitted targets first (consumes RAM by rank), then spend
         // whatever's left prepping the next-best targets.
         batchPhase(ns, batchers, pool);
-        prepPhase(ns, needsPrep, pool, inFlight);
+
+        // Reserve the batchers' *unclaimed* pipeline RAM from prep, so a target
+        // ramping toward its full pipeline (which fills gradually over a weaken
+        // time) isn't starved by greedy prep waves. Batch RAM already running ≈
+        // in-flight worker threads × per-thread RAM; the rest of the reservation
+        // must stay free for the pipeline to keep filling.
+        let batchRunningRam = 0;
+        for (const t of batchers) {
+            batchRunningRam += (inFlight.get(t.hostname) ?? 0) * WORKER_RAM.weakenRam;
+        }
+        const prepFloor = Math.max(0, reserved - batchRunningRam);
+        prepPhase(ns, needsPrep, pool, inFlight, prepFloor);
 
         // Future hook (RAM-share): once prep is clear, the genuine excess is
         //   excess = poolFree(pool) - poolTotal * (1 - BATCH_BUDGET_FRAC)
@@ -315,7 +328,12 @@ function classify(ns, servers) {
     }
 
     eligible.sort((a, b) => b.score - a.score);
-    needsPrep.sort((a, b) => b.maxMoney - a.maxMoney);
+    // Prep easiest-earner first (ascending maxMoney ≈ fewer grow threads to fill ≈
+    // cheaper/faster to prep). With a tiny early pool this gets the trivial servers
+    // prepped and earning in seconds — funding the pool that later preps the big
+    // ones — instead of stalling for hours on un-preppable large servers at the
+    // front of the queue. `maxMoney` is the free, tunable prep-cost proxy.
+    needsPrep.sort((a, b) => a.maxMoney - b.maxMoney);
     return { eligible, needsPrep };
 }
 
@@ -328,37 +346,58 @@ function isPrepped(s, sec, money) {
 }
 
 /**
- * Admission control. Of the prepped, eligible targets (already score-sorted),
- * admit the highest-ranked subset whose cumulative steady-state pipeline RAM
- * stays under BATCH_BUDGET_FRAC of the total pool — the rest idle (they stay
- * prepped at zero RAM cost since they aren't hacked). This caps aggregate batch
- * demand below pool capacity so admitted pipelines never starve for RAM and
- * never half-fire (the cause of money/security drift), and guarantees prep keeps
- * the reserved headroom.
+ * Admission control + depth-first RAM allocation. Walks the prepped, eligible
+ * targets in rank order and gives each, greedily, the RAM it can use before moving
+ * to the next — so the best target is filled toward its full pipeline before a
+ * lower-ranked one starts. The rest idle (prepped, zero RAM cost since un-hacked).
  *
- * Hysteresis: last tick's batchers (tracked in `wasBatching`) are considered for
- * admission before new candidates, so the active set doesn't flap tick-to-tick.
+ * Per target, given the `remaining` budget:
+ *  - if a single *optimal* batch fits, use the locked optimal plan (`t`) — stable,
+ *    the normal big-pool path;
+ *  - else step the hack-% DOWN to the best batch that fits `remaining`
+ *    (`bestHackPct(..., remaining)`), so a small early pool can still batch;
+ *  - reserve `min(full pipeline, remaining)`. A stepped-down target therefore
+ *    claims the *whole* remaining budget (the next target waits) and runs a shallow
+ *    pipeline that batchPhase deepens automatically as free RAM grows. As the pool
+ *    grows the hack-% climbs back to optimal, then depth fills, then the pipeline
+ *    completes and the leftover budget overflows to the next-best target.
+ *
+ * Hysteresis: last tick's batchers (`wasBatching`) get first claim so the active
+ * set doesn't flap. Two ceilings: the RAM budget (early, RAM-limited) and
+ * MAX_BATCH_TARGETS (late, lag-limited); whichever binds first wins.
  */
-function selectBatchers(eligible, poolTotal) {
+function selectBatchers(ns, eligible, poolTotal) {
     const budget = poolTotal * BATCH_BUDGET_FRAC;
-    const pipelineRam = (t) => Math.ceil(t.weakenTime / BATCH_PERIOD) * t.ramPerBatch;
+    const concurrency = (t) => Math.ceil(t.weakenTime / BATCH_PERIOD);
 
     const admitted = [];
     let used = 0;
-    // Pass 1 keeps already-batching targets; pass 2 admits new ones with the
-    // budget that's left. Each pass walks `eligible` in its existing rank order.
+    // Pass 1 keeps already-batching targets; pass 2 admits new ones with whatever
+    // budget is left. Each pass walks `eligible` in its existing rank order.
     for (const keepPass of [true, false]) {
         for (const t of eligible) {
+            if (admitted.length >= MAX_BATCH_TARGETS) break;
             if (wasBatching.has(t.hostname) !== keepPass) continue;
-            const need = pipelineRam(t);
-            if (used + need > budget) continue;
-            used += need;
-            admitted.push(t);
+            const remaining = budget - used;
+
+            let entry, ramPerBatch;
+            if (remaining >= t.ramPerBatch) {
+                entry = t; // optimal batch fits → use the locked optimal plan
+                ramPerBatch = t.ramPerBatch;
+            } else {
+                const fitted = bestHackPct(ns, t, t.chance, remaining); // step down
+                if (!fitted) continue; // not even the smallest batch fits → skip
+                entry = { ...t, ...fitted, score: t.score }; // keep optimal score for rank
+                ramPerBatch = fitted.ramPerBatch;
+            }
+
+            used += Math.min(concurrency(t) * ramPerBatch, remaining);
+            admitted.push(entry);
         }
     }
 
     admitted.sort((a, b) => b.score - a.score); // restore global rank order
-    return admitted;
+    return { batchers: admitted, reserved: used };
 }
 
 // ── Batch phase (rolling HWGW grid scheduler) ───────────────────────────────
@@ -474,11 +513,20 @@ function fireBatch(ns, pool, t, base, now, hackTime, growTime, weakenTime) {
  * valuable first, one corrective wave per target at a time (skip targets that
  * already have workers in flight).
  */
-function prepPhase(ns, needsPrep, pool, inFlight) {
+function prepPhase(ns, needsPrep, pool, inFlight, prepFloor = 0) {
+    // Breadth guard: when the batch cap is active, don't prep more servers than
+    // could earn a slot soon (cap + lookahead). needsPrep is easiest-first, so
+    // this preps the cheapest candidates. Inert when MAX_BATCH_TARGETS is large.
+    const prepBudget = MAX_BATCH_TARGETS + PREP_LOOKAHEAD;
+    let considered = 0;
     for (const t of needsPrep) {
-        if (poolFree(pool) <= 0) break;
+        if (considered >= prepBudget) break;
+        considered++;
+        // Stop once free RAM hits the batchers' reserved-but-unclaimed floor —
+        // that RAM belongs to ramping pipelines, not prep.
+        if (poolFree(pool) <= prepFloor) break;
         if ((inFlight.get(t.hostname) ?? 0) > 0) continue; // wave already running
-        prepWave(ns, t, pool);
+        prepWave(ns, t, pool, poolFree(pool) - prepFloor);
     }
 }
 
@@ -488,12 +536,17 @@ function prepPhase(ns, needsPrep, pool, inFlight) {
  *  - else grow money toward max, plus weaken to counter grow's security rise
  *    (grow lands at growTime, the counter-weaken at the longer weakenTime, so
  *    the weaken naturally lands after the grow it offsets).
+ *
+ * `ramBudget` caps the RAM this single wave may consume so one large grow can't
+ * blow past the prep floor (and into the batchers' reserved RAM). A wave that
+ * doesn't fully fit just makes partial progress and finishes on later ticks.
  */
-function prepWave(ns, t, pool) {
+function prepWave(ns, t, pool, ramBudget = Infinity) {
     const target = t.hostname;
 
     if (t.sec > t.minSecurity * (1 + SEC_MARGIN)) {
-        const need = Math.ceil((t.sec - t.minSecurity) / WEAKEN_SEC * THREAD_MARGIN);
+        let need = Math.ceil((t.sec - t.minSecurity) / WEAKEN_SEC * THREAD_MARGIN);
+        need = Math.min(need, Math.floor(ramBudget / WORKER_RAM.weakenRam));
         const placed = placeThreads(ns, pool, WEAKEN_WORKER, WORKER_RAM.weakenRam, need, target, 0);
         // Only count this wave as handled if weaken threads actually landed; if
         // the pool was momentarily empty, fall through / retry next tick rather
@@ -501,9 +554,11 @@ function prepWave(ns, t, pool) {
         if (placed > 0) return;
     }
 
-    // Security is fine; restore money.
+    // Security is fine; restore money. Cap grow to the budget, leaving a little for
+    // the counter-weaken (~1 weaken per 12.5 grow, so the grow share dominates).
     const mult = t.maxMoney / Math.max(t.money, 1);
-    const growNeed = Math.ceil(ns.growthAnalyze(target, mult) * THREAD_MARGIN);
+    let growNeed = Math.ceil(ns.growthAnalyze(target, mult) * THREAD_MARGIN);
+    growNeed = Math.min(growNeed, Math.floor((ramBudget * 0.9) / WORKER_RAM.growRam));
     const placed = placeThreads(ns, pool, GROW_WORKER, WORKER_RAM.growRam, growNeed, target, 0);
     if (placed > 0) {
         const counter = Math.ceil((placed * GROW_SEC) / WEAKEN_SEC * THREAD_MARGIN);
@@ -535,10 +590,18 @@ function placeThreads(ns, pool, script, ramPerThread, threads, target, delay) {
 // ── Scoring (kept for stage 3b batching; not used in the 3a prep loop) ───────
 
 /**
- * Sweep hack fractions and return the row with the best score ($/GB/s).
- * All hackAnalyze/growthAnalyze calls are free RAM.
+ * Sweep hack fractions and return the row with the best score ($/GB/s) whose
+ * single-batch RAM is ≤ `ramCap`. With the default (Infinity) this is the global
+ * optimum. With a finite cap it's the best batch that *fits* — used to step the
+ * hack-% down on a small pool so a target can still batch (a single optimal batch
+ * may not fit early, when low hacking level makes weakenTime long and batches
+ * large). Returns null if not even the smallest (1%) batch fits the cap.
+ *
+ * The fitted choice is stable tick-to-tick: `chance` is a common factor across all
+ * f, so it never changes which f wins — only hackFrac/weakenTime/ramPerBatch (all
+ * stable for a given hacking level) and the cap do. All NS calls here are free RAM.
  */
-function bestHackPct(ns, server, chance) {
+function bestHackPct(ns, server, chance, ramCap = Infinity) {
     const target = server.hostname;
     const hackFrac = ns.hackAnalyze(target);
     if (hackFrac <= 0) return null;
@@ -554,6 +617,7 @@ function bestHackPct(ns, server, chance) {
         const w2 = Math.ceil((g * GROW_SEC) / WEAKEN_SEC * THREAD_MARGIN);
         const ramPerBatch =
             h * WORKER_RAM.hackRam + g * WORKER_RAM.growRam + (w1 + w2) * WORKER_RAM.weakenRam;
+        if (ramPerBatch > ramCap) continue; // batch too big for the available RAM
         const moneyPerBatch = server.maxMoney * f * chance;
         const score = moneyPerBatch / (weakenTime * ramPerBatch);
         if (!best || score > best.score) {

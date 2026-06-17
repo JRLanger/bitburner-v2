@@ -27,18 +27,30 @@ The main loop (`main`) each tick:
 3. `classify` — splits viable servers into `eligible` (prepped + batch-worthy,
    each scored by $/GB/s via `bestHackPct`) and `needsPrep`. Uses hysteresis:
    **strict** bounds to *start* batching, **loose** bounds to *keep* batching
-   (healthy batches oscillate mid-cycle).
-4. `selectBatchers` — **admission control.** Walks the score-sorted `eligible`
-   list and admits targets while their cumulative steady-state pipeline RAM
-   (`ceil(weakenTime / BATCH_PERIOD) * ramPerBatch`) stays under
-   `BATCH_BUDGET_FRAC` of the *total* pool. Last tick's batchers (`wasBatching`)
-   get first claim on the budget so the active set doesn't flap.
+   (healthy batches oscillate mid-cycle). `needsPrep` is sorted **easiest-earner
+   first** (ascending `maxMoney`).
+4. `selectBatchers` — **admission control + depth-first allocation.** Walks the
+   score-sorted `eligible` list in rank order and gives each target, greedily, the
+   RAM it can use before moving to the next — filling the best target toward its
+   full pipeline before a lower-ranked one starts. Per target, against the
+   `remaining` budget: if a single *optimal* batch fits, use the locked optimal
+   plan; otherwise step the hack-% **down** to the best batch that fits
+   (`bestHackPct(..., remaining)`). It reserves `min(full pipeline, remaining)`, so
+   a stepped-down target claims the whole remaining budget and the next target
+   waits. Ceilings: `BATCH_BUDGET_FRAC` of the *total* pool and `MAX_BATCH_TARGETS`.
+   Last tick's batchers (`wasBatching`) get first claim so the set doesn't flap.
+   Returns `{ batchers, reserved }`.
 5. `batchPhase` — fires rolling HWGW batches for the admitted set, in rank order,
-   regulated by a per-target launch clock advancing by `BATCH_PERIOD`. Calls
-   `maybeRecover` to inject supplemental grow/weaken when a batching target drifts.
+   regulated by a per-target launch clock advancing by `BATCH_PERIOD`. The pipeline
+   fills gradually (one launch per period) up to its concurrency, so a target's RAM
+   use ramps over ~a weaken time. Calls `maybeRecover` to inject supplemental
+   grow/weaken when a batching target drifts.
 6. `prepPhase` — spends remaining RAM driving `needsPrep` targets to baseline, one
    corrective wave per target (`prepWave`), skipping any with workers already in
-   flight.
+   flight; prepares at most `MAX_BATCH_TARGETS + PREP_LOOKAHEAD` servers at once.
+   Stops at a `prepFloor` = the batchers' reserved-but-unclaimed RAM, and each
+   `prepWave` is capped to that headroom — so prep can't starve a pipeline that is
+   still ramping toward full depth.
 7. `updateDisplayStats` / `renderStatus` — refresh the tail-window status table.
    Raw money/security reads land at a random phase of each target's batch grid, so
    they oscillate (e.g. money flips between 100% and `100% − hack%`). For display
@@ -52,6 +64,50 @@ Thread placement (`placeThreads`) greedily bin-packs across the pool and returns
 how many threads actually landed.
 
 ## Why it's built this way
+
+**Prep is ordered easiest-earner-first to bootstrap a fresh save.** With a tiny
+starting pool, prepping biggest-money-first (the original order) poured the whole
+pool into partial waves for the largest servers — which can't finish for hours —
+while the trivially-cheap earners starved at the back of the queue, so no income
+ever flowed to grow the pool. Sorting `needsPrep` ascending by `maxMoney` gets the
+cheap servers prepped and batching in seconds; their income funds the pool that
+later preps the big servers. This is self-scaling (no bootstrap mode, no hardcoded
+`n00dles`, no RAM threshold): once the pool is large, prep is fast for everyone and
+the order stops mattering. `maxMoney` is a free, tunable prep-cost proxy.
+
+**Batches are sized to fit the pool (step-down/up).** On a fresh save the hacking
+level is low, so weaken times are long, pipelines are huge, and a single
+*optimal* batch can exceed the whole tiny pool — leaving a server prepped but
+unable to batch. `bestHackPct` therefore takes a RAM cap and returns the best
+batch that *fits*; `selectBatchers` uses the optimal batch when it fits, else steps
+the hack-% down. As the pool grows the hack-% climbs back toward optimal, then
+`batchPhase` fills the depth, then the full pipeline completes and the leftover
+budget overflows to the next target — a depth-first "fill the best, then the next"
+progression. The fitted choice is stable tick-to-tick (`chance` is a common factor
+across all f, so it never flips which f wins), so re-fitting each tick doesn't
+cause flap.
+
+**Prep can't starve a ramping pipeline.** A pipeline fills gradually (one launch
+per `BATCH_PERIOD`, over ~a weaken time), so a freshly-admitted target's reserved
+RAM is mostly *unclaimed* at first. Since prep and batching draw from the same
+pool, greedy prep would grab that unclaimed RAM and the pipeline could never fill.
+So `selectBatchers` reports its `reserved` total, and `prepPhase` keeps a
+`prepFloor` (reserved minus the batchers' already-running RAM) free; each
+`prepWave` is also capped so one large grow can't overshoot it. As the pipeline
+fills, the floor shrinks and prep gets more room — and once batchers are satisfied,
+the floor is zero and prep uses everything left.
+
+**Two batching ceilings for two regimes.** Early game is *RAM-limited*, governed
+by `BATCH_BUDGET_FRAC`. Late game is *lag-limited* — Bitburner slows with too many
+concurrent worker scripts — governed by `MAX_BATCH_TARGETS` (default high =
+effectively off until tuned down). The two never conflict: prep ordering decides
+what gets *ready* (velocity, easiest-first), the cap decides what *runs* among the
+ready set (value, best-score-first). They bind in different regimes, so the cap
+never undermines the bootstrap fix. `PREP_LOOKAHEAD` keeps prep breadth aligned
+with the cap so prep doesn't sprawl onto servers that won't earn a slot. Tradeoff:
+with the cap active, a freed slot can briefly go to an easy modest server before a
+big earner finishes prepping — this self-corrects as `selectBatchers` retains the
+highest-score targets and drops weaker ones (hysteresis permitting).
 
 **Admission control is the core correctness mechanism.** Each batching target
 independently tries to maintain a full pipeline of `weakenTime / BATCH_PERIOD`

@@ -18,6 +18,7 @@ home RAM). Source: `src/booster.js`, workers in `src/workers/`, tunables in
 | 3b | Rolling HWGW grid batcher + enter/stay hysteresis | ✅ done |
 | 3c | Recovery grow (climb drifted targets back to max) | ✅ done |
 | 3d | Stabilization: RAM-budgeted admission, plan locking, fire cap, recovery rate-limit, drift tuning | ✅ done |
+| 3e | Bootstrap fix (easiest-earner-first prep) + target-count cap for lag | ✅ done |
 | 5 (partial) | Live status table (tail window) | ✅ done |
 | 4 | Manager orchestration (managers not yet written) | ⬜ pending |
 | 5 | Formulas.exe handoff | ⬜ **deliberately disabled** — loop is `while(true)` so it can be tested on a save that already owns Formulas.exe. Restore the `while(!fileExists(FORMULAS_EXE))` exit when moving to a fresh BN. |
@@ -198,6 +199,8 @@ batch, or we'll badly over-commit. This is the central constraint for the
 | `BATCH_BUDGET_FRAC` | 0.80 | fraction of total pool usable for batch pipelines (rest reserved for prep) |
 | `MAX_FIRES_PER_TICK` | 2 | cap on batches one target may launch per tick (anti-burst) |
 | `THREAD_MARGIN` | 1.05 | over-provision factor for grow/weaken threads (drift absorption) |
+| `MAX_BATCH_TARGETS` | 999 (≈ off) | late-game cap on concurrently batched targets (dial down for lag) |
+| `PREP_LOOKAHEAD` | 2 | servers prepped beyond the batch cap as a lookahead buffer |
 
 ## Validation plan
 
@@ -536,6 +539,70 @@ recorded here in the order they were found and solved.
 grid and oscillate; `displayHealth` reports the rolling-window peak money / floor
 security so the status table shows the grid-aligned baseline (~100 % / +0.00) and
 genuine drift still stands out.
+
+## Bootstrap fix + target cap (stage 3e)
+
+**Problem.** On a *fresh* save the controller ran correctly but took hours to get
+going. With a tiny starting pool, prep was ordered biggest-money-first, so
+`prepPhase` poured the whole pool into partial weaken/grow waves for the largest
+servers (which can't finish for hours) while the trivially-cheap earners starved
+at the back of the queue. No prep finished → nothing batched → no income → the
+pool never grew.
+
+**Why not the old workaround.** Previous saves solved this with a hardcoded
+"n00dles-only bootstrap phase" gated on pserver count. That's a workaround for a
+prep-ordering bug, and the gate signal was a proxy. The real constraint is RAM,
+and the real bug is the ordering.
+
+**Fix: prep easiest-earner-first.** Flip `needsPrep` to ascending `maxMoney`
+([booster.js](../../src/booster.js), `classify`). Cheap servers prep in seconds,
+start batching, and their income funds the pool that later preps the big ones.
+Self-scaling: no bootstrap mode, no hardcoded server, no threshold — once the pool
+is large, prep is fast for everyone and order stops mattering. `maxMoney` is a
+free (no NS call) prep-cost proxy; a value/cost ROI is a possible future refinement.
+
+**Target-count cap (folded in for later).** Early game is RAM-limited
+(`BATCH_BUDGET_FRAC`); late game is lag-limited — Bitburner slows with too many
+concurrent worker scripts. `MAX_BATCH_TARGETS` adds a second ceiling in
+`selectBatchers` (default 999 ≈ off) that keeps the highest-score targets up to a
+count. The two logics compose without conflict because they act at different
+stages: **prep ordering decides what gets *ready* (velocity, easiest-first); the
+cap decides what *runs* among the ready set (value, best-first).** They bind in
+different regimes, so the cap never undermines the bootstrap fix. `PREP_LOOKAHEAD`
+bounds prep breadth to `cap + lookahead` so prep doesn't sprawl onto servers that
+won't earn a slot. Accepted tradeoff: with the cap active a freed slot can briefly
+go to an easy modest server before a big earner finishes prepping — self-corrects
+as `selectBatchers` retains the best and drops the weaker (hysteresis permitting).
+
+**Then: prepped but still not batching.** Testing on a genuinely fresh save
+surfaced two more blockers, both because a low hacking level makes weaken times
+long → pipelines huge → batches large:
+
+1. *Admission was all-or-nothing.* `selectBatchers` required a target's whole
+   steady-state pipeline (`concurrency × ramPerBatch`) to fit the budget; on a tiny
+   pool that never fits, so every target was rejected and nothing batched. Fix:
+   admit if at least one batch fits, reserving `min(pipeline, remaining)` and
+   running a shallow pipeline (batchPhase caps real fires by free RAM).
+
+2. *The optimal batch itself didn't fit.* `bestHackPct` picked the best-*score*
+   hack-%, ignoring pool size, so even one batch could exceed the pool. Fix:
+   `bestHackPct` takes a RAM cap and returns the best batch that *fits*;
+   `selectBatchers` steps the hack-% **down** when the optimal won't fit, then
+   **up** toward optimal as the pool grows, then fills depth, then overflows to the
+   next target. This is the depth-first "fill the best, then the next" the user
+   wanted. The fit is stable tick-to-tick (`chance` is a common factor across all
+   f, so it never flips the winner), so re-fitting every tick doesn't flap.
+
+**Finally: prep starved the ramping pipeline.** A pipeline fills gradually (one
+launch per `BATCH_PERIOD`), so a new batcher's reserved RAM is mostly unclaimed at
+first — and greedy `prepPhase`, drawing from the same pool, grabbed it (huge grow
+waves for 4%-money servers), so the pipeline never filled. Fix: `selectBatchers`
+returns its `reserved` total; `prepPhase` holds a `prepFloor` (reserved minus the
+batchers' already-running RAM) free, and each `prepWave` is capped to that
+headroom. As the pipeline fills the floor shrinks; once batchers are satisfied it's
+zero and prep uses the rest. This is the inverse reservation of `BATCH_BUDGET_FRAC`
+(which reserves headroom *for* prep) — together they keep batch and prep from
+starving each other in either direction.
 
 ## RAM gotcha: property names that collide with NS functions
 

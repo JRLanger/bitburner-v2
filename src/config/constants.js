@@ -77,6 +77,21 @@ export const BATCH_BUDGET_FRAC = 0.80;
 /** Max HWGW batches a single target may launch in one tick. */
 export const MAX_FIRES_PER_TICK = 2;
 
+// Hard ceiling on how many targets batch at once, on top of the RAM budget. The
+// RAM budget is the early-game (RAM-limited) constraint; this cap is the
+// late-game (lag-limited) knob — Bitburner slows down with too many concurrent
+// worker scripts, so dial this down if the game lags. selectBatchers keeps the
+// highest-score targets up to the cap. Default high = effectively unlimited
+// (RAM budget governs) so established saves are unaffected until tuned down.
+/** Max number of simultaneously batched targets. */
+export const MAX_BATCH_TARGETS = 999;
+
+// When the target cap is active, prep no more than (cap + this) servers at once,
+// so prep effort doesn't sprawl onto servers that won't earn a batch slot soon.
+// Inert when MAX_BATCH_TARGETS is effectively unlimited (early game).
+/** Extra servers beyond the batch cap to keep prepping as a lookahead buffer. */
+export const PREP_LOOKAHEAD = 2;
+
 // Over-provision grow and weaken threads by this factor. Each batch then grows
 // slightly past max (clamps, harmless) and weakens slightly past min, which
 // absorbs the small per-cycle under-restore that otherwise lets long-pipeline
