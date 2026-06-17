@@ -4,8 +4,9 @@
  * The cheap "first stage" controller that runs at the start of a BitNode cycle,
  * before Formulas.exe. See docs/devlog/02-booster.md for the full design.
  *
- * BUILD STATUS: Stage 3b — adds the rolling HWGW grid batcher on top of 3a's
- * loop/pool/prep. Self-heal (3c), managers (4), and status table (5) follow.
+ * BUILD STATUS: Stage 4 — orchestrates the pserver + hacknet managers (gated
+ * launch on home, no double-launch) on top of the 3a–3e batcher and status table.
+ * Formulas.exe handoff (stage 5) still follows.
  *
  * Prerequisites: the three worker scripts must already exist on home. booster
  * does NOT create them; it errors out and exits if any is missing.
@@ -25,6 +26,10 @@ import {
     HACK_PCT_MIN,
     HACK_PCT_MAX,
     HACK_PCT_STEP,
+    HACK_PCT_RAMP_MAX,
+    RAMP_STEP,
+    RAMP_UTIL_LOW,
+    RAMP_UTIL_HIGH,
     WORKER_RAM,
     WEAKEN_SEC,
     GROW_SEC,
@@ -41,6 +46,12 @@ import {
     D_GAP,
     BATCH_PERIOD,
     BATCH_SAFETY_MS,
+    PSERVER_MANAGER,
+    HACKNET_MANAGER,
+    PSERVER_MANAGER_RAM,
+    HACKNET_MANAGER_RAM,
+    PSERVER_PREFIX,
+    HACKNET_GATE,
 } from "/config/constants.js";
 
 /** Worker paths that must exist on home and get copied to every rooted server. */
@@ -48,6 +59,22 @@ const WORKERS = [HACK_WORKER, GROW_WORKER, WEAKEN_WORKER];
 
 /** Normalized worker filenames for matching against ns.ps() output. */
 const WORKER_FILES = new Set(WORKERS.map(stripSlash));
+
+/**
+ * Managers booster orchestrates, in fixed dependency order. Each tick booster
+ * launches the FIRST not-yet-running manager whose gate passes, and won't consider
+ * a later one until every earlier one is already running (see launchManagers).
+ * `ramGB` (hardcoded in constants) is reserved on home so the exec always fits.
+ *
+ *  1. pserver — grows the RAM pool; launch immediately (it waits internally to
+ *     afford). Highest compounding ROI: purchased servers feed the batch pool.
+ *  2. hacknet — weak ROI; deferred until the pserver fleet is fully built (counted
+ *     from topology data booster already has — no extra NS call).
+ */
+const MANAGERS = [
+    { file: PSERVER_MANAGER, ramGB: PSERVER_MANAGER_RAM, gate: () => true },
+    { file: HACKNET_MANAGER, ramGB: HACKNET_MANAGER_RAM, gate: pserverFleetBuilt },
+];
 
 /** Monotonic id appended to every worker exec so concurrent workers are unique. */
 let batchSeq = 0;
@@ -82,6 +109,15 @@ const batchPlan = new Map();
 const wasBatching = new Set();
 
 /**
+ * Global hack-% ramp floor (idle-RAM absorber). Sticky across ticks; moves at
+ * most one RAMP_STEP per tick under the controller in main(). Each batching plan
+ * is computed at max(score-optimal f, rampLevel) capped at HACK_PCT_RAMP_MAX, so
+ * raising it pulls low-% targets up to spend otherwise-idle pool RAM. 0 = off
+ * (pure $/GB/s efficiency). See the "Hack-% ramp-up" block in constants.js.
+ */
+let rampLevel = 0;
+
+/**
  * Per-target rolling samples of money fraction and security-over-min, used only
  * for the status display. Raw mid-cycle reads oscillate (a hack has landed
  * but its counter-grow hasn't); reporting the window's peak money / floor
@@ -113,7 +149,11 @@ export async function main(ns) {
         ns.write(SERVERS_JSON, JSON.stringify(servers, null, 2), "w");
 
         const rootedHosts = servers.filter((s) => s.hasRoot).map((s) => s.hostname);
-        const pool = buildPool(ns, rootedHosts);
+        // Reserve home headroom for the next pending manager, then launch it if its
+        // gate trips. Done before buildPool so the pool already excludes that reserve.
+        const homeReserveExtra = nextManagerReserve(ns);
+        launchManagers(ns, servers);
+        const pool = buildPool(ns, rootedHosts, homeReserveExtra);
         const inFlight = inFlightByTarget(ns, rootedHosts);
 
         const { eligible, needsPrep } = classify(ns, servers);
@@ -142,12 +182,32 @@ export async function main(ns) {
         const prepFloor = Math.max(0, reserved - batchRunningRam);
         prepPhase(ns, needsPrep, pool, inFlight, prepFloor);
 
-        // Future hook (RAM-share): once prep is clear, the genuine excess is
-        //   excess = poolFree(pool) - poolTotal * (1 - BATCH_BUDGET_FRAC)
-        // i.e. free RAM beyond the reserved prep headroom. A future
-        // sharePhase(ns, pool, excess) would place ns.share() workers into that
-        // residual only when excess > 0 and needsPrep is empty, recomputed each
-        // tick so it yields the instant batch/prep demand rises. Not built yet.
+        // Hack-% ramp controller (idle-RAM absorber). Move the global ramp floor
+        // at most one step/tick. Signal: actual POOL UTILIZATION (1 − free/total),
+        // measured after this tick's batch + prep placements, so it already counts
+        // whatever prep is consuming — a one-server prep trickle leaves the pool
+        // ~all-free (ramp up), while a fresh-save bootstrap where prep eats the
+        // small pool leaves it nearly full (no ramp). Raise the floor while the
+        // pool is under-used AND every batch-worthy target already has a slot;
+        // lower it when the pool is heavily used or admission is RAM/lag-starved.
+        // The wide LOW..HIGH deadband holds it steady through mid-cycle
+        // oscillation. Plans pick up the new floor next tick (classify).
+        const poolUsedFrac = poolTotal > 0 ? 1 - poolFree(pool) / poolTotal : 1;
+        const allBatching = batchers.length === eligible.length;
+        if (allBatching && poolUsedFrac < RAMP_UTIL_LOW) {
+            rampLevel = Math.min(HACK_PCT_RAMP_MAX, rampLevel + RAMP_STEP);
+        } else if (!allBatching || poolUsedFrac > RAMP_UTIL_HIGH) {
+            rampLevel = Math.max(0, rampLevel - RAMP_STEP);
+        }
+
+        // Share boundary (definition only; sharePhase not built yet). Once
+        // rampLevel == HACK_PCT_RAMP_MAX and needsPrep is empty, every target is
+        // hacking as hard as we allow, so the free RAM still left over —
+        //   residual = poolFree(pool) - poolTotal * (1 - BATCH_BUDGET_FRAC)
+        // (free RAM beyond the reserved prep/jitter headroom) — is the genuine
+        // share residual. A future sharePhase(ns, pool, residual) would place
+        // ns.share() workers there only when residual > 0, recomputed each tick so
+        // it yields the instant batch/prep demand (or a ramp-down) reclaims it.
 
         updateDisplayStats(batchers);
         renderStatus(ns, servers, pool, batchers, needsPrep);
@@ -234,13 +294,15 @@ function gatherInfo(ns, host, rooted) {
  * Build the worker RAM pool: one entry per rooted host with free RAM, sorted
  * largest-first for tidy bin-packing. home keeps a safety buffer free.
  */
-function buildPool(ns, rootedHosts) {
+function buildPool(ns, rootedHosts, homeReserveExtra = 0) {
     const pool = [];
     for (const host of rootedHosts) {
         const max = ns.getServerMaxRam(host);
         if (max <= 0) continue;
         let free = max - ns.getServerUsedRam(host);
-        if (host === "home") free -= HOME_SAFETY_BUFFER_GB;
+        // Keep the safety buffer plus headroom for the next pending manager free on
+        // home, so workers never fill home and block that manager's exec.
+        if (host === "home") free -= HOME_SAFETY_BUFFER_GB + homeReserveExtra;
         if (free > 0) pool.push({ host, free });
     }
     pool.sort((a, b) => b.free - a.free);
@@ -268,6 +330,49 @@ function inFlightByTarget(ns, rootedHosts) {
     return map;
 }
 
+// ── Manager orchestration ───────────────────────────────────────────────────
+
+/**
+ * Launch managers in fixed dependency order. Each tick, find the FIRST manager not
+ * already running; if its gate passes, exec it. Stop there regardless — a later
+ * manager is never launched until every earlier one is already running, which is
+ * what makes the order "fixed." Checks ns.ps("home") (not just in-memory state) so
+ * a booster restart never double-launches a persistent manager.
+ */
+function launchManagers(ns, servers) {
+    for (const m of MANAGERS) {
+        if (isRunning(ns, m.file)) continue; // already up → move past it
+        if (m.gate(servers)) ns.exec(m.file, "home");
+        return; // first not-running manager is the only candidate this tick
+    }
+}
+
+/** RAM to reserve on home for the next pending (not-yet-running) manager, GB. */
+function nextManagerReserve(ns) {
+    for (const m of MANAGERS) {
+        if (!isRunning(ns, m.file)) return m.ramGB;
+    }
+    return 0; // all managers running → no reserve needed
+}
+
+/** True if a script with this filename is already running on home. */
+function isRunning(ns, file) {
+    const name = stripSlash(file);
+    return ns.ps("home").some((proc) => stripSlash(proc.filename) === name);
+}
+
+/**
+ * Hacknet gate: the pserver fleet is fully built — at least serverCount purchased
+ * servers, each at or above ramEachGB. Counted from the topology booster already
+ * gathered (hostnames starting with PSERVER_PREFIX), so no extra NS calls.
+ */
+function pserverFleetBuilt(servers) {
+    const built = servers.filter(
+        (s) => s.hostname.startsWith(PSERVER_PREFIX) && s.maxRam >= HACKNET_GATE.ramEachGB
+    ).length;
+    return built >= HACKNET_GATE.serverCount;
+}
+
 // ── Classification ──────────────────────────────────────────────────────────
 
 /**
@@ -293,15 +398,36 @@ function classify(ns, servers) {
         // healthy batches oscillate within each cycle).
         if (activeBatching.has(s.hostname)) {
             const chance = ns.hackAnalyzeChance(s.hostname);
+            // Judge drift on the grid-aligned WINDOWED baseline (peak money /
+            // floor security), not the raw instantaneous read. At high hack-% the
+            // raw money legitimately plunges to ~(1−f) of max each cycle (hack
+            // lands, money sits low until the grow lands) and security momentarily
+            // spikes — judging on those troughs false-drops healthy targets, which
+            // breaks their pipeline and snowballs into real drift. The window's
+            // peak/floor is the true baseline the status table already trusts.
+            // Chance is dropped from the keep-test: once admitted it only degrades
+            // via security, which the security-floor bound already catches.
+            const { moneyFrac, secOver } = displayHealth({
+                hostname: s.hostname,
+                money,
+                maxMoney: s.maxMoney,
+                sec,
+                minSecurity: s.minSecurity,
+            });
             const healthy =
-                chance >= CHANCE_BATCH &&
-                money >= s.maxMoney * BATCH_KEEP_MONEY_FRAC &&
-                sec <= s.minSecurity + BATCH_KEEP_SEC_OVER;
+                moneyFrac >= BATCH_KEEP_MONEY_FRAC &&
+                secOver <= BATCH_KEEP_SEC_OVER;
             if (healthy) {
-                // Reuse the locked plan (don't re-optimise mid-pipeline); only
-                // compute if somehow missing.
-                const best = batchPlan.get(s.hostname) ?? bestHackPct(ns, s, chance);
+                // Reuse the locked plan (don't re-optimise mid-pipeline) UNLESS
+                // the global ramp floor has moved since it was locked — then the
+                // target's hack-% target changed and the plan must be recomputed.
+                const locked = batchPlan.get(s.hostname);
+                const best =
+                    locked && locked.ramp === rampLevel
+                        ? locked
+                        : bestHackPct(ns, s, chance, Infinity, rampLevel);
                 if (best) {
+                    best.ramp = rampLevel;
                     batchPlan.set(s.hostname, best);
                     eligible.push({ ...s, chance, sec, money, ...best });
                     continue;
@@ -319,10 +445,11 @@ function classify(ns, servers) {
         const chance = ns.hackAnalyzeChance(s.hostname);
         if (chance < CHANCE_BATCH) continue; // prepped but not worth batching
 
-        const best = bestHackPct(ns, s, chance);
+        const best = bestHackPct(ns, s, chance, Infinity, rampLevel);
         if (best) {
+            best.ramp = rampLevel;
             activeBatching.add(s.hostname);
-            batchPlan.set(s.hostname, best); // lock the plan for this batching run
+            batchPlan.set(s.hostname, best); // lock the plan (+ ramp) for this run
             eligible.push({ ...s, chance, sec, money, ...best });
         }
     }
@@ -416,7 +543,14 @@ function batchPhase(ns, eligible, pool) {
         const ramPerBatch = t.ramPerBatch;
         if (ramPerBatch > poolFree(pool)) continue; // can't even fit one batch
 
-        const weakenTime = t.weakenTime; // from bestHackPct, no extra NS call
+        // Fetch ALL three op times fresh and from the same instant. Using the
+        // locked plan's stale weakenTime here (while grow/hack are fresh) was the
+        // root cause of the high-hack-% desync: as the hacking level climbs the real
+        // weaken time shrinks, so a stale (too-large) value makes W1/W2 land earlier
+        // than their H/G; once the gap exceeds D_GAP the order flips (W2 before G)
+        // and the grow's security is never cleared → runaway security → drift.
+        // RAM-free: ns.getWeakenTime is already charged via bestHackPct.
+        const weakenTime = ns.getWeakenTime(target);
         const growTime = ns.getGrowTime(target);
         const hackTime = ns.getHackTime(target);
 
@@ -464,10 +598,24 @@ function maybeRecover(ns, t, pool, growTime) {
     const now = Date.now();
     if ((recoverClock.get(target) ?? 0) > now) return; // a wave is still landing
 
+    // Gate and size recovery on the grid-aligned WINDOWED baseline (peak money /
+    // floor security), not the raw read. Raw money on a healthy high-hack-% target
+    // sits below RECOVER_MONEY_FRAC almost every tick (it dips to ~(1−f) each
+    // cycle), so a raw gate fires supplemental grows constantly — off-grid grows
+    // that raise security and desync the pipeline. The window's peak is the true
+    // baseline: only fire when even that hasn't returned to max.
+    const { moneyFrac, secOver } = displayHealth({
+        hostname: target,
+        money: t.money,
+        maxMoney: t.maxMoney,
+        sec: t.sec,
+        minSecurity: t.minSecurity,
+    });
+
     let fired = false;
 
-    if (t.money < t.maxMoney * RECOVER_MONEY_FRAC) {
-        const mult = t.maxMoney / Math.max(t.money, 1);
+    if (moneyFrac < RECOVER_MONEY_FRAC) {
+        const mult = 1 / Math.max(moneyFrac, 0.01);
         const need = Math.ceil(ns.growthAnalyze(target, mult) * THREAD_MARGIN);
         const placed = placeThreads(ns, pool, GROW_WORKER, WORKER_RAM.growRam, need, target, 0);
         if (placed > 0) {
@@ -477,8 +625,8 @@ function maybeRecover(ns, t, pool, growTime) {
         }
     }
 
-    if (t.sec > t.minSecurity + RECOVER_SEC_OVER) {
-        const need = Math.ceil((t.sec - t.minSecurity) / WEAKEN_SEC * THREAD_MARGIN);
+    if (secOver > RECOVER_SEC_OVER) {
+        const need = Math.ceil((secOver / WEAKEN_SEC) * THREAD_MARGIN);
         const placed = placeThreads(ns, pool, WEAKEN_WORKER, WORKER_RAM.weakenRam, need, target, 0);
         if (placed > 0) fired = true;
     }
@@ -601,7 +749,7 @@ function placeThreads(ns, pool, script, ramPerThread, threads, target, delay) {
  * f, so it never changes which f wins — only hackFrac/weakenTime/ramPerBatch (all
  * stable for a given hacking level) and the cap do. All NS calls here are free RAM.
  */
-function bestHackPct(ns, server, chance, ramCap = Infinity) {
+function bestHackPct(ns, server, chance, ramCap = Infinity, floor = 0) {
     const target = server.hostname;
     const hackFrac = ns.hackAnalyze(target);
     if (hackFrac <= 0) return null;
@@ -609,7 +757,13 @@ function bestHackPct(ns, server, chance, ramCap = Infinity) {
     const weakenTime = ns.getWeakenTime(target);
     let best = null;
 
-    for (let f = HACK_PCT_MIN; f <= HACK_PCT_MAX + 1e-9; f += HACK_PCT_STEP) {
+    // The ramp floor raises the search's lower bound (spend idle RAM at higher
+    // hack-%); HACK_PCT_RAMP_MAX caps the upper bound so no target ever exceeds
+    // the share-residual boundary. ramCap (small-pool step-down) is applied per
+    // candidate below and wins over the floor — a batch must always fit.
+    const lo = Math.max(HACK_PCT_MIN, floor);
+    const hi = Math.min(HACK_PCT_MAX, HACK_PCT_RAMP_MAX);
+    for (let f = lo; f <= hi + 1e-9; f += HACK_PCT_STEP) {
         const h = Math.ceil(f / hackFrac);
         // Over-provision grow/weaken (not hack) to absorb per-cycle drift.
         const g = Math.ceil(ns.growthAnalyze(target, 1 / (1 - f)) * THREAD_MARGIN);
@@ -683,7 +837,8 @@ function renderStatus(ns, servers, pool, eligible, needsPrep) {
     const W = 58;
     ns.print(`╔═ BOOSTER ═ ${new Date().toLocaleTimeString()} ${"═".repeat(Math.max(0, W - 24))}`);
     ns.print(`║ Hack Lv ${level}  |  Rooted ${rooted}/${servers.length}  |  Pool ${ns.format.ram(free)} free / ${ns.format.ram(totalRam)}`);
-    ns.print(`║ Batching ${eligible.length}  |  Prepping ${needsPrep.length}  |  Est income $${ns.format.number(income)}/s`);
+    const ramp = rampLevel > 0 ? `  |  Ramp ${Math.round(rampLevel * 100)}%` : "";
+    ns.print(`║ Batching ${eligible.length}  |  Prepping ${needsPrep.length}${ramp}  |  Est income $${ns.format.number(income)}/s`);
     ns.print(`╠${"═".repeat(W)}`);
     ns.print(
         "║ " +

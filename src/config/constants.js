@@ -10,7 +10,11 @@
 
 // ── HWGW batch timing ──────────────────────────────────────────────────────
 
-/** Gap between consecutive HWGW landings, ms. Tune in-game later. */
+/** Gap between consecutive HWGW landings, ms. Tune in-game later.
+ *  Drives BATCH_PERIOD (= 4 × this), so it also sets batch throughput: smaller
+ *  D_GAP → shorter period → more batches/sec → more income on RAM-rich pools. The
+ *  engine enforces landing times via additionalMsec, so 100ms is ample spacing as
+ *  long as the op times used to schedule are current (see batchPhase). */
 export const D_GAP = 100;
 
 /** Interval between batch launches into the pipeline, ms. One batch per period. */
@@ -107,6 +111,41 @@ export const HACK_PCT_STEP = 0.01;
 export const HACK_PCT_MIN = 0.01;
 export const HACK_PCT_MAX = 0.99;
 
+// ── Hack-% ramp-up (idle-RAM absorber) ─────────────────────────────────────
+//
+// bestHackPct picks the f that maximises $/GB/s — the right objective when RAM
+// is scarce. Once every available target is batching at that efficiency peak and
+// the pool still sits on lots of idle RAM, efficiency stops mattering and
+// absolute income does: we can spend the idle RAM by pushing hack-% ABOVE the
+// per-target peak (more money per batch at worse $/GB/s — fine, the GB are idle).
+//
+// A single sticky global `rampLevel` acts as a hack-% FLOOR: each target plans at
+// max(score-optimal f, rampLevel), capped at HACK_PCT_RAMP_MAX. The level moves at
+// most one RAMP_STEP per tick, driven by actual POOL UTILIZATION (1 − free/total,
+// which already counts prep usage): raise it while every batch-worthy target has a
+// slot and the pool sits under RAMP_UTIL_LOW used; lower it once usage exceeds
+// RAMP_UTIL_HIGH or admission is RAM/lag-starved. The wide LOW..HIGH deadband keeps
+// routine mid-cycle oscillation from springing it up/down, and basing it on real
+// utilization (not "prep empty") means a steady-state prep trickle no longer blocks
+// the ramp while a fresh-save bootstrap — where prep eats the small pool — still
+// reads as fully-used and won't ramp.
+
+/** Max effective hack-% the ramp may reach. Also the share-residual boundary:
+ *  once rampLevel == this and prep is clear, free RAM beyond the reserve is
+ *  shareable. Tune in-game. */
+export const HACK_PCT_RAMP_MAX = 0.75;
+
+/** Per-tick step the ramp floor moves by. Small → smooth, no flap. */
+export const RAMP_STEP = 0.02;
+
+/** Ramp UP only when pool utilization (1 − free/total) is below this — i.e. there
+ *  is genuine idle RAM after batch + prep. */
+export const RAMP_UTIL_LOW = 0.85;
+
+/** Ramp DOWN when pool utilization exceeds this (pool nearly full). The gap
+ *  RAMP_UTIL_LOW..RAMP_UTIL_HIGH is the hold deadband. */
+export const RAMP_UTIL_HIGH = 0.97;
+
 // ── Worker scripts ─────────────────────────────────────────────────────────
 
 export const HACK_WORKER = "/workers/hack.js";
@@ -153,6 +192,59 @@ export const HACKNET_GATE = {
     serverCount: 25,
     ramEachGB: 32 * 1024, // 32 TB
 };
+
+/** Manager script paths. booster execs these on home in dependency order. */
+export const PSERVER_MANAGER = "/managers/pserver.js";
+export const HACKNET_MANAGER = "/managers/hacknet.js";
+
+/**
+ * Manager RAM footprints, GB. Hardcoded (like BOOSTER_RAM_GB) so booster can
+ * reserve home headroom for the next pending manager WITHOUT a getScriptRam call.
+ * Measure each with `mem <file>` after any change and update here.
+ */
+export const PSERVER_MANAGER_RAM = 5.85; // measured in-game (mem managers/pserver.js)
+export const HACKNET_MANAGER_RAM = 6.80; // measured in-game (mem managers/hacknet.js)
+
+/** Loop sleep for the (infrequent-purchase) managers, ms. */
+export const MANAGER_LOOP_SLEEP = 10000;
+
+// ── Manager spending: payback OR reinvestment-fraction ─────────────────────
+//
+// A manager buys the cheapest next step (gated by plain affordability) when
+// EITHER arm passes:
+//
+//  1. PAYBACK arm — it pays back within PAYBACK_SECONDS of current income ($/s).
+//     This lets large purchases through once income justifies them, and makes
+//     upgrades halt automatically in BNs where servers get expensive.
+//
+//  2. REINVEST arm — its cost ≤ effFrac of current cash. Income-independent, so it
+//     bootstraps the fleet on a fresh save (when income is ~0 *because* RAM is the
+//     bottleneck — the payback arm can't fire yet). effFrac is NOT constant: it
+//     DECAYS from *_REINVEST_FRAC (full bootstrap help) down to *_REINVEST_FLOOR
+//     as infrastructure grows toward a target (pserver: fleet RAM → BOOTSTRAP_RAM_GB;
+//     hacknet: node count → BOOTSTRAP_NODES). This stops the reinvest arm from
+//     permanently overriding payback once bootstrap is done — past the target,
+//     payback's "worth it?" gate governs upgrades, with the small floor as a
+//     slow-trickle relief valve (a stalled fleet still creeps on a big cash pile).
+
+/** Smallest pserver to buy when filling the fleet, GB (must be a power of two). */
+export const PSERVER_START_RAM = 8;
+
+/** Payback horizon: spend a step if it pays back within this many seconds. */
+export const PSERVER_PAYBACK_SECONDS = 300;
+export const HACKNET_PAYBACK_SECONDS = 300;
+
+/** Reinvest arm bootstrap-max fraction (used at zero infrastructure). */
+export const PSERVER_REINVEST_FRAC = 0.25;
+export const HACKNET_REINVEST_FRAC = 0.25;
+
+/** Reinvest arm floor — fraction it decays to once the bootstrap target is met. */
+export const PSERVER_REINVEST_FLOOR = 0.01;
+export const HACKNET_REINVEST_FLOOR = 0.01;
+
+/** Infrastructure target at which the reinvest arm reaches its floor. */
+export const PSERVER_BOOTSTRAP_RAM_GB = 25 * 32; // 800 GB (fleet of 25 at 32 GB)
+export const HACKNET_BOOTSTRAP_NODES = 8;
 
 // ── Data files ─────────────────────────────────────────────────────────────
 

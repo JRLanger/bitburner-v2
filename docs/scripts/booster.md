@@ -12,6 +12,9 @@ extraction via HWGW batching:
 - **Batch** runs rolling HWGW grids against prepped, profitable targets.
 - **Admission control** caps how many targets batch at once so aggregate RAM
   demand never exceeds what the pool can sustain.
+- **Hack-% ramp** raises hack fractions above the RAM-efficiency optimum when the
+  whole fleet is engaged and pool RAM still sits idle, trading efficiency for
+  absolute income.
 
 It also writes `/data/servers.json` (topology for managers) and refreshes a live
 status table in the tail window each tick.
@@ -26,9 +29,17 @@ The main loop (`main`) each tick:
    keeps a safety buffer.
 3. `classify` — splits viable servers into `eligible` (prepped + batch-worthy,
    each scored by $/GB/s via `bestHackPct`) and `needsPrep`. Uses hysteresis:
-   **strict** bounds to *start* batching, **loose** bounds to *keep* batching
-   (healthy batches oscillate mid-cycle). `needsPrep` is sorted **easiest-earner
-   first** (ascending `maxMoney`).
+   **strict** bounds (on the raw read) to *start* batching, **loose** bounds to
+   *keep* batching. The keep-test is judged on the **grid-aligned windowed
+   baseline** (`displayHealth`'s peak money / floor security), not the raw
+   instantaneous read — a healthy batch's money legitimately plunges to ~(1−hack%)
+   each cycle, and its security legitimately spikes by the grow's full bump in the
+   gap between the grow landing and its counter-weaken (at high hack-% that bump is
+   large). Judging keep on those raw troughs/spikes would false-drop healthy
+   targets. `chance` is dropped from the keep-test entirely: once a target is
+   admitted, `chance` only degrades via security, which the floor-security bound
+   already catches — and the raw `chance` read dips on the same mid-cycle spike.
+   `needsPrep` is sorted **easiest-earner first** (ascending `maxMoney`).
 4. `selectBatchers` — **admission control + depth-first allocation.** Walks the
    score-sorted `eligible` list in rank order and gives each target, greedily, the
    RAM it can use before moving to the next — filling the best target toward its
@@ -51,7 +62,17 @@ The main loop (`main`) each tick:
    Stops at a `prepFloor` = the batchers' reserved-but-unclaimed RAM, and each
    `prepWave` is capped to that headroom — so prep can't starve a pipeline that is
    still ramping toward full depth.
-7. `updateDisplayStats` / `renderStatus` — refresh the tail-window status table.
+7. **Hack-% ramp controller** — a global `rampLevel` (a hack-% *floor*, starts at
+   0) absorbs idle pool RAM. After prep, the loop nudges `rampLevel` by at most one
+   `RAMP_STEP` per tick, driven by actual **pool utilization** (`1 − free/total`,
+   measured after this tick's batch + prep placements): **up** when every `eligible`
+   target got a batch slot **and** utilization is below `RAMP_UTIL_LOW`; **down**
+   when admission is RAM/lag-starved or utilization exceeds `RAMP_UTIL_HIGH`;
+   otherwise it holds (the `LOW..HIGH` deadband). `classify` then plans each target
+   at `max(score-optimal f, rampLevel)` capped at `HACK_PCT_RAMP_MAX`, so a raised
+   floor pulls low-% targets up to spend the idle RAM. The plan lock stores the
+   `rampLevel` it was computed at and recomputes only when the floor moves.
+8. `updateDisplayStats` / `renderStatus` — refresh the tail-window status table.
    Raw money/security reads land at a random phase of each target's batch grid, so
    they oscillate (e.g. money flips between 100% and `100% − hack%`). For display
    only, `updateDisplayStats` keeps a short rolling window per batcher and
@@ -86,6 +107,37 @@ budget overflows to the next target — a depth-first "fill the best, then the n
 progression. The fitted choice is stable tick-to-tick (`chance` is a common factor
 across all f, so it never flips which f wins), so re-fitting each tick doesn't
 cause flap.
+
+**The hack-% ramp spends idle RAM without flapping.** `bestHackPct` picks the `f`
+that maximizes `$/GB/s` — RAM *efficiency* — which is correct only while RAM is the
+bottleneck. After hours on a fresh save, every available target batches at that
+efficiency peak yet the pool still sits on huge free RAM (idle GB earn nothing). The
+fix raises hack-% *above* the per-target peak: more money per batch at worse
+`$/GB/s`, which is a good trade when the GB are otherwise idle. A single sticky
+`rampLevel` floor (not a per-target greedy allocator) keeps the model simple,
+monotonic, and easy to reason about — raising it pulls the cheapest-to-grow targets
+up first. Anti-flap comes from three things together: the move is **gated on actual pool
+utilization** (so it never steals RAM that prep or a new target is using and yields
+the instant utilization climbs), it steps by a small `RAMP_STEP` at most once per
+tick, and the wide `RAMP_UTIL_LOW..HIGH` deadband holds it steady through the normal
+mid-cycle money/security oscillation. The plan lock keys on `rampLevel` so plans
+only recompute on a genuine floor move, preserving the no-flap admission guarantee.
+
+The signal is **pool utilization, not "prep is empty."** An earlier version gated
+ramp-up on `needsPrep` being empty, but a large rooted network almost always has a
+trickle of one server prepping, so the ramp never fired while 98% of the pool sat
+idle. Measuring real utilization (which already counts prep's RAM) fixes that: a
+one-server prep trickle barely moves utilization, so the ramp proceeds — yet a
+fresh-save bootstrap, where prep is consuming the whole small pool, reads as
+fully-used and correctly suppresses the ramp.
+
+**`HACK_PCT_RAMP_MAX` doubles as the share-residual boundary.** Capping the ramp
+(and thus every target's hack-%) at a fixed maximum means that once `rampLevel`
+reaches it and `needsPrep` is empty, every target is hacking as hard as we allow, so
+the free RAM still left over — `poolFree − poolTotal × (1 − BATCH_BUDGET_FRAC)` — is
+genuine, well-defined surplus. A future `sharePhase` can claim exactly that residual
+for `ns.share()` workers, recomputed each tick so a ramp-down or new demand reclaims
+it instantly. Only the boundary is defined for now; `sharePhase` is not yet built.
 
 **Prep can't starve a ramping pipeline.** A pipeline fills gradually (one launch
 per `BATCH_PERIOD`, over ~a weaken time), so a freshly-admitted target's reserved
@@ -146,6 +198,24 @@ worker accumulation collapses the pool to near-zero, starving everything and
 causing the very drift the system is trying to avoid. The plan is deleted when a
 target drifts out (so it re-optimises fresh on the next admission).
 
+**Batch landing times use fresh op-times, never the locked plan's.** `batchPhase`
+schedules each batch's four landings from `ns.getWeakenTime/getGrowTime/getHackTime`
+fetched *fresh* every fire — it must **not** reuse the `weakenTime` stored in the
+locked plan. This was the root cause of a severe high-hack-% desync: the plan locks
+its thread counts (`h/g/w1/w2`) at admission, but if its `weakenTime` is also reused
+for scheduling, it goes stale as the hacking level climbs (real weaken time shrinks).
+Because each op's delay is `base ± offset − now − opTime`, a too-large stale
+`weakenTime` makes the two weakens (`W1`, `W2`) land progressively earlier than their
+hack/grow; once the error exceeds one `D_GAP` the landing order flips to `W1, H, W2,
+G` — the big `W2` lands *before* its `G`, so the grow's security bump is never
+cleared and stacks across batches until the target drifts. It was invisible for
+months because at low hack-% the grow is tiny (a fraction of a security point); the
+ramp pushed grow counts into the thousands (tens of security points per batch), which
+turned the latent bug into immediate, violent drift. The fix is one line — fetch
+`weakenTime` fresh alongside grow/hack — and is RAM-free (`getWeakenTime` is already
+charged via `bestHackPct`). The *thread counts* stay locked (they're robust, over-
+provisioned by `THREAD_MARGIN`); only the landing *timing* must track the live level.
+
 **Recovery is rate-limited per target.** `maybeRecover` (the safety net that
 re-grows a target that has slipped below `RECOVER_MONEY_FRAC`) fires at most one
 wave per `growTime` via `recoverClock`. Without this gate it re-fired a full
@@ -153,7 +223,11 @@ deficit-sized grow every tick for any persistently-drifted target; those grows
 live for the full grow time, so they stacked up, drained the pool, and starved the
 normal batches — which pushed more targets below threshold, a runaway that bled the
 pool from tens of TB to tens of GB. The cooldown lets one corrective wave land and
-be measured before the next fires.
+be measured before the next fires. Like the keep-test, recovery is **gated and
+sized on the windowed baseline** (peak money / floor security), not the raw read —
+otherwise a healthy high-hack-% target, whose raw money sits below
+`RECOVER_MONEY_FRAC` almost every tick, would fire off-grid grows continuously,
+themselves raising security and desyncing the pipeline.
 
 **Launches are capped per tick** (`MAX_FIRES_PER_TICK`). A target whose launch
 clock fell behind (e.g. after brief RAM starvation) would otherwise dump its entire
@@ -170,15 +244,20 @@ clear, `excess = poolFree - poolTotal * (1 - BATCH_BUDGET_FRAC)` is the genuine
 surplus a future `sharePhase` could feed to `ns.share()` for faction-rep bonuses,
 recomputed each tick so it yields the moment hacking demand rises. Not built yet.
 
-**Drift-prevention tuning.** Two knobs target the residual per-cycle leak that let
-long-pipeline targets (e.g. `iron-gym`) slowly rot even with recovery running:
-`THREAD_MARGIN` over-provisions every grow/weaken thread count by a small factor
-(hack is left exact) so each batch grows just past max and weakens just past min —
-both clamp harmlessly — absorbing the under-restore; and `D_GAP` (the spacing
-between HWGW landings) was tightened to reduce overlap jitter. Note `D_GAP` also
-drives `BATCH_PERIOD = 4 × D_GAP`, so halving it doubles each target's steady-state
-pipeline depth and RAM footprint — fewer targets fit the budget, but each runs
-hotter. These are tunables, validated by watching the log.
+**Drift-prevention tuning.** `THREAD_MARGIN` over-provisions every grow/weaken
+thread count by a small factor (hack is left exact) so each batch grows just past
+max and weakens just past min — both clamp harmlessly — absorbing the residual
+per-cycle under-restore that let long-pipeline targets slowly rot.
+
+`D_GAP` (spacing between HWGW landings, currently **100 ms**) also drives
+`BATCH_PERIOD = 4 × D_GAP`, so it sets batch *throughput*: a smaller `D_GAP` →
+shorter period → more batches/second → more income on RAM-rich pools (where deeper
+pipelines are free). It is **not** a drift knob — the engine enforces landing times
+via `additionalMsec`, so 100 ms is ample spacing as long as the scheduling op-times
+are current (see the fresh-`weakenTime` point above). A brief experiment widening it
+to 200 ms appeared to reduce drift, but that was a misdiagnosis: 200 ms only bought
+more staleness headroom before the order flipped. With the stale-time bug fixed,
+`D_GAP` returned to 100 ms for the throughput.
 
 ## Alternatives considered
 
@@ -192,3 +271,9 @@ hotter. These are tunables, validated by watching the log.
 - **Counting in-flight batches to limit depth**: the existing launch-clock model
   already regulates per-target depth implicitly; the missing piece was a *global*
   admission gate, which `selectBatchers` adds with minimal new state.
+- **Per-target marginal-$/s ramp instead of a global floor**: greedily spending
+  idle RAM on whichever target yields the most extra `$/s` per GB is closer to
+  theoretically optimal income, but it needs per-target state and is much harder to
+  keep from flapping at the margin. The global floor trades a little allocation
+  optimality for simplicity and rock-solid stability — the right call for an
+  opportunistic idle-RAM absorber.
