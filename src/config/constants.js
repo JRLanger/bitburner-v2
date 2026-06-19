@@ -212,6 +212,7 @@ export const HACKNET_GATE = {
 };
 
 /** Manager script paths. booster execs these on home in dependency order. */
+export const CONTRACTS_MANAGER = "/managers/contracts.js";
 export const PSERVER_MANAGER = "/managers/pserver.js";
 export const HACKNET_MANAGER = "/managers/hacknet.js";
 
@@ -220,6 +221,7 @@ export const HACKNET_MANAGER = "/managers/hacknet.js";
  * reserve home headroom for the next pending manager WITHOUT a getScriptRam call.
  * Measure each with `mem <file>` after any change and update here.
  */
+export const CONTRACTS_MANAGER_RAM = 16.80; // measured in-game (mem managers/contracts.js): 1.6 base + 0.2 ls + 15 getContract
 export const PSERVER_MANAGER_RAM = 5.85; // measured in-game (mem managers/pserver.js)
 export const HACKNET_MANAGER_RAM = 6.80; // measured in-game (mem managers/hacknet.js)
 

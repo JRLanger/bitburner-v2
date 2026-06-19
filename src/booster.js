@@ -46,8 +46,10 @@ import {
     D_GAP,
     BATCH_PERIOD,
     BATCH_SAFETY_MS,
+    CONTRACTS_MANAGER,
     PSERVER_MANAGER,
     HACKNET_MANAGER,
+    CONTRACTS_MANAGER_RAM,
     PSERVER_MANAGER_RAM,
     HACKNET_MANAGER_RAM,
     PSERVER_PREFIX,
@@ -66,12 +68,15 @@ const WORKER_FILES = new Set(WORKERS.map(stripSlash));
  * a later one until every earlier one is already running (see launchManagers).
  * `ramGB` (hardcoded in constants) is reserved on home so the exec always fits.
  *
- *  1. pserver — grows the RAM pool; launch immediately (it waits internally to
+ *  1. contracts — solves coding contracts for free money/rep; trivial cost, no
+ *     prerequisites (network is rooted), so it leads the order. Gate always true.
+ *  2. pserver — grows the RAM pool; launch immediately (it waits internally to
  *     afford). Highest compounding ROI: purchased servers feed the batch pool.
- *  2. hacknet — weak ROI; deferred until the pserver fleet is fully built (counted
+ *  3. hacknet — weak ROI; deferred until the pserver fleet is fully built (counted
  *     from topology data booster already has — no extra NS call).
  */
 const MANAGERS = [
+    { file: CONTRACTS_MANAGER, ramGB: CONTRACTS_MANAGER_RAM, gate: () => true },
     { file: PSERVER_MANAGER, ramGB: PSERVER_MANAGER_RAM, gate: () => true },
     { file: HACKNET_MANAGER, ramGB: HACKNET_MANAGER_RAM, gate: pserverFleetBuilt },
 ];

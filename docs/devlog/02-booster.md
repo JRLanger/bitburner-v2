@@ -21,7 +21,7 @@ home RAM). Source: `src/booster.js`, workers in `src/workers/`, tunables in
 | 3e | Bootstrap fix (easiest-earner-first prep) + target-count cap for lag | ✅ done |
 | 3f | Live status table (tail window) | ✅ done |
 | 4 | Manager orchestration: pserver + hacknet managers, gated launch in booster | ✅ done |
-| 4 (cont.) | Contracts solver manager (`managers/contracts.js`), launched order-1 by booster | ⬜ planned |
+| 4 (cont.) | Contracts solver manager (`managers/contracts.js`), launched order-1 by booster | ✅ done |
 | 5 | `sharePhase` in booster: feed idle pool residual to `ns.share()` | ⬜ planned |
 | 6 | Formulas.exe handoff | ⬜ **deliberately disabled** — loop is `while(true)` so it can be tested on a save that already owns Formulas.exe. Restore the `while(!fileExists(FORMULAS_EXE))` exit when moving to a fresh BN. |
 
@@ -265,11 +265,13 @@ inside each manager. `booster` does not micromanage.
 **Implementation note (stage 4).** The two RAM-pool-growth managers shipped first:
 the pserver buyer/upgrader (`src/managers/pserver.js`) and the hacknet
 buyer/upgrader (`src/managers/hacknet.js`). See `docs/scripts/pserver.md` and
-`docs/scripts/hacknet.md`. The **contracts solver (order 1 above) is now in scope
-as the remaining Stage-4 work** (`src/managers/contracts.js`, planned) — it had
-been deferred as "contract-solving logic, not RAM growth," but is being folded back
-in to close Stage 4. Once built, the launch order is the full
-contracts → pserver → hacknet (contracts' gate is always true, so it leads).
+`docs/scripts/hacknet.md`. The **contracts solver (order 1 above) closed out Stage 4**
+(`src/managers/contracts.js`, see `docs/scripts/contracts.md`) — it had been deferred
+as "contract-solving logic, not RAM growth," but was folded back in to complete the
+stage. The launch order is now the full contracts → pserver → hacknet (contracts'
+gate is always true, so it leads). It finds `.cct` files across the network (host
+list from the topology JSON booster already writes) and solves them from a pure-function
+solver registry keyed by contract type — solve-all, skip-unknown.
 
 **Spending model — two arms: payback OR reinvestment fraction.** Each manager buys
 the cheapest next step (gated by affordability) when EITHER it *pays back within `X`
