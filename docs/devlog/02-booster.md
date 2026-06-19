@@ -20,7 +20,7 @@ home RAM). Source: `src/booster.js`, workers in `src/workers/`, tunables in
 | 3d | Stabilization: RAM-budgeted admission, plan locking, fire cap, recovery rate-limit, drift tuning | ✅ done |
 | 3e | Bootstrap fix (easiest-earner-first prep) + target-count cap for lag | ✅ done |
 | 5 (partial) | Live status table (tail window) | ✅ done |
-| 4 | Manager orchestration (managers not yet written) | ⬜ pending |
+| 4 | Manager orchestration: pserver + hacknet managers, gated launch in booster | ✅ done (contracts solver deferred to a later stage) |
 | 5 | Formulas.exe handoff | ⬜ **deliberately disabled** — loop is `while(true)` so it can be tested on a save that already owns Formulas.exe. Restore the `while(!fileExists(FORMULAS_EXE))` exit when moving to a fresh BN. |
 
 Key lessons captured during implementation: the NS-property RAM collision (see
@@ -258,8 +258,45 @@ running**. That ordering is what makes the sequence "fixed."
 | 5 | bladeburner (future) | unlock-gated | deferred |
 
 Affordability/launch decisions live in `booster`; **spending** decisions live
-inside each manager (e.g. the pserver manager only reinvests a budget
-fraction). `booster` does not micromanage.
+inside each manager. `booster` does not micromanage.
+
+**Implementation note (stage 4).** Only the two RAM-pool-growth managers were
+built: the pserver buyer/upgrader (`src/managers/pserver.js`) and the hacknet
+buyer/upgrader (`src/managers/hacknet.js`). The contracts solver (order 1 above)
+is **deferred to its own later stage** — it's contract-solving logic, not RAM
+growth — so in the shipped order pserver is launched first (gate always true) and
+hacknet second (gated on the pserver fleet). See `docs/scripts/pserver.md` and
+`docs/scripts/hacknet.md`.
+
+**Spending model — two arms: payback OR reinvestment fraction.** Each manager buys
+the cheapest next step (gated by affordability) when EITHER it *pays back within `X`
+seconds of current income* (`getTotalScriptIncome`, the PAYBACK arm) OR its cost ≤ a
+*reinvestment fraction of current cash* (the REINVEST arm). The payback arm lets
+large purchases through once income justifies them and makes upgrades halt
+automatically where servers get expensive ("not worth it after a point", emergent).
+The reinvest arm is income-independent and **breaks the fresh-save chicken-and-egg**:
+at the start income is ~0 *because* RAM is the bottleneck, so payback can never fire;
+the reinvest arm spends accumulating cash down to a self-scaling buffer
+(~`cost/frac`) and pours the rest into RAM.
+
+**The reinvest fraction decays as infrastructure is built**, so it doesn't
+permanently neuter payback. A constant reinvest arm would override payback forever
+(once cash-rich/income-poor, `money × frac` almost always covers the cheapest step,
+so the "worth it?" check never binds). Instead `effFrac` decays linearly from
+`*_REINVEST_FRAC` (0.25) down to `*_REINVEST_FLOOR` (0.01) as infrastructure grows
+toward a target — pserver keyed to **fleet RAM** → `PSERVER_BOOTSTRAP_RAM_GB`
+(25 × 32 = 800 GB), hacknet to **node count** → `HACKNET_BOOTSTRAP_NODES` (8). RAM
+is the signal because it's BitNode-independent (unlike a dollar income threshold).
+During bootstrap the reinvest arm fills the fleet; past the target it sits at the 1%
+floor and payback governs upgrades, the floor acting as a slow-trickle relief valve
+(a stalled fleet still creeps on a large cash pile). Tunables:
+`*_PAYBACK_SECONDS`, `*_REINVEST_FRAC`, `*_REINVEST_FLOOR`, `PSERVER_BOOTSTRAP_RAM_GB`,
+`HACKNET_BOOTSTRAP_NODES`.
+
+*Known consequence:* if pserver upgrades stall below the hacknet gate (32 TB × 25)
+because they stop being worth it, hacknet launches late or not at all. The reinvest
+arm lets a fleet keep growing as cash accumulates; gating hacknet on "pserver reports
+no affordable step" instead of a fixed RAM target is a noted future refinement.
 
 The hacknet gate is computed from existing scan data — `booster` counts
 topology entries whose hostname starts with the shared `PSERVER_PREFIX` and
