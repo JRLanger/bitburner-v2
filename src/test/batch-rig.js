@@ -31,18 +31,29 @@
  * outside the optimum, and fire/skip/clamp counts that expose the gate starvation).
  */
 
-// ── CONFIG — flip these to A/B the schedulers ───────────────────────────────
-const USE_GATE = true;      // MODE A: baseline fire gate on. MODE B: set false.
-const SKIP_LATE = false;    // MODE B: set true — advance grid by wall-clock, skip
+// ── CONFIG — flip these to A/B/C the schedulers ─────────────────────────────
+// MODE C ("self-pacing") overrides the gate/skip flags entirely. Instead of a
+// pre-anchored grid that discards missed slots (Mode B), it tracks the committed
+// future landings, and each tick fires enough new batches to TOP UP the pipeline
+// to its target depth — placing each at lastLand + period. Nothing is skipped or
+// discarded: it fills exactly to depth and holds. Goal: same +0.00 / ~2ms timing
+// as Mode B but with skipped≈0 and full throughput.
+const SELF_PACE = true;     // MODE C on. Overrides USE_GATE / SKIP_LATE below.
+
+const USE_GATE = false;     // MODE A: baseline fire gate on. MODE B: set false.
+const SKIP_LATE = true;     // MODE B: set true — advance grid by wall-clock, skip
                             //         slots that would land late instead of firing them.
-const CONCURRENCY_CAP = 50; // 0 = uncapped (raw BATCH_PERIOD spacing, max depth).
+const CONCURRENCY_CAP = 0;  // 0 = uncapped (raw BATCH_PERIOD spacing, max depth).
                             //     Match booster's 50, or 0 for worst-case depth.
 const USE_FRESH_TIMES = true; // false → schedule from min-sec cached times.
+const RUN_MINUTES = 5;      // auto-stop after this many minutes (0 = run forever).
+                            //   override per-run: run /test/batch-rig.js iron-gym 0.75 10
 
 // Booster's coarse loop regime (the conditions under which drift actually appears).
 const LOOP_SLEEP = 200;     // booster LOOP_SLEEP (was 40 in the old fine-loop rig).
 const SAFETY = 300;         // booster BATCH_SAFETY_MS (was 50).
-const MAX_FIRES_PER_TICK = 2;
+const MAX_FIRES_PER_TICK = 8; // per-tick fire cap. Higher than booster's 2 so Mode C
+                            //   can refill a deep pipeline in seconds without a spike.
 
 // ── Fixed constants (mirror config/constants.js) ────────────────────────────
 const D_GAP = 100;
@@ -61,9 +72,10 @@ export async function main(ns) {
     ns.ui.openTail();
     const target = ns.args[0] ?? "n00dles";
     const f = ns.args[1] ?? 0.75;
+    const runMinutes = ns.args[2] ?? RUN_MINUTES; // 0 = forever
     if (!ns.hasRootAccess(target)) { ns.tprint(`ERROR: no root on ${target}`); return; }
 
-    const mode = !USE_GATE && SKIP_LATE ? "B-decoupled" : USE_GATE ? "A-booster" : "custom";
+    const mode = SELF_PACE ? "C-selfpace" : !USE_GATE && SKIP_LATE ? "B-decoupled" : USE_GATE ? "A-booster" : "custom";
     const minSec = ns.getServerMinSecurityLevel(target);
     const maxMoney = ns.getServerMaxMoney(target);
     const hosts = discover(ns);
@@ -90,13 +102,20 @@ export async function main(ns) {
     port.clear();
     let batchId = 0;
     let nextLand = 0; // absolute landing time of the next batch's W1; 0 = (re)anchor
+    // MODE C state: committed future W1 landing times, and the most recent one. The
+    // pipeline depth at any moment is how many of these are still in the future.
+    let committed = [];      // W1 land timestamps of batches still pending
+    let lastLand = 0;        // W1 land of the most recently fired batch
+    let inFlightNow = 0;     // depth this tick (for the report)
     const errs = [];           // recent landing errors (actual - planned)
     let offBaseline = 0, samples = 0; // how often a landing reads outside baseline
     let firedTotal = 0, skippedTotal = 0, clampedTotal = 0, gateShutLoops = 0, loops = 0;
     let lastReport = Date.now();
+    const deadline = runMinutes > 0 ? Date.now() + runMinutes * 60000 : Infinity;
 
     while (true) {
         const now = Date.now();
+        if (now >= deadline) break; // auto-stop after runMinutes
         loops++;
         const wt = USE_FRESH_TIMES ? ns.getWeakenTime(target) : plan.minSecWT;
         const gt = USE_FRESH_TIMES ? ns.getGrowTime(target) : plan.minSecGT;
@@ -107,35 +126,59 @@ export async function main(ns) {
         const atBaseline = ns.getServerSecurityLevel(target) - minSec <= FIRE_SEC_MARGIN;
         if (USE_GATE && !atBaseline) gateShutLoops++;
 
-        // (Re)anchor one weaken-time ahead if missing or a slot slipped fully past.
-        // MODE A only re-anchors at baseline (mirrors booster); MODE B re-anchors freely.
-        if (nextLand === 0 || nextLand < now) {
-            if (!USE_GATE || atBaseline) nextLand = now + wt + SAFETY;
-        }
-
-        // Launch every slot whose launch-lead has arrived.
-        const maxFires = Math.min(MAX_FIRES_PER_TICK, Math.ceil(wt / period));
+        const targetDepth = Math.ceil(wt / period); // batches needed to fill the pipeline
+        const maxFires = MAX_FIRES_PER_TICK;
         let fired = 0;
-        while (nextLand !== 0 && now >= nextLand - wt - SAFETY && fired < maxFires) {
-            const addW1 = nextLand - now - wt; // < 0 → would clamp → lands late, off-grid
 
-            if (SKIP_LATE && addW1 < 0) {
-                // MODE B: this slot can't land on-grid any more. Drop it and advance
-                // the grid by wall-clock rather than firing a late/colliding batch.
-                nextLand += period;
-                skippedTotal++;
-                continue;
+        if (SELF_PACE) {
+            // ── MODE C: self-pacing top-up ──────────────────────────────────────
+            // Drop landings that have already passed, measure remaining depth, and
+            // fire just enough to refill to targetDepth. Each new batch lands at
+            // lastLand + period (or now + wt + SAFETY if the pipeline ran dry), so
+            // landings stay exactly `period` apart with no skipped or discarded slots.
+            committed = committed.filter((t) => t > now);
+            inFlightNow = committed.length;
+            while (committed.length < targetDepth && fired < maxFires) {
+                const land = Math.max(now + wt + SAFETY, lastLand + period);
+                const pool = buildPool(ns, hosts);
+                if (poolFree(pool) < (h + g + w1 + w2) * ramPer) break; // RAM full → top up later
+                fireBatch(ns, pool, target, land, now, ht, gt, wt, plan, batchId, minSec, maxMoney, ramPer);
+                batchId++;
+                firedTotal++;
+                lastLand = land;
+                committed.push(land);
+                fired++;
             }
-            if (USE_GATE && !atBaseline) break; // MODE A: wait for the gate to open.
+        } else {
+            // (Re)anchor one weaken-time ahead if missing or a slot slipped fully past.
+            // MODE A only re-anchors at baseline (mirrors booster); MODE B re-anchors freely.
+            if (nextLand === 0 || nextLand < now) {
+                if (!USE_GATE || atBaseline) nextLand = now + wt + SAFETY;
+            }
 
-            const pool = buildPool(ns, hosts);
-            if (poolFree(pool) < (h + g + w1 + w2) * ramPer) break; // can't fit a batch
-            if (addW1 < 0) clampedTotal++; // fired anyway (MODE A) → lands late
-            fireBatch(ns, pool, target, nextLand, now, ht, gt, wt, plan, batchId, minSec, maxMoney, ramPer);
-            batchId++;
-            firedTotal++;
-            nextLand += period;
-            fired++;
+            // Launch every slot whose launch-lead has arrived.
+            const maxFiresAB = Math.min(MAX_FIRES_PER_TICK, targetDepth);
+            while (nextLand !== 0 && now >= nextLand - wt - SAFETY && fired < maxFiresAB) {
+                const addW1 = nextLand - now - wt; // < 0 → would clamp → lands late, off-grid
+
+                if (SKIP_LATE && addW1 < 0) {
+                    // MODE B: this slot can't land on-grid any more. Drop it and advance
+                    // the grid by wall-clock rather than firing a late/colliding batch.
+                    nextLand += period;
+                    skippedTotal++;
+                    continue;
+                }
+                if (USE_GATE && !atBaseline) break; // MODE A: wait for the gate to open.
+
+                const pool = buildPool(ns, hosts);
+                if (poolFree(pool) < (h + g + w1 + w2) * ramPer) break; // can't fit a batch
+                if (addW1 < 0) clampedTotal++; // fired anyway (MODE A) → lands late
+                fireBatch(ns, pool, target, nextLand, now, ht, gt, wt, plan, batchId, minSec, maxMoney, ramPer);
+                batchId++;
+                firedTotal++;
+                nextLand += period;
+                fired++;
+            }
         }
 
         // Drain the landing reports.
@@ -163,14 +206,40 @@ export async function main(ns) {
             const mn = n ? sorted[0] : 0;
             ns.clearLog();
             ns.print(`RIG ${target} f=${f} MODE ${mode} (cap=${CONCURRENCY_CAP})`);
-            ns.print(`batches fired: ${batchId}  depth≈${Math.ceil(wt / period)}`);
+            ns.print(`batches fired: ${batchId}  depth≈${Math.ceil(wt / period)}${SELF_PACE ? `  inFlight=${inFlightNow}` : ""}`);
             ns.print(`sec now: +${(ns.getServerSecurityLevel(target) - minSec).toFixed(2)}  mon now: ${((ns.getServerMoneyAvailable(target) / maxMoney) * 100).toFixed(0)}%`);
             ns.print(`landing err ms  min=${mn} med=${med} p95=${p95} max=${mx}  (n=${n})`);
             ns.print(`landings outside optimum: ${samples ? ((offBaseline / samples) * 100).toFixed(1) : 0}%  (${offBaseline}/${samples})`);
             ns.print(`fires=${firedTotal} skipped=${skippedTotal} clampedLate=${clampedTotal}  gateShut ${loops ? ((gateShutLoops / loops) * 100).toFixed(0) : 0}% of loops`);
+            // Ground-truth RAM check: how much pool the rig actually sees free, the
+            // per-batch footprint, and how many batches that free RAM can hold vs the
+            // depth we're trying to fill. If batchesFit << depth, the rig is starved
+            // (something else — e.g. booster — is holding the pool), NOT a scheduler bug.
+            const free = poolFree(buildPool(ns, hosts));
+            const batchRam = (h + g + w1 + w2) * ramPer;
+            ns.print(`poolFree=${(free / 1e6).toFixed(2)}PB  batchRam=${(batchRam / 1e3).toFixed(2)}TB  batchesFit=${Math.floor(free / batchRam)} / depth ${Math.ceil(wt / period)}`);
         }
         await ns.sleep(LOOP_SLEEP);
     }
+
+    // Auto-stop: kill any workers this rig still has in flight so they stop hitting
+    // the target, then print + log a final summary so it's there when you come back.
+    for (const host of hosts) {
+        for (const proc of ns.ps(host)) {
+            if (WORKERS.includes(proc.filename) && proc.args[0] === target) ns.kill(proc.pid);
+        }
+    }
+    const sorted = [...errs].sort((a, b) => a - b);
+    const n = sorted.length;
+    const p95 = n ? sorted[Math.min(n - 1, Math.floor(n * 0.95))] : 0;
+    const summary =
+        `DONE ${target} f=${f} MODE ${mode} cap=${CONCURRENCY_CAP} after ${runMinutes}min: ` +
+        `fires=${firedTotal} skipped=${skippedTotal} clampedLate=${clampedTotal} ` +
+        `errP95=${p95}ms offOptimum=${samples ? ((offBaseline / samples) * 100).toFixed(1) : 0}%`;
+    ns.print("─".repeat(40));
+    ns.print(summary);
+    ns.write(LOG, summary + "\n", "a");
+    ns.tprint(summary);
 }
 
 function fireBatch(ns, pool, target, base, now, ht, gt, wt, plan, id, minSec, maxMoney, ramPer) {

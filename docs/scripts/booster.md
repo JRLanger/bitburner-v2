@@ -28,7 +28,10 @@ The main loop (`main`) each tick:
 2. `buildPool` — one entry per rooted host with free RAM, largest-first; home
    keeps a safety buffer.
 3. `classify` — splits viable servers into `eligible` (prepped + batch-worthy,
-   each scored by $/GB/s via `bestHackPct`) and `needsPrep`. Uses hysteresis:
+   each scored by $/GB/s via `bestHackPct`), `needsPrep` (not yet at baseline), and
+   `idle` (prepped but `hackAnalyzeChance < CHANCE_BATCH` — held back until the
+   hacking level rises, surfaced in the status table so it's clear *why* a ready
+   server isn't being attacked rather than vanishing from every list). Uses hysteresis:
    **strict** bounds (on the raw read) to *start* batching, **loose** bounds to
    *keep* batching. The keep-test is judged on the **grid-aligned windowed
    baseline** (`displayHealth`'s peak money / floor security), not the raw
@@ -51,14 +54,18 @@ The main loop (`main`) each tick:
    waits. Ceilings: `BATCH_BUDGET_FRAC` of the *total* pool and `MAX_BATCH_TARGETS`.
    Last tick's batchers (`wasBatching`) get first claim so the set doesn't flap.
    Returns `{ batchers, reserved }`.
-5. `batchPhase` — fires rolling HWGW batches for the admitted set, in rank order,
-   regulated by a per-target **absolute landing grid decoupled from firing**: a
-   `clock.nextLand` timestamp advancing by `period` (= `max(BATCH_PERIOD,
-   weakenTime/CONCURRENCY_CAP)`). The grid advances by wall-clock, and a slot too
-   stale to land on-grid (its `addW1` would clamp below 0) is **skipped** — the
-   clock advances past it without firing — rather than fired late. The pipeline
-   fills gradually up to its depth, so a target's RAM use ramps over ~a weaken time.
-   There is **no baseline fire gate and no recovery wave** (see below).
+5. `batchPhase` — a **self-pacing scheduler** that tops each admitted target's
+   pipeline up to a target depth. It keeps a per-target `pipelines` entry
+   (`committed[]` future W1 landing times, `lastLand`, `depth`); each tick it drops
+   landings that have passed and fires enough new batches to refill to `depth`, each
+   landing one `period` after the previous committed one (or a fresh weaken-time +
+   safety ahead if the pipeline drained). `period = max(BATCH_PERIOD,
+   weakenTime/CONCURRENCY_CAP)` and `depth = ceil(weakenTime/period)` are derived
+   from the **stable min-security weaken time** locked in the plan, so depth is
+   constant and the pipeline holds at exactly N in flight. There is **no baseline
+   fire gate, no skipped slots, and no recovery wave** (see below). The pipeline
+   fills gradually (≤ `MAX_FIRES_PER_TICK` per tick) so RAM use ramps over ~a weaken
+   time; a momentarily full pool just defers the rest to a later tick.
 6. `prepPhase` — spends remaining RAM driving `needsPrep` targets to baseline, one
    corrective wave per target (`prepWave`), skipping any with workers already in
    flight; prepares at most `MAX_BATCH_TARGETS + PREP_LOOKAHEAD` servers at once.
@@ -165,8 +172,12 @@ big earner finishes prepping — this self-corrects as `selectBatchers` retains 
 highest-score targets and drops weaker ones (hysteresis permitting).
 
 **Admission control is the core correctness mechanism.** Each batching target
-independently tries to maintain a full pipeline of `weakenTime / BATCH_PERIOD`
-concurrent batches. Without a global budget, the sum of all pipelines far exceeds
+independently tries to maintain a full pipeline of `min(ceil(weakenTime/BATCH_PERIOD),
+CONCURRENCY_CAP)` concurrent batches — the **same depth `batchPhase` actually runs**.
+(An earlier version estimated the uncapped `ceil(weakenTime/BATCH_PERIOD)` here, which
+over-reserved several-fold on deep targets, exhausting the budget and freezing the
+admitted set far below the pool's real capacity.) Without a global budget, the sum of
+all pipelines far exceeds
 the pool: as pipelines fill, RAM drains to zero. That caused two failures observed
 in a 10-hour run:
 
@@ -219,46 +230,49 @@ turned the latent bug into immediate, violent drift. The fix is one line — fet
 charged via `bestHackPct`). The *thread counts* stay locked (they're robust, over-
 provisioned by `THREAD_MARGIN`); only the landing *timing* must track the live level.
 
-**The landing grid is decoupled from firing, with no baseline fire gate — this is
-the central drift fix.** Earlier the scheduler only fired a batch while the server
-read at (near) min security (a "baseline fire gate"), and the grid clock advanced
-*only on a fire*. That gate was both unnecessary and actively harmful:
+**The scheduler is self-pacing, with no baseline fire gate — this is the central
+drift fix.** It evolved through two earlier designs, both of which the test rig
+(`src/test/batch-rig.js`, modes A/B/C) exposed as flawed:
 
-- *Unnecessary:* an op fired at `now` lands at `now + freshWeakenTime`, and
-  `fireBatch` sets `addW1 = slot − now − weakenTime` from the **fresh** weaken time,
-  so the op lands on its grid slot regardless of the security at fire time. The gate
-  bought no correctness the fresh op-times didn't already provide.
-- *Harmful:* on a deep pipeline (long-`weakenTime` targets like iron-gym) security
-  is perpetually bumped by in-flight hacks/grows, so the gate was shut most of the
-  time. While shut, no batch fired but the clock didn't advance either; `now` ran on
-  until the next fire's `addW1` went negative and clamped to 0, landing that batch
-  **late and off-grid**. The late landing broke the H‑W1‑G‑W2 order, grow-security
-  stopped being cleared, and the target ran away into drift within seconds of each
-  re-admission.
+- *Mode A — baseline fire gate (original).* A batch only fired while the server read
+  at (near) min security, and the landing clock advanced *only on a fire*. On a deep
+  pipeline (long-`weakenTime` targets like iron-gym) security is perpetually bumped
+  by in-flight hacks/grows, so the gate was shut most of the time; while shut the
+  clock stalled while `now` ran on, until the next fire's `addW1` went negative,
+  clamped to 0, and the batch landed **late and off-grid** — breaking the H‑W1‑G‑W2
+  order so grow-security stopped being cleared and the target ran away. On iron-gym
+  the rig measured landing-error p95 ≈ 2.5 s, 71 % of landings off-optimum.
+- *Mode B — decoupled grid + skip-late.* The gate was dropped (an op fired at `now`
+  lands at `now + freshWeakenTime`, and `fireBatch` sets `addW1` from the fresh
+  weaken time, so it lands on slot regardless of current security — the gate bought
+  no correctness) and slots too stale to land on-grid were *skipped*. This fixed the
+  drift (p95 ≈ 2 ms, +0.00 security) but the skip bookkeeping wasted throughput: the
+  grid drifted ahead of itself and discarded ~⅔ of slots (rig: 502 fired vs 1111
+  skipped over 10 min, ~31 % of theoretical).
+- *Mode C — self-pacing top-up (current).* No grid to skip against: track the
+  committed future landings and each tick fire enough to refill to `depth`, each
+  landing `period` after the last. Nothing is gated, nothing is discarded. Rig on
+  iron-gym at full depth 248: +0.00 security, ~2 ms landing error, **0 skipped,
+  ~98 % throughput** (≈1469 fires/10 min) indefinitely.
 
-The fix: advance `clock.nextLand` by wall-clock and **skip** any slot whose `addW1`
-would clamp below 0 (drop it, advance `period`, don't fire), so only clean, on-grid
-batches ever launch and the grid catches up to *now* in a single tick. This was
-proven in isolation with the test rig (`src/test/batch-rig.js`, Mode A gated vs
-Mode B decoupled): on iron-gym, Mode A drifted with landing-error p95 ≈ 2.5 s and
-71 % of landings off-optimum, while Mode B held p95 ≈ 2 ms, security at +0.00, zero
-late landings. Live, drifts dropped from one every few minutes to ~one per 20 min.
-The trade-off is **dropped slots** (the skipped batches) — some throughput is lost
-on deep targets, acceptable here (RAM is abundant; stability is the priority). A
-future pass may close that gap.
+Two details make Mode C hold exactly N in flight: depth/period come from the
+**stable min-security weaken time** in the locked plan (using the live,
+security-inflated value would grow the depth target on a transient bump and
+overfill), while landing *times* use **fresh op-times** so each op still lands on
+slot. `committed.length` is also the live pipeline fill shown in the status table.
 
-**Drift recovery is "drop to prep," not an off-grid corrective wave.** The earlier
-`maybeRecover` injected supplemental grow/weaken **off the absolute grid** when a
-batcher dipped; those landings collided with the in-flight grid at times it didn't
-anticipate, spiking security past the (then-present) fire gate and locking the
-target into the very runaway it was meant to fix. It was removed. A target that
-genuinely dips below the loose keep-bounds now simply drops to a clean re-prep via
-`classify`'s existing drift-grace logic. With the decoupled grid keeping targets
-pinned at baseline, such dips are now rare.
+**Drift recovery is "drop to prep," not an off-grid corrective wave.** An earlier
+`maybeRecover` injected supplemental grow/weaken **off the grid** when a batcher
+dipped; those landings collided with the in-flight pipeline at unanticipated times,
+spiking security past the (then-present) fire gate and locking the target into the
+very runaway it was meant to fix. It was removed. A target that genuinely dips below
+the loose keep-bounds now simply drops to a clean re-prep via `classify`'s
+drift-grace logic. With the self-pacing scheduler holding targets at baseline, such
+dips are rare.
 
-**Launches are capped per tick** (`MAX_FIRES_PER_TICK`). A target whose launch
-clock fell behind (e.g. after brief RAM starvation) would otherwise dump its entire
-pipeline — hundreds of batches — in a single tick, spiking RAM and re-starving the
+**Fill is capped per tick** (`MAX_FIRES_PER_TICK`). A target refilling a deep
+pipeline (e.g. after brief RAM starvation) would otherwise fire its entire backlog
+in a single tick, spiking RAM and re-starving the
 pool. The cap refills a pipeline gradually; steady state only needs about one
 launch every couple of ticks.
 

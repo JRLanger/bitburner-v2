@@ -70,25 +70,6 @@ export const BATCH_KEEP_SEC_OVER = 5;
 /** Re-prep a drifted batcher only after it stays unhealthy this long, ms. */
 export const DRIFT_GRACE_MS = 4000;
 
-// Baseline fire gate. A batch's ops take their duration from the server's security
-// at the instant they START (fire time), so a batch fired while security is
-// transiently bumped (by the target's own in-flight grows) runs long and lands late
-// → desync. Only launch a batch when the server is at (near) min security, so every
-// batch executes from the baseline its schedule assumes and lands on the grid. Small
-// enough to exclude an un-cleared grow bump, loose enough not to miss the baseline
-// window (security is at min the large majority of each cycle). Tune in-game.
-/** Max security-over-min at which a batch may be launched. */
-export const FIRE_SEC_MARGIN = 0.5;
-
-// Recovery: a pure HWGW batch maintains money but provides no surplus to climb
-// back to max if a target ever dips below it. When a batching target sits below
-// this fraction of max (a sustained drift, not a healthy mid-cycle dip), inject
-// supplemental grow to pull it back up.
-/** Fire recovery grow when a batching target's money < maxMoney × this. */
-export const RECOVER_MONEY_FRAC = 0.95;
-/** Fire recovery weaken when a batching target's security > minSecurity + this. */
-export const RECOVER_SEC_OVER = 1;
-
 // ── Batcher admission control ──────────────────────────────────────────────
 
 // Each batching target sustains a full pipeline of ceil(weakenTime/BATCH_PERIOD)

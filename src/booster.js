@@ -57,53 +57,6 @@ import {
 /** Worker paths that must exist on home and get copied to every rooted server. */
 const WORKERS = [HACK_WORKER, GROW_WORKER, WEAKEN_WORKER];
 
-// ── Drift diagnostics (toggle) ──────────────────────────────────────────────
-// Temporary instrumentation to find the cause of the remaining sparse drifts.
-// Appends to DRIFT_FILE: a rich line per drift event, plus a periodic snapshot
-// of every batcher so the slow approach to a drift is visible. Goal: tell apart
-// (H1) stale thread counts as the hacking level climbs — the locked `h` steals a
-// growing fraction `f_actual = h*hackAnalyze` while `g` stays fixed → slow money
-// bleed; from (H3) inter-batch grid compression — newer batches have a shorter
-// weakenTime, so landings creep closer than BATCH_PERIOD → sudden collision. All
-// NS calls used here (hackAnalyze/growthAnalyze/getWeakenTime/getHackingLevel)
-// are already charged via bestHackPct/classify, so this adds no RAM. Remove once
-// diagnosed.
-const DRIFT_DEBUG = true;
-const DRIFT_FILE = "/data/booster-drift.txt";
-const SNAP_INTERVAL_MS = 30000;
-let driftCount = 0;
-let lastSnap = 0;
-function dfile(ns, msg) {
-    if (!DRIFT_DEBUG) return;
-    const ts = `${new Date().toLocaleTimeString()}.${String(Date.now() % 1000).padStart(3, "0")}`;
-    ns.write(DRIFT_FILE, `${ts} ${msg}\n`, "a");
-}
-/** Record the hacking level and time a plan was (re)computed, for staleness diag. */
-function stampPlan(plan, level) {
-    plan.computedLevel = level;
-    plan.computedTime = Date.now();
-}
-/**
- * One-line diagnostic for a batching target: how stale its locked plan is (age,
- * level climb), whether it is now over-stealing (f planned vs f_actual), whether
- * its grow is now undersized (g planned vs g_needed), and how far weakenTime has
- * shifted since the plan was computed (grid-compression driver). `plan` is the
- * locked bestHackPct result (carries f/h/g/weakenTime + computedLevel/Time).
- */
-function driftDiag(ns, host, plan, moneyFrac, secOver, level) {
-    if (!plan) return `win(m=${Math.round(moneyFrac * 100)}%,s=+${secOver.toFixed(1)}) plan(none)`;
-    const fActual = plan.h * ns.hackAnalyze(host);
-    const gNeed = fActual < 0.999 ? Math.ceil(ns.growthAnalyze(host, 1 / (1 - fActual)) * THREAD_MARGIN) : -1;
-    const nowWt = ns.getWeakenTime(host);
-    const ageS = ((Date.now() - plan.computedTime) / 1000).toFixed(0);
-    return (
-        `age=${ageS}s lvl=${plan.computedLevel}->${level}(+${level - plan.computedLevel}) ` +
-        `f=${plan.f.toFixed(2)}->${fActual.toFixed(2)} g=${plan.g}/${gNeed} ` +
-        `wt=${(plan.weakenTime / 1000).toFixed(1)}->${(nowWt / 1000).toFixed(1)}s ` +
-        `win(m=${Math.round(moneyFrac * 100)}%,s=+${secOver.toFixed(1)})`
-    );
-}
-
 /** Normalized worker filenames for matching against ns.ps() output. */
 const WORKER_FILES = new Set(WORKERS.map(stripSlash));
 
@@ -129,9 +82,16 @@ let batchSeq = 0;
 /** Hosts we've already copied the workers onto this run (avoid re-scp each tick). */
 const provisioned = new Set();
 
-/** Per-target absolute landing grid: target -> { nextLand } timestamp (ms) of the
- *  next batch's W1 landing. Advances by BATCH_PERIOD; cleared on drift. */
-const clocks = new Map();
+/**
+ * Per-target HWGW pipeline state: target -> { committed, lastLand, depth }.
+ * `committed` is the list of W1 landing timestamps still in the future, `lastLand`
+ * the most recent committed landing, `depth` the target in-flight count (for the
+ * status display). Each tick batchPhase prunes landed entries and fires enough new
+ * batches to refill to `depth`, each landing one period after the last — a
+ * self-pacing scheduler that holds the pipeline full with no fire gate and no
+ * skipped slots. Cleared when a target drops to re-prep (classify).
+ */
+const pipelines = new Map();
 
 /** Targets currently in the batching rotation (persistent across ticks). */
 const activeBatching = new Set();
@@ -189,8 +149,6 @@ export async function main(ns) {
         return;
     }
 
-    if (DRIFT_DEBUG) ns.write(DRIFT_FILE, `=== booster drift diag ${new Date().toLocaleTimeString()} ===\n`, "w");
-
     // Main control loop. Stage 3a: discover/root + prep.
     // NOTE: stage 5 will restore the Formulas.exe handoff as the loop's exit
     // condition. For now it runs unconditionally so it's testable on saves that
@@ -207,7 +165,7 @@ export async function main(ns) {
         const pool = buildPool(ns, rootedHosts, homeReserveExtra);
         const inFlight = inFlightByTarget(ns, rootedHosts);
 
-        const { eligible, needsPrep } = classify(ns, servers);
+        const { eligible, needsPrep, idle } = classify(ns, servers);
 
         // Admission control: cap the actively-batched set to what the pool can
         // sustain (full pipelines), leaving real headroom for prep. Total pool
@@ -261,19 +219,7 @@ export async function main(ns) {
         // it yields the instant batch/prep demand (or a ramp-down) reclaims it.
 
         updateDisplayStats(batchers);
-        renderStatus(ns, servers, pool, batchers, needsPrep);
-
-        // Periodic per-batcher health snapshot (drift diagnostics): captures the
-        // slow approach to a drift — does f_actual creep up / money creep down
-        // (H1 stale counts), or does it hold flat then break (H3 grid compression)?
-        if (DRIFT_DEBUG && Date.now() - lastSnap >= SNAP_INTERVAL_MS) {
-            lastSnap = Date.now();
-            const level = ns.getHackingLevel();
-            for (const t of batchers) {
-                const { moneyFrac, secOver } = displayHealth(t);
-                dfile(ns, `SNAP ${t.hostname} ${driftDiag(ns, t.hostname, batchPlan.get(t.hostname), moneyFrac, secOver, level)}`);
-            }
-        }
+        renderStatus(ns, servers, pool, batchers, needsPrep, idle);
 
         // Remember this tick's admitted set for next tick's admission hysteresis.
         wasBatching.clear();
@@ -452,6 +398,7 @@ function classify(ns, servers) {
     const now = Date.now();
     const eligible = [];
     const needsPrep = [];
+    const idle = []; // prepped but chance < CHANCE_BATCH (held back, not attacked)
 
     for (const s of servers) {
         if (!s.hasRoot || s.maxMoney <= 0 || s.hackLevelReq > level) continue;
@@ -497,13 +444,9 @@ function classify(ns, servers) {
                 // the global ramp floor has moved since it was locked — then the
                 // target's hack-% target changed and the plan must be recomputed.
                 const locked = batchPlan.get(s.hostname);
-                let best;
-                if (locked && locked.ramp === rampLevel) {
-                    best = locked;
-                } else {
-                    best = bestHackPct(ns, s, chance, Infinity, rampLevel);
-                    if (best) stampPlan(best, level); // fresh plan → reset staleness ref
-                }
+                const best = locked && locked.ramp === rampLevel
+                    ? locked
+                    : bestHackPct(ns, s, chance, Infinity, rampLevel);
                 if (best) {
                     best.ramp = rampLevel;
                     batchPlan.set(s.hostname, best);
@@ -511,25 +454,11 @@ function classify(ns, servers) {
                     continue;
                 }
             }
-            unhealthySince.delete(s.hostname); // dropping → clear grace state
-            // Drifted out → re-prep. Log a rich diagnostic BEFORE deleting the plan.
-            if (DRIFT_DEBUG) {
-                const reasons = [];
-                if (moneyFrac < BATCH_KEEP_MONEY_FRAC)
-                    reasons.push(`mon ${Math.round(moneyFrac * 100)}%<${Math.round(BATCH_KEEP_MONEY_FRAC * 100)}%`);
-                if (secOver > BATCH_KEEP_SEC_OVER)
-                    reasons.push(`sec +${secOver.toFixed(1)}>+${BATCH_KEEP_SEC_OVER}`);
-                driftCount++;
-                dfile(
-                    ns,
-                    `DRIFT ${s.hostname} ${reasons.join(" ")} ` +
-                    `${driftDiag(ns, s.hostname, batchPlan.get(s.hostname), moneyFrac, secOver, level)} ` +
-                    `raw(m=${Math.round((money / s.maxMoney) * 100)}%,s=+${(sec - s.minSecurity).toFixed(1)})`
-                );
-            }
-            activeBatching.delete(s.hostname); // drifted out → re-prep below
+            // Drifted out → drop to re-prep below.
+            unhealthySince.delete(s.hostname); // clear grace state
+            activeBatching.delete(s.hostname);
             batchPlan.delete(s.hostname); // recompute a fresh plan on re-admission
-            clocks.delete(s.hostname); // re-anchor the landing grid on re-admission
+            pipelines.delete(s.hostname); // re-anchor the pipeline on re-admission
         }
 
         // Not batching: STRICT prepped check to start (ensures table accuracy).
@@ -538,12 +467,17 @@ function classify(ns, servers) {
             continue;
         }
         const chance = ns.hackAnalyzeChance(s.hostname);
-        if (chance < CHANCE_BATCH) continue; // prepped but not worth batching
+        if (chance < CHANCE_BATCH) {
+            // Prepped (at max money / min sec) but hack chance is still too low to be
+            // worth batching — it sits idle until the hacking level rises. Tracked so
+            // the status table can show WHY it isn't being attacked.
+            idle.push({ ...s, chance });
+            continue;
+        }
 
         const best = bestHackPct(ns, s, chance, Infinity, rampLevel);
         if (best) {
             best.ramp = rampLevel;
-            stampPlan(best, level); // record level/time the plan was computed at
             activeBatching.add(s.hostname);
             batchPlan.set(s.hostname, best); // lock the plan (+ ramp) for this run
             eligible.push({ ...s, chance, sec, money, ...best });
@@ -557,7 +491,8 @@ function classify(ns, servers) {
     // ones — instead of stalling for hours on un-preppable large servers at the
     // front of the queue. `maxMoney` is the free, tunable prep-cost proxy.
     needsPrep.sort((a, b) => a.maxMoney - b.maxMoney);
-    return { eligible, needsPrep };
+    idle.sort((a, b) => b.chance - a.chance); // closest to batch-worthy first
+    return { eligible, needsPrep, idle };
 }
 
 /** True when a server is at (near) min security and (near) max money. */
@@ -591,7 +526,12 @@ function isPrepped(s, sec, money) {
  */
 function selectBatchers(ns, eligible, poolTotal) {
     const budget = poolTotal * BATCH_BUDGET_FRAC;
-    const concurrency = (t) => Math.ceil(t.weakenTime / BATCH_PERIOD);
+    // Reserve only as much depth as batchPhase actually runs. batchPhase widens the
+    // period to max(BATCH_PERIOD, weakenTime/CONCURRENCY_CAP), so real depth is
+    // min(natural depth, CONCURRENCY_CAP). Estimating uncapped depth here (the old
+    // ceil(weakenTime/BATCH_PERIOD)) over-reserved several-fold on deep targets,
+    // exhausting the budget and freezing admission while the pool sat near-idle.
+    const concurrency = (t) => Math.min(Math.ceil(t.weakenTime / BATCH_PERIOD), CONCURRENCY_CAP);
 
     const admitted = [];
     let used = 0;
@@ -626,14 +566,22 @@ function selectBatchers(ns, eligible, poolTotal) {
 // ── Batch phase (rolling HWGW grid scheduler) ───────────────────────────────
 
 /**
- * Launch rolling HWGW batches for each eligible target, in rank order, until RAM
- * runs out. Each target has an ABSOLUTE landing grid (clocks: nextLand += BATCH_
- * PERIOD); a batch is only launched while the server is at min security, with its
- * per-op delays from FRESH op-times, so every op lands on its fixed grid slot
- * regardless of the security oscillation. This scheduler was validated to ~±1ms
- * landing error (security returns to min every cycle) even on high-grow targets in
- * the isolated rig (src/test/batch-rig.js). Steady-state in-flight ≈
- * weakenTime/BATCH_PERIOD without needing to count batches.
+ * SELF-PACING HWGW scheduler. For each eligible target, in rank order, it tops the
+ * pipeline up to a target depth: each tick it drops landings that have already
+ * passed, then fires enough new batches to refill to `depth`, each landing one
+ * `period` after the previous committed landing (or one fresh weaken-time + safety
+ * ahead if the pipeline ran dry). Nothing is gated and nothing is skipped — only
+ * clean, collision-free landings are ever scheduled, so the pipeline holds full
+ * with zero drift.
+ *
+ * Cadence and depth are derived from the STABLE min-security weaken time locked in
+ * the plan (`t.weakenTime`), so the depth target is constant and the pipeline holds
+ * at exactly N in flight; using the live (security-inflated) weaken time here would
+ * grow the target on a transient bump and overfill. Landing *times*, however, use
+ * FRESH op-times (current security) so each op lands exactly on its slot regardless
+ * of security — see fireBatch. Validated in the isolated rig (src/test/batch-rig.js,
+ * Mode C on iron-gym at full depth): +0.00 security, ~2ms landing error, ~full
+ * throughput indefinitely.
  */
 function batchPhase(ns, eligible, pool) {
     const now = Date.now();
@@ -641,60 +589,38 @@ function batchPhase(ns, eligible, pool) {
     for (const t of eligible) {
         const target = t.hostname;
         const ramPerBatch = t.ramPerBatch;
-        if (ramPerBatch > poolFree(pool)) continue; // can't even fit one batch
 
-        // Op-times fetched FRESH (current security). Validated in the isolated rig:
-        // when a batch is fired at min security (the baseline gate guarantees this),
-        // the engine computes each op's real duration from that same min-security
-        // state, so addX = slot − now − freshOpTime cancels exactly and every op
-        // lands on its absolute grid slot to ~±1ms — even on high-grow targets.
+        // Inter-batch spacing and in-flight depth, from the stable plan weaken time.
+        // CONCURRENCY_CAP bounds depth by widening the period on long-weakenTime
+        // targets, keeping the concurrent-script count manageable (lag/RAM).
+        const period = Math.max(BATCH_PERIOD, t.weakenTime / CONCURRENCY_CAP);
+        const depth = Math.ceil(t.weakenTime / period);
+
+        // Fresh op-times for landing math (see fireBatch).
         const weakenTime = ns.getWeakenTime(target);
         const growTime = ns.getGrowTime(target);
         const hackTime = ns.getHackTime(target);
 
-        // Per-target inter-batch spacing. Natural depth is weakenTime/BATCH_PERIOD;
-        // CONCURRENCY_CAP bounds it by widening the period on long-weakenTime targets
-        // so the in-flight count stays manageable (lag/RAM), not for drift control —
-        // the decoupled grid below handles drift directly.
-        const period = Math.max(BATCH_PERIOD, weakenTime / CONCURRENCY_CAP);
-
-        // ABSOLUTE LANDING GRID, DECOUPLED FROM FIRING. The clock holds the next
-        // batch's W1 landing time, advancing by `period` — landings are pinned to a
-        // fixed grid, NOT recomputed from now+weakenTime (which moves with security
-        // → desync). There is NO baseline fire gate: an op fired at `now` lands at
-        // now + freshWeakenTime, and fireBatch sets addW1 = slot − now − weakenTime
-        // from the FRESH weakenTime, so the op lands exactly on `slot` regardless of
-        // the current security. The gate was removed because on a deep pipeline it
-        // was shut most of the time (security perpetually bumped), starving fires
-        // until the clock fell behind and the next fire clamped to a late, off-grid
-        // landing — the proven drift source (validated in src/test/batch-rig.js,
-        // Mode A vs B on iron-gym). (Re)anchor one weaken-time + safety ahead when
-        // missing or fully drained; cleared on drift (classify) so a re-admitted
-        // target re-anchors fresh.
-        let clock = clocks.get(target);
-        if (!clock || clock.nextLand < now) {
-            clock = { nextLand: now + weakenTime + BATCH_SAFETY_MS };
-            clocks.set(target, clock);
+        let pipe = pipelines.get(target);
+        if (!pipe) {
+            pipe = { committed: [], lastLand: 0, depth };
+            pipelines.set(target, pipe);
         }
+        pipe.depth = depth;
 
-        // Launch each grid slot once its launch lead (slot − weakenTime − safety)
-        // has arrived. The KEY drift fix: a slot whose lead has already slipped so
-        // far that addW1 would clamp below 0 (it can no longer land on its grid slot)
-        // is SKIPPED — the clock advances past it by `period` without firing — rather
-        // than fired late and colliding with the in-flight pipeline. Skips don't count
-        // against maxFires, so the grid catches up to wall-clock in one tick; only
-        // clean, on-grid batches are actually launched.
-        const maxFires = Math.min(MAX_FIRES_PER_TICK, Math.ceil(weakenTime / period));
+        // Drop landings that have already passed; what remains is the live depth.
+        pipe.committed = pipe.committed.filter((land) => land > now);
+
+        // Top up to depth. Each new batch lands `period` after the last committed one,
+        // or a fresh weaken-time + safety ahead if the pipeline drained. A momentarily
+        // full pool just defers the rest to a later tick (no skipped slots).
         let k = 0;
-        while (now >= clock.nextLand - weakenTime - BATCH_SAFETY_MS && k < maxFires) {
-            const addW1 = clock.nextLand - now - weakenTime;
-            if (addW1 < 0) {
-                clock.nextLand += period; // slot un-hittable → drop it, advance grid
-                continue;
-            }
-            if (ramPerBatch > poolFree(pool)) break; // can't fit a clean batch
-            fireBatch(ns, pool, t, clock.nextLand, now, hackTime, growTime, weakenTime);
-            clock.nextLand += period;
+        while (pipe.committed.length < depth && k < MAX_FIRES_PER_TICK) {
+            if (ramPerBatch > poolFree(pool)) break;
+            const land = Math.max(now + weakenTime + BATCH_SAFETY_MS, pipe.lastLand + period);
+            fireBatch(ns, pool, t, land, now, hackTime, growTime, weakenTime);
+            pipe.committed.push(land);
+            pipe.lastLand = land;
             k++;
         }
     }
@@ -886,13 +812,15 @@ function displayHealth(t) {
     return { moneyFrac: Math.max(...h.money), secOver: Math.min(...h.sec) };
 }
 
-/** Expected income for a batching target, $/s. */
+/** Expected income for a batching target, $/s: one batch's take per landing period
+ *  (the period widens past BATCH_PERIOD on CONCURRENCY_CAP-bounded deep targets). */
 function expectedIncome(t) {
-    return (t.maxMoney * t.f * t.chance) / (BATCH_PERIOD / 1000);
+    const period = Math.max(BATCH_PERIOD, t.weakenTime / CONCURRENCY_CAP);
+    return (t.maxMoney * t.f * t.chance) / (period / 1000);
 }
 
 /** Render a refreshing status table to the tail window each tick. */
-function renderStatus(ns, servers, pool, eligible, needsPrep) {
+function renderStatus(ns, servers, pool, eligible, needsPrep, idle = []) {
     ns.clearLog();
     const level = ns.getHackingLevel();
     const rooted = servers.filter((s) => s.hasRoot).length;
@@ -904,8 +832,16 @@ function renderStatus(ns, servers, pool, eligible, needsPrep) {
     ns.print(`╔═ BOOSTER ═ ${new Date().toLocaleTimeString()} ${"═".repeat(Math.max(0, W - 24))}`);
     ns.print(`║ Hack Lv ${level}  |  Rooted ${rooted}/${servers.length}  |  Pool ${ns.format.ram(free)} free / ${ns.format.ram(totalRam)}`);
     const ramp = rampLevel > 0 ? `  |  Ramp ${Math.round(rampLevel * 100)}%` : "";
-    const drifts = DRIFT_DEBUG ? `  |  Drifts ${driftCount}` : "";
-    ns.print(`║ Batching ${eligible.length}  |  Prepping ${needsPrep.length}${ramp}${drifts}  |  Est income $${ns.format.number(income)}/s`);
+    // Pipeline fill meter: total in-flight batches vs total target depth across all
+    // batchers, so how full the pipelines are running is visible at a glance.
+    let inFlight = 0, depth = 0;
+    for (const t of eligible) {
+        const pipe = pipelines.get(t.hostname);
+        if (pipe) { inFlight += pipe.committed.length; depth += pipe.depth; }
+    }
+    const fillPct = depth > 0 ? (inFlight / depth) * 100 : 0;
+    const fill = `  |  Pipeline ${inFlight}/${depth} (${fillPct.toFixed(0)}%)`;
+    ns.print(`║ Batching ${eligible.length}  |  Prepping ${needsPrep.length}${ramp}${fill}  |  Est income $${ns.format.number(income)}/s`);
     ns.print(`╠${"═".repeat(W)}`);
     ns.print(
         "║ " +
@@ -913,21 +849,22 @@ function renderStatus(ns, servers, pool, eligible, needsPrep) {
         "MON%".padStart(5) +
         "SEC".padStart(7) +
         "HK%".padStart(5) +
-        "BATCH".padStart(7) +
+        "FILL".padStart(7) +
         "$/s".padStart(11)
     );
     for (const t of eligible) {
         const { moneyFrac, secOver: secOverNum } = displayHealth(t);
         const monPct = Math.round(moneyFrac * 100);
         const secOver = secOverNum.toFixed(2);
-        const conc = Math.ceil(t.weakenTime / BATCH_PERIOD);
+        const pipe = pipelines.get(t.hostname);
+        const fillCol = pipe ? `${pipe.committed.length}/${pipe.depth}` : "-";
         ns.print(
             "║ " +
             t.hostname.padEnd(16) +
             `${monPct}%`.padStart(5) +
             `+${secOver}`.padStart(7) +
             `${(t.f * 100).toFixed(0)}%`.padStart(5) +
-            `x${conc}`.padStart(7) +
+            fillCol.padStart(7) +
             ns.format.number(expectedIncome(t)).padStart(11)
         );
     }
@@ -936,6 +873,15 @@ function renderStatus(ns, servers, pool, eligible, needsPrep) {
         const items = needsPrep
             .slice(0, 8)
             .map((t) => `${t.hostname}(${Math.round((t.money / t.maxMoney) * 100)}%)`);
+        ns.print("║ " + items.join("  "));
+    }
+    if (idle.length > 0) {
+        // Prepped but held back by CHANCE_BATCH (hack chance too low) — shown with
+        // each target's current chance so it's clear they're waiting on hacking level.
+        ns.print(`╠═ Idle: chance < ${Math.round(CHANCE_BATCH * 100)}% ${"═".repeat(W - 22)}`);
+        const items = idle
+            .slice(0, 8)
+            .map((t) => `${t.hostname}(${Math.round(t.chance * 100)}%)`);
         ns.print("║ " + items.join("  "));
     }
     ns.print(`╚${"═".repeat(W)}`);
