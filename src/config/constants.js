@@ -23,8 +23,13 @@ export const BATCH_PERIOD = 4 * D_GAP;
 /** Main loop sleep, ms. Wake often enough to never miss a grid launch window. */
 export const LOOP_SLEEP = BATCH_PERIOD / 2;
 
-/** Small buffer added to every batch's land base so all delays stay ≥ 0, ms. */
-export const BATCH_SAFETY_MS = 50;
+/** Launch lead, ms: a batch's grid slot is fired this far before its launch lead
+ *  (slot − weakenTime), so on the absolute landing grid its per-op delays stay ≥ 0
+ *  and it lands exactly on slot. Must EXCEED LOOP_SLEEP (and a little extra for the
+ *  occasional wait for a min-security window), else a coarse loop can fire a slot
+ *  late and clamp its delays. Bigger only deepens the pipeline by a batch or two
+ *  (cheap — RAM is abundant). */
+export const BATCH_SAFETY_MS = 300;
 
 // ── Security deltas (single-core, validated exact in-game) ─────────────────
 
@@ -54,6 +59,27 @@ export const BATCH_KEEP_MONEY_FRAC = 0.2;
 /** Keep batching while security ≤ minSecurity + this (absolute). */
 export const BATCH_KEEP_SEC_OVER = 5;
 
+// Drift grace. A batch fired during a transient security bump (caused by a
+// high-grow target's own in-flight grows) lands a little late and briefly
+// desyncs money/security; the grid then self-heals within a few seconds. Dropping
+// a target on such a blip forces a destructive re-prep, so only re-prep a target
+// once it has been UNHEALTHY (outside the keep-bounds above) continuously for this
+// long. Must comfortably exceed one display window plus a couple of batch cycles
+// so a self-healing transient is ridden out, while a genuine sustained collapse is
+// still caught. Tune in-game.
+/** Re-prep a drifted batcher only after it stays unhealthy this long, ms. */
+export const DRIFT_GRACE_MS = 4000;
+
+// Baseline fire gate. A batch's ops take their duration from the server's security
+// at the instant they START (fire time), so a batch fired while security is
+// transiently bumped (by the target's own in-flight grows) runs long and lands late
+// → desync. Only launch a batch when the server is at (near) min security, so every
+// batch executes from the baseline its schedule assumes and lands on the grid. Small
+// enough to exclude an un-cleared grow bump, loose enough not to miss the baseline
+// window (security is at min the large majority of each cycle). Tune in-game.
+/** Max security-over-min at which a batch may be launched. */
+export const FIRE_SEC_MARGIN = 0.5;
+
 // Recovery: a pure HWGW batch maintains money but provides no surplus to climb
 // back to max if a target ever dips below it. When a batching target sits below
 // this fraction of max (a sustained drift, not a healthy mid-cycle dip), inject
@@ -80,6 +106,17 @@ export const BATCH_BUDGET_FRAC = 0.80;
 // a small cap fills/heals a pipeline gradually without spikes.
 /** Max HWGW batches a single target may launch in one tick. */
 export const MAX_FIRES_PER_TICK = 2;
+
+// Pipeline DEPTH cap. A target's natural depth is weakenTime/BATCH_PERIOD; on a
+// long-weakenTime server (e.g. iron-gym wt≈99s → 248 batches at 400ms spacing) the
+// pipeline is so deep it is almost never at min security, so the baseline fire gate
+// rarely opens, the pipeline can't stay full, grow-security accumulates uncleared,
+// and the target drifts into runaway security. Capping depth widens a deep target's
+// inter-batch spacing to max(BATCH_PERIOD, weakenTime/CONCURRENCY_CAP) so it stays
+// in the shallow, self-healing regime the design is validated in — at the cost of
+// some throughput on long-wt targets (cheap: the pool has ample idle RAM).
+/** Max concurrent in-flight HWGW batches per target. Tune in-game. */
+export const CONCURRENCY_CAP = 50;
 
 // Hard ceiling on how many targets batch at once, on top of the RAM budget. The
 // RAM budget is the early-game (RAM-limited) constraint; this cap is the

@@ -52,10 +52,13 @@ The main loop (`main`) each tick:
    Last tick's batchers (`wasBatching`) get first claim so the set doesn't flap.
    Returns `{ batchers, reserved }`.
 5. `batchPhase` — fires rolling HWGW batches for the admitted set, in rank order,
-   regulated by a per-target launch clock advancing by `BATCH_PERIOD`. The pipeline
-   fills gradually (one launch per period) up to its concurrency, so a target's RAM
-   use ramps over ~a weaken time. Calls `maybeRecover` to inject supplemental
-   grow/weaken when a batching target drifts.
+   regulated by a per-target **absolute landing grid decoupled from firing**: a
+   `clock.nextLand` timestamp advancing by `period` (= `max(BATCH_PERIOD,
+   weakenTime/CONCURRENCY_CAP)`). The grid advances by wall-clock, and a slot too
+   stale to land on-grid (its `addW1` would clamp below 0) is **skipped** — the
+   clock advances past it without firing — rather than fired late. The pipeline
+   fills gradually up to its depth, so a target's RAM use ramps over ~a weaken time.
+   There is **no baseline fire gate and no recovery wave** (see below).
 6. `prepPhase` — spends remaining RAM driving `needsPrep` targets to baseline, one
    corrective wave per target (`prepWave`), skipping any with workers already in
    flight; prepares at most `MAX_BATCH_TARGETS + PREP_LOOKAHEAD` servers at once.
@@ -216,18 +219,42 @@ turned the latent bug into immediate, violent drift. The fix is one line — fet
 charged via `bestHackPct`). The *thread counts* stay locked (they're robust, over-
 provisioned by `THREAD_MARGIN`); only the landing *timing* must track the live level.
 
-**Recovery is rate-limited per target.** `maybeRecover` (the safety net that
-re-grows a target that has slipped below `RECOVER_MONEY_FRAC`) fires at most one
-wave per `growTime` via `recoverClock`. Without this gate it re-fired a full
-deficit-sized grow every tick for any persistently-drifted target; those grows
-live for the full grow time, so they stacked up, drained the pool, and starved the
-normal batches — which pushed more targets below threshold, a runaway that bled the
-pool from tens of TB to tens of GB. The cooldown lets one corrective wave land and
-be measured before the next fires. Like the keep-test, recovery is **gated and
-sized on the windowed baseline** (peak money / floor security), not the raw read —
-otherwise a healthy high-hack-% target, whose raw money sits below
-`RECOVER_MONEY_FRAC` almost every tick, would fire off-grid grows continuously,
-themselves raising security and desyncing the pipeline.
+**The landing grid is decoupled from firing, with no baseline fire gate — this is
+the central drift fix.** Earlier the scheduler only fired a batch while the server
+read at (near) min security (a "baseline fire gate"), and the grid clock advanced
+*only on a fire*. That gate was both unnecessary and actively harmful:
+
+- *Unnecessary:* an op fired at `now` lands at `now + freshWeakenTime`, and
+  `fireBatch` sets `addW1 = slot − now − weakenTime` from the **fresh** weaken time,
+  so the op lands on its grid slot regardless of the security at fire time. The gate
+  bought no correctness the fresh op-times didn't already provide.
+- *Harmful:* on a deep pipeline (long-`weakenTime` targets like iron-gym) security
+  is perpetually bumped by in-flight hacks/grows, so the gate was shut most of the
+  time. While shut, no batch fired but the clock didn't advance either; `now` ran on
+  until the next fire's `addW1` went negative and clamped to 0, landing that batch
+  **late and off-grid**. The late landing broke the H‑W1‑G‑W2 order, grow-security
+  stopped being cleared, and the target ran away into drift within seconds of each
+  re-admission.
+
+The fix: advance `clock.nextLand` by wall-clock and **skip** any slot whose `addW1`
+would clamp below 0 (drop it, advance `period`, don't fire), so only clean, on-grid
+batches ever launch and the grid catches up to *now* in a single tick. This was
+proven in isolation with the test rig (`src/test/batch-rig.js`, Mode A gated vs
+Mode B decoupled): on iron-gym, Mode A drifted with landing-error p95 ≈ 2.5 s and
+71 % of landings off-optimum, while Mode B held p95 ≈ 2 ms, security at +0.00, zero
+late landings. Live, drifts dropped from one every few minutes to ~one per 20 min.
+The trade-off is **dropped slots** (the skipped batches) — some throughput is lost
+on deep targets, acceptable here (RAM is abundant; stability is the priority). A
+future pass may close that gap.
+
+**Drift recovery is "drop to prep," not an off-grid corrective wave.** The earlier
+`maybeRecover` injected supplemental grow/weaken **off the absolute grid** when a
+batcher dipped; those landings collided with the in-flight grid at times it didn't
+anticipate, spiking security past the (then-present) fire gate and locking the
+target into the very runaway it was meant to fix. It was removed. A target that
+genuinely dips below the loose keep-bounds now simply drops to a clean re-prep via
+`classify`'s existing drift-grace logic. With the decoupled grid keeping targets
+pinned at baseline, such dips are now rare.
 
 **Launches are capped per tick** (`MAX_FIRES_PER_TICK`). A target whose launch
 clock fell behind (e.g. after brief RAM starvation) would otherwise dump its entire
