@@ -19,9 +19,11 @@ home RAM). Source: `src/booster.js`, workers in `src/workers/`, tunables in
 | 3c | Recovery grow (climb drifted targets back to max) | ✅ done |
 | 3d | Stabilization: RAM-budgeted admission, plan locking, fire cap, recovery rate-limit, drift tuning | ✅ done |
 | 3e | Bootstrap fix (easiest-earner-first prep) + target-count cap for lag | ✅ done |
-| 5 (partial) | Live status table (tail window) | ✅ done |
-| 4 | Manager orchestration: pserver + hacknet managers, gated launch in booster | ✅ done (contracts solver deferred to a later stage) |
-| 5 | Formulas.exe handoff | ⬜ **deliberately disabled** — loop is `while(true)` so it can be tested on a save that already owns Formulas.exe. Restore the `while(!fileExists(FORMULAS_EXE))` exit when moving to a fresh BN. |
+| 3f | Live status table (tail window) | ✅ done |
+| 4 | Manager orchestration: pserver + hacknet managers, gated launch in booster | ✅ done |
+| 4 (cont.) | Contracts solver manager (`managers/contracts.js`), launched order-1 by booster | ⬜ planned |
+| 5 | `sharePhase` in booster: feed idle pool residual to `ns.share()` | ⬜ planned |
+| 6 | Formulas.exe handoff | ⬜ **deliberately disabled** — loop is `while(true)` so it can be tested on a save that already owns Formulas.exe. Restore the `while(!fileExists(FORMULAS_EXE))` exit when moving to a fresh BN. |
 
 Key lessons captured during implementation: the NS-property RAM collision (see
 section below), the hysteresis fix for false-drift churn, and the recovery-grow
@@ -260,13 +262,14 @@ running**. That ordering is what makes the sequence "fixed."
 Affordability/launch decisions live in `booster`; **spending** decisions live
 inside each manager. `booster` does not micromanage.
 
-**Implementation note (stage 4).** Only the two RAM-pool-growth managers were
-built: the pserver buyer/upgrader (`src/managers/pserver.js`) and the hacknet
-buyer/upgrader (`src/managers/hacknet.js`). The contracts solver (order 1 above)
-is **deferred to its own later stage** — it's contract-solving logic, not RAM
-growth — so in the shipped order pserver is launched first (gate always true) and
-hacknet second (gated on the pserver fleet). See `docs/scripts/pserver.md` and
-`docs/scripts/hacknet.md`.
+**Implementation note (stage 4).** The two RAM-pool-growth managers shipped first:
+the pserver buyer/upgrader (`src/managers/pserver.js`) and the hacknet
+buyer/upgrader (`src/managers/hacknet.js`). See `docs/scripts/pserver.md` and
+`docs/scripts/hacknet.md`. The **contracts solver (order 1 above) is now in scope
+as the remaining Stage-4 work** (`src/managers/contracts.js`, planned) — it had
+been deferred as "contract-solving logic, not RAM growth," but is being folded back
+in to close Stage 4. Once built, the launch order is the full
+contracts → pserver → hacknet (contracts' gate is always true, so it leads).
 
 **Spending model — two arms: payback OR reinvestment fraction.** Each manager buys
 the cheapest next step (gated by affordability) when EITHER it *pays back within `X`
