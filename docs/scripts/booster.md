@@ -24,9 +24,12 @@ status table in the tail window each tick.
 The main loop (`main`) each tick:
 
 1. `discoverAndRoot` — BFS from home, root what it can, copy workers onto newly
-   rooted hosts once.
+   rooted hosts once. **home is included as a rooted pool host** (it already holds
+   the worker scripts, being the copy source) with `maxMoney 0` so `classify` never
+   targets it for hacking — only its RAM is used.
 2. `buildPool` — one entry per rooted host with free RAM, largest-first; home
-   keeps a safety buffer.
+   keeps the safety buffer **plus the next pending manager's RAM reservation** free,
+   and contributes the rest to the pool.
 3. `classify` — splits viable servers into `eligible` (prepped + batch-worthy,
    each scored by $/GB/s via `bestHackPct`), `needsPrep` (not yet at baseline), and
    `idle` (prepped but `hackAnalyzeChance < CHANCE_BATCH` — held back until the
@@ -95,6 +98,20 @@ Thread placement (`placeThreads`) greedily bin-packs across the pool and returns
 how many threads actually landed.
 
 ## Why it's built this way
+
+**home is a pool host, not a special case.** `discoverAndRoot` originally did
+`if (host === "home") continue;`, which dropped home from `servers` entirely — so it
+never reached `rootedHosts`, the pool, or the RAM totals, and *neither prep nor
+batches ever ran on it*. On a save where home is the largest single block of RAM, the
+batcher would crowd a small set of weak rooted servers to ~0 free while home sat idle
+(and prep threads it *had* placed were invisible in the table, which lists only
+batching targets and prep names — making it look like nothing launched). The fix is to
+emit home as an ordinary rooted host with `maxMoney 0`: `classify` skips it as a target
+(money ≤ 0) but it flows through `buildPool` (which already carried the
+safety-buffer + manager-reserve logic for home), the pool totals, and the batch budget
+like any other host. Keeping home a normal entry — rather than threading a separate
+"home RAM" path through every phase — means the reserve is respected in exactly one
+place and every consumer stays uniform.
 
 **Prep is ordered easiest-earner-first to bootstrap a fresh save.** With a tiny
 starting pool, prepping biggest-money-first (the original order) poured the whole
