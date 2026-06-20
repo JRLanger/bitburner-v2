@@ -211,12 +211,18 @@ export async function main(ns) {
         // whatever prep is consuming — a one-server prep trickle leaves the pool
         // ~all-free (ramp up), while a fresh-save bootstrap where prep eats the
         // small pool leaves it nearly full (no ramp). Raise the floor while the
-        // pool is under-used AND every batch-worthy target already has a slot;
-        // lower it when the pool is heavily used or admission is RAM/lag-starved.
+        // pool is under-used AND admission placed every target it could (up to both
+        // the RAM budget and MAX_BATCH_TARGETS); lower it when the pool is heavily
+        // used or admission is RAM-starved (target-cap exclusions don't count).
         // The wide LOW..HIGH deadband holds it steady through mid-cycle
         // oscillation. Plans pick up the new floor next tick (classify).
         const poolUsedFrac = poolTotal > 0 ? 1 - poolFree(pool) / poolTotal : 1;
-        const allBatching = batchers.length === eligible.length;
+        // "All batching" means admission placed as many targets as it possibly could
+        // given BOTH ceilings — the RAM budget AND MAX_BATCH_TARGETS. Comparing against
+        // the raw eligible count (pre-MAX_BATCH_TARGETS fix) falsely read as starved
+        // whenever eligible targets exceeded the target-count cap, permanently
+        // blocking — and decaying — the ramp even with the pool nearly empty.
+        const allBatching = batchers.length === Math.min(eligible.length, MAX_BATCH_TARGETS);
         if (allBatching && poolUsedFrac < RAMP_UTIL_LOW) {
             rampLevel = Math.min(HACK_PCT_RAMP_MAX, rampLevel + RAMP_STEP);
         } else if (!allBatching || poolUsedFrac > RAMP_UTIL_HIGH) {
