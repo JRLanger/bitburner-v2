@@ -273,8 +273,17 @@ gate is always true, so it leads). It finds `.cct` files across the network (hos
 list from the topology JSON booster already writes) and solves them from a pure-function
 solver registry keyed by contract type — solve-all, skip-unknown.
 
-**Spending model — two arms: payback OR reinvestment fraction.** Each manager buys
-the cheapest next step (gated by affordability) when EITHER it *pays back within `X`
+**Two spending models.** The **pserver** manager uses the two-arm payback/reinvest rule
+described below. The **hacknet** manager was later switched to a different rule —
+**ROI over the remaining-BitNode horizon** (buy a step only if it pays back before the
+BN is expected to end; horizon = 8 h on a fresh BN, then the last recorded BN duration).
+See `docs/scripts/hacknet.md`. Both managers now also **drain every worthwhile step per
+tick** (not one — `MANAGER_MAX_BUYS_PER_TICK`) and **self-exit once there's nothing left
+worth buying** (freeing their `home` RAM; see "Manual-stop detection and self-kill"). The
+two-arm model below is the pserver spending policy.
+
+**pserver spending — two arms: payback OR reinvestment fraction.** The pserver manager
+buys the cheapest next step (gated by affordability) when EITHER it *pays back within `X`
 seconds of current income* (`getTotalScriptIncome`, the PAYBACK arm) OR its cost ≤ a
 *reinvestment fraction of current cash* (the REINVEST arm). The payback arm lets
 large purchases through once income justifies them and makes upgrades halt
@@ -288,15 +297,13 @@ the reinvest arm spends accumulating cash down to a self-scaling buffer
 permanently neuter payback. A constant reinvest arm would override payback forever
 (once cash-rich/income-poor, `money × frac` almost always covers the cheapest step,
 so the "worth it?" check never binds). Instead `effFrac` decays linearly from
-`*_REINVEST_FRAC` (0.25) down to `*_REINVEST_FLOOR` (0.01) as infrastructure grows
-toward a target — pserver keyed to **fleet RAM** → `PSERVER_BOOTSTRAP_RAM_GB`
-(25 × 32 = 800 GB), hacknet to **node count** → `HACKNET_BOOTSTRAP_NODES` (8). RAM
-is the signal because it's BitNode-independent (unlike a dollar income threshold).
-During bootstrap the reinvest arm fills the fleet; past the target it sits at the 1%
-floor and payback governs upgrades, the floor acting as a slow-trickle relief valve
-(a stalled fleet still creeps on a large cash pile). Tunables:
-`*_PAYBACK_SECONDS`, `*_REINVEST_FRAC`, `*_REINVEST_FLOOR`, `PSERVER_BOOTSTRAP_RAM_GB`,
-`HACKNET_BOOTSTRAP_NODES`.
+`PSERVER_REINVEST_FRAC` (0.25) down to `PSERVER_REINVEST_FLOOR` (0.01) as fleet **RAM**
+grows toward `PSERVER_BOOTSTRAP_RAM_GB` (25 × 32 = 800 GB). RAM is the signal because
+it's BitNode-independent (unlike a dollar income threshold). During bootstrap the
+reinvest arm fills the fleet; past the target it sits at the 1% floor and payback governs
+upgrades, the floor acting as a slow-trickle relief valve (a stalled fleet still creeps
+on a large cash pile). Tunables: `PSERVER_PAYBACK_SECONDS`, `PSERVER_REINVEST_FRAC`,
+`PSERVER_REINVEST_FLOOR`, `PSERVER_BOOTSTRAP_RAM_GB`.
 
 *Known consequence:* if pserver upgrades stall below the hacknet gate (32 TB × 25)
 because they stop being worth it, hacknet launches late or not at all. The reinvest
@@ -314,6 +321,33 @@ Managers are persistent loops. Before `exec`-ing one, `booster` checks
 `ns.ps("home")` for that script's filename, so a `booster` restart never spawns
 duplicates (in-memory tracking alone is insufficient — `booster` itself can be
 restarted).
+
+### Manual-stop detection and self-kill (don't relaunch a stopped/done manager)
+
+Two cases must NOT trigger a relaunch: the user manually kills a manager, and a manager
+that has nothing worth buying exits on its own. The plain "not running → relaunch" rule
+would re-exec both immediately. A single in-memory mechanism handles both:
+
+- **In-memory `launchedManagers` set.** `booster` records every manager it has seen
+  running this run. A manager that was seen running and is now gone — whether the user
+  killed it or it self-exited — is not relaunched for the rest of this `booster` run.
+  Treated as "accounted for" in the fixed-order scan, so it doesn't block later managers
+  (e.g. hacknet still launches after pserver finishes); `nextManagerReserve` skips it too,
+  so no `home` RAM is reserved for a manager that won't relaunch.
+
+A fresh `booster` start clears the set and relaunches everything. That's exactly right for
+self-completed managers, because **an aug install (soft reset) wipes purchased servers and
+hacknet nodes** — so each run the managers must rebuild from scratch. A persistent "done"
+marker would be *wrong* here: it would stop a manager that genuinely needs to rebuild. The
+trade-off is that a manual stop only lasts until you restart `booster` (kill a manager and
+it stays dead; reload/restart resumes it) — the agreed, low-friction behavior. The cost of
+the in-memory approach is a brief relaunch-then-exit on a `booster` restart for a manager
+that's already maxed (e.g. a page reload mid-run with the fleet full) — harmless.
+
+The pserver and hacknet managers self-exit when there's nothing left worth buying (pserver:
+fleet fully maxed; hacknet: maxed, or no upgrade pays back within the fixed run horizon —
+see `docs/scripts/hacknet.md`), freeing their `home` RAM. The `contracts` manager has no
+self-exit — contracts keep spawning, so it runs forever.
 
 ### RAM interaction
 

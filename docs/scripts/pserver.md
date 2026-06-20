@@ -33,9 +33,16 @@ Each loop tick (`MANAGER_LOOP_SLEEP`, default 10 s — purchases are infrequent)
    fraction of current cash (`cost ≤ money × effFrac`). `effFrac` falls from
    `PSERVER_REINVEST_FRAC` (0.25) toward `PSERVER_REINVEST_FLOOR` (0.01) as the
    fleet's total RAM grows toward `PSERVER_BOOTSTRAP_RAM_GB` (800 GB) — see below.
-3. **Execute at most one purchase per tick** — `ns.cloud.purchaseServer` or
-   `ns.cloud.upgradeServer`. One step per tick keeps the pacing legible and lets the
-   next tick re-read income/cash before spending again.
+3. **Drain every affordable step this tick** — up to `MANAGER_MAX_BUYS_PER_TICK` (100),
+   cheapest first, decrementing a local cash figure as it goes so the loop stops once
+   the wallet is down to the self-scaling buffer. Buying many per tick (rather than one)
+   lets the fleet fill out in seconds instead of one-purchase-per-10s; the per-tick cap
+   keeps the UI responsive.
+4. **Exit when the fleet is fully maxed.** When there's no step left (every server at the
+   cloud RAM limit), the manager returns, freeing its `home` RAM back to the worker pool.
+   `booster` won't relaunch it for the rest of that `booster` run (in-memory suppression),
+   and rebuilds it next run — an aug install wipes purchased servers, so the fleet is
+   rebuilt from scratch each run.
 
 The manager owns *spending*; `booster` owns only *when to launch it*. `booster`
 reserves `PSERVER_MANAGER_RAM` of `home` RAM for this script before it starts, so

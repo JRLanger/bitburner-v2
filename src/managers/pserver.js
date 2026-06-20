@@ -24,6 +24,7 @@ import {
     PSERVER_REINVEST_FLOOR,
     PSERVER_BOOTSTRAP_RAM_GB,
     MANAGER_LOOP_SLEEP,
+    MANAGER_MAX_BUYS_PER_TICK,
 } from "/config/constants.js";
 
 export async function main(ns) {
@@ -33,44 +34,68 @@ export async function main(ns) {
     while (true) {
         const status = step(ns);
         renderStatus(ns, status);
+        if (status.decision === "done") {
+            // Fleet fully maxed — nothing left to buy. Exit to free our home RAM back to
+            // the worker pool; booster won't relaunch us this run (in-memory suppression),
+            // and rebuilds next run after an aug install wipes the fleet.
+            ns.print("Fleet fully maxed — exiting.");
+            return;
+        }
         await ns.sleep(MANAGER_LOOP_SLEEP);
     }
 }
 
 /**
- * Make at most one RAM-growth purchase this tick: the cheapest next step that
- * passes the buy test. Filling the fleet (buying new servers) takes priority over
- * upgrading, since an 8 GB server adds more pooled RAM per dollar than the first
- * upgrades of an existing one until the fleet is full. Returns a status object for
- * the tail display.
+ * Drain every affordable RAM-growth step this tick (up to a per-tick cap), cheapest
+ * first. Filling the fleet (buying new servers) takes priority over upgrading, since an
+ * 8 GB server adds more pooled RAM per dollar than the first upgrades of an existing one
+ * until the fleet is full. Buying many per tick (instead of one) lets the fleet build
+ * out in seconds rather than one-purchase-per-10s. Returns a status object for the tail
+ * display; decision === "done" means the fleet is fully maxed.
  */
 function step(ns) {
     const limit = ns.cloud.getServerLimit();
-    const owned = ns.cloud.getServerNames();
     const maxRam = ns.cloud.getRamLimit();
     const income = ns.getTotalScriptIncome()[0]; // $/s across all scripts
-    const money = ns.getServerMoneyAvailable("home");
-    const fleetRam = owned.reduce((sum, h) => sum + ns.getServerMaxRam(h), 0);
+    let money = ns.getServerMoneyAvailable("home");
+
+    let owned = ns.cloud.getServerNames();
+    let fleetRam = owned.reduce((sum, h) => sum + ns.getServerMaxRam(h), 0);
 
     // Reinvest fraction decays from FRAC (empty fleet) to FLOOR (target reached), so
     // the income-independent bootstrap arm fades and payback governs steady state.
+    // Computed once per tick — it barely moves within a single drain.
     const progress = Math.min(1, fleetRam / PSERVER_BOOTSTRAP_RAM_GB);
     const reinvestFrac =
         PSERVER_REINVEST_FLOOR + (PSERVER_REINVEST_FRAC - PSERVER_REINVEST_FLOOR) * (1 - progress);
 
-    const base = { count: owned.length, limit, fleetRam, income, money, progress, reinvestFrac };
+    let bought = 0;
+    let move = null;
+    let decision = "done"; // overwritten unless the very first move is null (fully maxed)
 
-    const move = owned.length < limit
-        ? cheapestBuy(ns)
-        : cheapestUpgrade(ns, owned, maxRam);
-    if (!move) return { ...base, label: "fleet fully maxed", cost: 0, decision: "done" };
+    while (bought < MANAGER_MAX_BUYS_PER_TICK) {
+        owned = ns.cloud.getServerNames(); // re-read: a buy changes the fleet
+        move = owned.length < limit ? cheapestBuy(ns) : cheapestUpgrade(ns, owned, maxRam);
+        if (!move) { decision = "done"; break; } // nothing left to buy → fleet maxed
 
-    const decision = shouldBuy(move.cost, income, money, reinvestFrac)
-        ? (move.execute(), "bought")
-        : move.cost > money
-            ? "waiting: insufficient $"
-            : "waiting: accumulating cash";
-    return { ...base, label: move.label, cost: move.cost, decision };
+        if (!shouldBuy(move.cost, income, money, reinvestFrac)) {
+            decision = move.cost > money ? "waiting: insufficient $" : "waiting: accumulating cash";
+            break;
+        }
+        move.execute();
+        money -= move.cost; // reflect spend so the loop terminates as cash drains
+        bought++;
+        decision = "bought";
+    }
+
+    fleetRam = ns.cloud.getServerNames().reduce((sum, h) => sum + ns.getServerMaxRam(h), 0);
+    return {
+        count: ns.cloud.getServerNames().length,
+        limit, fleetRam, income, money, progress, reinvestFrac,
+        label: move ? move.label : "fleet fully maxed",
+        cost: move ? move.cost : 0,
+        bought, decision,
+    };
 }
 
 /** Buy a new server at the starting RAM. */
@@ -130,7 +155,12 @@ function renderStatus(ns, s) {
     ns.print(`╠${"═".repeat(W)}`);
     ns.print(`║ Next: ${s.label}`);
     if (s.cost > 0) ns.print(`║ Cost: $${ns.format.number(s.cost)}`);
-    ns.print(`║ ${s.decision === "bought" ? "✔ BOUGHT" : s.decision === "done" ? "— idle" : "… " + s.decision}`);
+    const verdict = s.decision === "bought"
+        ? `✔ BOUGHT ×${s.bought}`
+        : s.decision === "done"
+            ? "— done (maxed)"
+            : `… ${s.decision}${s.bought ? ` (after ${s.bought})` : ""}`;
+    ns.print(`║ ${verdict}`);
     ns.print(`╚${"═".repeat(W)}`);
 }
 

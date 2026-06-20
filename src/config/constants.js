@@ -223,14 +223,19 @@ export const HACKNET_MANAGER = "/managers/hacknet.js";
  */
 export const CONTRACTS_MANAGER_RAM = 16.80; // measured in-game (mem managers/contracts.js): 1.6 base + 0.2 ls + 15 getContract
 export const PSERVER_MANAGER_RAM = 5.85; // measured in-game (mem managers/pserver.js)
-export const HACKNET_MANAGER_RAM = 6.80; // measured in-game (mem managers/hacknet.js)
+export const HACKNET_MANAGER_RAM = 8.20; // measured in-game (mem managers/hacknet.js)
 
 /** Loop sleep for the (infrequent-purchase) managers, ms. */
 export const MANAGER_LOOP_SLEEP = 10000;
 
-// ── Manager spending: payback OR reinvestment-fraction ─────────────────────
+/** Max purchases a buyer/upgrader manager makes in one tick. Each tick now drains all
+ *  affordable steps (not just one), so hacknet's hundreds of tiny upgrades complete in
+ *  seconds instead of one-per-10s. The cap bounds a single tick for UI responsiveness. */
+export const MANAGER_MAX_BUYS_PER_TICK = 100;
+
+// ── pserver spending: payback OR reinvestment-fraction ─────────────────────
 //
-// A manager buys the cheapest next step (gated by plain affordability) when
+// The PSERVER manager buys the cheapest next step (gated by plain affordability) when
 // EITHER arm passes:
 //
 //  1. PAYBACK arm — it pays back within PAYBACK_SECONDS of current income ($/s).
@@ -240,36 +245,64 @@ export const MANAGER_LOOP_SLEEP = 10000;
 //  2. REINVEST arm — its cost ≤ effFrac of current cash. Income-independent, so it
 //     bootstraps the fleet on a fresh save (when income is ~0 *because* RAM is the
 //     bottleneck — the payback arm can't fire yet). effFrac is NOT constant: it
-//     DECAYS from *_REINVEST_FRAC (full bootstrap help) down to *_REINVEST_FLOOR
-//     as infrastructure grows toward a target (pserver: fleet RAM → BOOTSTRAP_RAM_GB;
-//     hacknet: node count → BOOTSTRAP_NODES). This stops the reinvest arm from
-//     permanently overriding payback once bootstrap is done — past the target,
-//     payback's "worth it?" gate governs upgrades, with the small floor as a
-//     slow-trickle relief valve (a stalled fleet still creeps on a big cash pile).
+//     DECAYS from PSERVER_REINVEST_FRAC (full bootstrap help) down to
+//     PSERVER_REINVEST_FLOOR as fleet RAM grows toward PSERVER_BOOTSTRAP_RAM_GB. This
+//     stops the reinvest arm from permanently overriding payback once bootstrap is
+//     done — past the target, payback's "worth it?" gate governs upgrades, with the
+//     small floor as a slow-trickle relief valve (a stalled fleet still creeps).
+//
+// (Hacknet no longer uses this model — it buys on ROI over the remaining-BN horizon,
+// see "hacknet spending" below.)
 
 /** Smallest pserver to buy when filling the fleet, GB (must be a power of two). */
 export const PSERVER_START_RAM = 8;
 
 /** Payback horizon: spend a step if it pays back within this many seconds. */
 export const PSERVER_PAYBACK_SECONDS = 300;
-export const HACKNET_PAYBACK_SECONDS = 300;
 
 /** Reinvest arm bootstrap-max fraction (used at zero infrastructure). */
 export const PSERVER_REINVEST_FRAC = 0.25;
-export const HACKNET_REINVEST_FRAC = 0.25;
 
 /** Reinvest arm floor — fraction it decays to once the bootstrap target is met. */
 export const PSERVER_REINVEST_FLOOR = 0.01;
-export const HACKNET_REINVEST_FLOOR = 0.01;
 
 /** Infrastructure target at which the reinvest arm reaches its floor. */
 export const PSERVER_BOOTSTRAP_RAM_GB = 25 * 32; // 800 GB (fleet of 25 at 32 GB)
-export const HACKNET_BOOTSTRAP_NODES = 8;
+
+// ── hacknet spending: ROI over the run (aug-reset) horizon ─────────────────
+//
+// The HACKNET manager buys a step only if it pays back within the expected length of
+// the current RUN — the span between augmentation installs (lastAugReset), since an aug
+// install wipes hacknet nodes and starts a fresh build-out: cost / marginalGain ≤
+// horizonSeconds. The horizon is fixed for the run (it doesn't change mid-run):
+// HACKNET_FRESH_BN_HORIZON_SECONDS when no run length has been recorded yet, otherwise
+// the last recorded run duration (runs shorten as the BitNode cycle progresses). Run
+// durations are derived from consecutive lastAugReset timestamps — exact even when the
+// manager self-kills early. Marginal production gain per step comes from getNodeStats
+// production ratios (no Formulas.exe). This replaces the payback+reinvest arms used by
+// pserver — a hacknet node's marginal production is nonzero from the first node, so
+// there is no income-is-zero chicken-and-egg to bootstrap around.
+
+/** Fresh-run horizon when no run duration has been recorded yet, seconds. */
+export const HACKNET_FRESH_BN_HORIZON_SECONDS = 8 * 3600; // 8 h
+
+/** Floor on the run horizon so a freak very-short recorded run doesn't stall all
+ *  hacknet spending, seconds. */
+export const HACKNET_MIN_HORIZON_SECONDS = 300;
+
+/** Hacknet-node production RAM growth base: production ∝ this^(ram−1). Validate in-game
+ *  (predicted vs actual production across one RAM buy); only affects RAM-upgrade ROI. */
+export const HACKNET_RAM_MULT_BASE = 1.035;
 
 // ── Data files ─────────────────────────────────────────────────────────────
 
 /** Topology JSON written by booster for managers to consume. */
 export const SERVERS_JSON = "/data/servers.json";
+
+/** Recorded run (aug-reset) durations + last-seen aug-reset timestamp, for hacknet's
+ *  ROI horizon. Survives aug installs (a soft reset keeps files); delete on a full
+ *  BitNode reset to start the horizon history fresh. */
+export const BN_DURATIONS_JSON = "/data/bn-durations.json";
 
 // ── Detection / handoff ────────────────────────────────────────────────────
 

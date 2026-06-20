@@ -81,6 +81,16 @@ const MANAGERS = [
     { file: HACKNET_MANAGER, ramGB: HACKNET_MANAGER_RAM, gate: pserverFleetBuilt },
 ];
 
+/**
+ * Manager filenames booster has seen running during THIS run (in-memory, cleared on a
+ * fresh booster start). A manager that was seen running and is now gone was either
+ * stopped by the user or self-killed because it had nothing left worth buying — booster
+ * will not relaunch it for the rest of this run. A fresh booster start (e.g. after an
+ * aug install, which wipes pservers/hacknet nodes) clears the set, so the managers
+ * relaunch and rebuild. See launchManagers.
+ */
+const launchedManagers = new Set();
+
 /** Monotonic id appended to every worker exec so concurrent workers are unique. */
 let batchSeq = 0;
 
@@ -254,7 +264,14 @@ function discoverAndRoot(ns) {
             }
         }
 
-        if (host === "home") continue;
+        // home is always rooted and already holds the worker scripts (it's the
+        // copy source). Include it as a normal pool host — buildPool keeps the
+        // safety + manager reserve free on it — so batches and prep use its RAM.
+        // gatherInfo reports maxMoney 0 for home, so classify never targets it.
+        if (host === "home") {
+            result.push(gatherInfo(ns, "home", true));
+            continue;
+        }
 
         const rooted = ns.hasRootAccess(host) || tryRoot(ns, host);
         if (rooted && !provisioned.has(host)) {
@@ -334,7 +351,7 @@ function poolFree(pool) {
  */
 function inFlightByTarget(ns, rootedHosts) {
     const map = new Map();
-    for (const host of rootedHosts.concat("home")) {
+    for (const host of rootedHosts) {
         for (const proc of ns.ps(host)) {
             if (!WORKER_FILES.has(stripSlash(proc.filename))) continue;
             const target = proc.args[0];
@@ -347,26 +364,44 @@ function inFlightByTarget(ns, rootedHosts) {
 // ── Manager orchestration ───────────────────────────────────────────────────
 
 /**
- * Launch managers in fixed dependency order. Each tick, find the FIRST manager not
- * already running; if its gate passes, exec it. Stop there regardless — a later
- * manager is never launched until every earlier one is already running, which is
- * what makes the order "fixed." Checks ns.ps("home") (not just in-memory state) so
- * a booster restart never double-launches a persistent manager.
+ * Launch managers in fixed dependency order. Each tick, find the FIRST manager that is
+ * not running and hasn't already been accounted for this run, and if its gate passes,
+ * exec it. A later manager is never launched until every earlier one is accounted for,
+ * which makes the order "fixed." Checks ns.ps("home") (not just in-memory state) so a
+ * booster restart never double-launches a persistent manager.
+ *
+ * In-memory `launchedManagers` suppresses relaunch: a manager booster saw running that
+ * is now gone was either stopped by the user or self-killed (nothing worth buying), so
+ * it stays down for the rest of this booster run. A fresh booster start clears the set,
+ * so the managers relaunch (and, after an aug install that wipes their infra, rebuild).
+ * A suppressed manager is treated as "accounted for" so the loop moves past it to later
+ * managers (e.g. hacknet still launches after pserver finishes).
  */
 function launchManagers(ns, servers) {
     for (const m of MANAGERS) {
-        if (isRunning(ns, m.file)) continue; // already up → move past it
-        if (m.gate(servers)) ns.exec(m.file, "home");
-        return; // first not-running manager is the only candidate this tick
+        if (isRunning(ns, m.file)) {
+            launchedManagers.add(m.file); // remember it's up so a later kill is detectable
+            continue;
+        }
+        if (launchedManagers.has(m.file)) continue; // was running, now gone → stopped/done
+        if (m.gate(servers)) {
+            ns.exec(m.file, "home");
+            launchedManagers.add(m.file);
+        }
+        return; // first pending manager is the only candidate this tick
     }
 }
 
-/** RAM to reserve on home for the next pending (not-yet-running) manager, GB. */
+/** RAM to reserve on home for the next pending manager, GB. Skips managers that are
+ *  running or already accounted for (stopped/done) — none of those will be (re)launched,
+ *  so reserving for them would needlessly shrink the worker pool. */
 function nextManagerReserve(ns) {
     for (const m of MANAGERS) {
-        if (!isRunning(ns, m.file)) return m.ramGB;
+        if (isRunning(ns, m.file)) continue;
+        if (launchedManagers.has(m.file)) continue;
+        return m.ramGB;
     }
-    return 0; // all managers running → no reserve needed
+    return 0; // nothing left to launch → no reserve needed
 }
 
 /** True if a script with this filename is already running on home. */
