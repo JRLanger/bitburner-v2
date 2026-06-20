@@ -88,25 +88,15 @@ export const BATCH_BUDGET_FRAC = 0.80;
 /** Max HWGW batches a single target may launch in one tick. */
 export const MAX_FIRES_PER_TICK = 2;
 
-// Pipeline DEPTH cap. A target's natural depth is weakenTime/BATCH_PERIOD; on a
-// long-weakenTime server (e.g. iron-gym wt≈99s → 248 batches at 400ms spacing) the
-// pipeline is so deep it is almost never at min security, so the baseline fire gate
-// rarely opens, the pipeline can't stay full, grow-security accumulates uncleared,
-// and the target drifts into runaway security. Capping depth widens a deep target's
-// inter-batch spacing to max(BATCH_PERIOD, weakenTime/CONCURRENCY_CAP) so it stays
-// in the shallow, self-healing regime the design is validated in — at the cost of
-// some throughput on long-wt targets (cheap: the pool has ample idle RAM).
-/** Max concurrent in-flight HWGW batches per target. Tune in-game. */
-export const CONCURRENCY_CAP = 50;
-
-// Hard ceiling on how many targets batch at once, on top of the RAM budget. The
-// RAM budget is the early-game (RAM-limited) constraint; this cap is the
-// late-game (lag-limited) knob — Bitburner slows down with too many concurrent
-// worker scripts, so dial this down if the game lags. selectBatchers keeps the
-// highest-score targets up to the cap. Default high = effectively unlimited
-// (RAM budget governs) so established saves are unaffected until tuned down.
+// Primary lag governor: hard ceiling on how many targets batch at once, on top of
+// the RAM budget. The self-pacing scheduler runs each target at its full natural
+// depth (ceil(weakenTime/BATCH_PERIOD)), so a deep target can hold hundreds of
+// in-flight batches = hundreds × 4 concurrent worker scripts; Bitburner slows with
+// too many live scripts. This cap bounds the total by limiting the *number* of
+// batched targets (selectBatchers keeps the highest-score ones). Temporary low value
+// for tuning — raise it until the game starts to lag, then back off.
 /** Max number of simultaneously batched targets. */
-export const MAX_BATCH_TARGETS = 999;
+export const MAX_BATCH_TARGETS = 10;
 
 // When the target cap is active, prep no more than (cap + this) servers at once,
 // so prep effort doesn't sprawl onto servers that won't earn a batch slot soon.

@@ -61,10 +61,9 @@ The main loop (`main`) each tick:
    pipeline up to a target depth. It keeps a per-target `pipelines` entry
    (`committed[]` future W1 landing times, `lastLand`, `depth`); each tick it drops
    landings that have passed and fires enough new batches to refill to `depth`, each
-   landing one `period` after the previous committed one (or a fresh weaken-time +
-   safety ahead if the pipeline drained). `period = max(BATCH_PERIOD,
-   weakenTime/CONCURRENCY_CAP)` and `depth = ceil(weakenTime/period)` are derived
-   from the **stable min-security weaken time** locked in the plan, so depth is
+   landing one `BATCH_PERIOD` after the previous committed one (or a fresh weaken-time
+   + safety ahead if the pipeline drained). `depth = ceil(weakenTime/BATCH_PERIOD)` is
+   derived from the **stable min-security weaken time** locked in the plan, so depth is
    constant and the pipeline holds at exactly N in flight. There is **no baseline
    fire gate, no skipped slots, and no recovery wave** (see below). The pipeline
    fills gradually (≤ `MAX_FIRES_PER_TICK` per tick) so RAM use ramps over ~a weaken
@@ -178,8 +177,12 @@ the floor is zero and prep uses everything left.
 
 **Two batching ceilings for two regimes.** Early game is *RAM-limited*, governed
 by `BATCH_BUDGET_FRAC`. Late game is *lag-limited* — Bitburner slows with too many
-concurrent worker scripts — governed by `MAX_BATCH_TARGETS` (default high =
-effectively off until tuned down). The two never conflict: prep ordering decides
+concurrent worker scripts, and the self-pacing scheduler runs every target at its
+full natural depth (`ceil(weakenTime/BATCH_PERIOD)`, hundreds of batches on a deep
+target), so this is the binding late-game constraint — governed by
+`MAX_BATCH_TARGETS` (currently a deliberately low **10**, tuned by hand against
+observed lag; there is no longer a per-target depth cap). The two never conflict:
+prep ordering decides
 what gets *ready* (velocity, easiest-first), the cap decides what *runs* among the
 ready set (value, best-score-first). They bind in different regimes, so the cap
 never undermines the bootstrap fix. `PREP_LOOKAHEAD` keeps prep breadth aligned
@@ -189,12 +192,10 @@ big earner finishes prepping — this self-corrects as `selectBatchers` retains 
 highest-score targets and drops weaker ones (hysteresis permitting).
 
 **Admission control is the core correctness mechanism.** Each batching target
-independently tries to maintain a full pipeline of `min(ceil(weakenTime/BATCH_PERIOD),
-CONCURRENCY_CAP)` concurrent batches — the **same depth `batchPhase` actually runs**.
-(An earlier version estimated the uncapped `ceil(weakenTime/BATCH_PERIOD)` here, which
-over-reserved several-fold on deep targets, exhausting the budget and freezing the
-admitted set far below the pool's real capacity.) Without a global budget, the sum of
-all pipelines far exceeds
+independently tries to maintain a full pipeline of `ceil(weakenTime/BATCH_PERIOD)`
+concurrent batches — the **same depth `batchPhase` actually runs** (the reservation
+estimate and the scheduler must use the identical formula, or the budget is over- or
+under-reserved). Without a global budget, the sum of all pipelines far exceeds
 the pool: as pipelines fill, RAM drains to zero. That caused two failures observed
 in a 10-hour run:
 
@@ -272,8 +273,9 @@ drift fix.** It evolved through two earlier designs, both of which the test rig
   iron-gym at full depth 248: +0.00 security, ~2 ms landing error, **0 skipped,
   ~98 % throughput** (≈1469 fires/10 min) indefinitely.
 
-Two details make Mode C hold exactly N in flight: depth/period come from the
-**stable min-security weaken time** in the locked plan (using the live,
+Two details make Mode C hold exactly N in flight: `depth = ceil(weakenTime/
+BATCH_PERIOD)` comes from the **stable min-security weaken time** in the locked plan
+(using the live,
 security-inflated value would grow the depth target on a transient bump and
 overfill), while landing *times* use **fresh op-times** so each op still lands on
 slot. `committed.length` is also the live pipeline fill shown in the status table.

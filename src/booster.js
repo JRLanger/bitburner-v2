@@ -40,7 +40,6 @@ import {
     CHANCE_BATCH,
     BATCH_BUDGET_FRAC,
     MAX_FIRES_PER_TICK,
-    CONCURRENCY_CAP,
     MAX_BATCH_TARGETS,
     PREP_LOOKAHEAD,
     D_GAP,
@@ -102,7 +101,7 @@ const provisioned = new Set();
  * `committed` is the list of W1 landing timestamps still in the future, `lastLand`
  * the most recent committed landing, `depth` the target in-flight count (for the
  * status display). Each tick batchPhase prunes landed entries and fires enough new
- * batches to refill to `depth`, each landing one period after the last — a
+ * batches to refill to `depth`, each landing one BATCH_PERIOD after the last — a
  * self-pacing scheduler that holds the pipeline full with no fire gate and no
  * skipped slots. Cleared when a target drops to re-prep (classify).
  */
@@ -566,12 +565,9 @@ function isPrepped(s, sec, money) {
  */
 function selectBatchers(ns, eligible, poolTotal) {
     const budget = poolTotal * BATCH_BUDGET_FRAC;
-    // Reserve only as much depth as batchPhase actually runs. batchPhase widens the
-    // period to max(BATCH_PERIOD, weakenTime/CONCURRENCY_CAP), so real depth is
-    // min(natural depth, CONCURRENCY_CAP). Estimating uncapped depth here (the old
-    // ceil(weakenTime/BATCH_PERIOD)) over-reserved several-fold on deep targets,
-    // exhausting the budget and freezing admission while the pool sat near-idle.
-    const concurrency = (t) => Math.min(Math.ceil(t.weakenTime / BATCH_PERIOD), CONCURRENCY_CAP);
+    // Reserve the same full-pipeline depth batchPhase actually runs, so the estimate
+    // matches real usage (a mismatch here would over- or under-reserve the budget).
+    const concurrency = (t) => Math.ceil(t.weakenTime / BATCH_PERIOD);
 
     const admitted = [];
     let used = 0;
@@ -609,7 +605,7 @@ function selectBatchers(ns, eligible, poolTotal) {
  * SELF-PACING HWGW scheduler. For each eligible target, in rank order, it tops the
  * pipeline up to a target depth: each tick it drops landings that have already
  * passed, then fires enough new batches to refill to `depth`, each landing one
- * `period` after the previous committed landing (or one fresh weaken-time + safety
+ * one BATCH_PERIOD after the previous committed landing (or one fresh weaken-time + safety
  * ahead if the pipeline ran dry). Nothing is gated and nothing is skipped — only
  * clean, collision-free landings are ever scheduled, so the pipeline holds full
  * with zero drift.
@@ -630,11 +626,10 @@ function batchPhase(ns, eligible, pool) {
         const target = t.hostname;
         const ramPerBatch = t.ramPerBatch;
 
-        // Inter-batch spacing and in-flight depth, from the stable plan weaken time.
-        // CONCURRENCY_CAP bounds depth by widening the period on long-weakenTime
-        // targets, keeping the concurrent-script count manageable (lag/RAM).
-        const period = Math.max(BATCH_PERIOD, t.weakenTime / CONCURRENCY_CAP);
-        const depth = Math.ceil(t.weakenTime / period);
+        // In-flight depth = a full pipeline at BATCH_PERIOD spacing, from the stable
+        // plan weaken time (constant depth, no overfill on a transient security bump).
+        // Lag is governed by MAX_BATCH_TARGETS (number of targets), not per-target depth.
+        const depth = Math.ceil(t.weakenTime / BATCH_PERIOD);
 
         // Fresh op-times for landing math (see fireBatch).
         const weakenTime = ns.getWeakenTime(target);
@@ -651,13 +646,13 @@ function batchPhase(ns, eligible, pool) {
         // Drop landings that have already passed; what remains is the live depth.
         pipe.committed = pipe.committed.filter((land) => land > now);
 
-        // Top up to depth. Each new batch lands `period` after the last committed one,
+        // Top up to depth. Each new batch lands one BATCH_PERIOD after the last committed one,
         // or a fresh weaken-time + safety ahead if the pipeline drained. A momentarily
         // full pool just defers the rest to a later tick (no skipped slots).
         let k = 0;
         while (pipe.committed.length < depth && k < MAX_FIRES_PER_TICK) {
             if (ramPerBatch > poolFree(pool)) break;
-            const land = Math.max(now + weakenTime + BATCH_SAFETY_MS, pipe.lastLand + period);
+            const land = Math.max(now + weakenTime + BATCH_SAFETY_MS, pipe.lastLand + BATCH_PERIOD);
             fireBatch(ns, pool, t, land, now, hackTime, growTime, weakenTime);
             pipe.committed.push(land);
             pipe.lastLand = land;
@@ -852,11 +847,10 @@ function displayHealth(t) {
     return { moneyFrac: Math.max(...h.money), secOver: Math.min(...h.sec) };
 }
 
-/** Expected income for a batching target, $/s: one batch's take per landing period
- *  (the period widens past BATCH_PERIOD on CONCURRENCY_CAP-bounded deep targets). */
+/** Expected income for a batching target, $/s: one batch's take per BATCH_PERIOD
+ *  (the steady-state landing cadence). */
 function expectedIncome(t) {
-    const period = Math.max(BATCH_PERIOD, t.weakenTime / CONCURRENCY_CAP);
-    return (t.maxMoney * t.f * t.chance) / (period / 1000);
+    return (t.maxMoney * t.f * t.chance) / (BATCH_PERIOD / 1000);
 }
 
 /** Render a refreshing status table to the tail window each tick. */
