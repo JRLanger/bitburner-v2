@@ -20,7 +20,7 @@ import {
     SEC_MARGIN,
     MONEY_EPSILON,
     BATCH_KEEP_MONEY_FRAC,
-    BATCH_KEEP_SEC_OVER,
+    BATCH_KEEP_SEC_FRAC,
     DRIFT_GRACE_MS,
     HACK_PCT_MIN,
     HACK_PCT_MAX,
@@ -37,7 +37,6 @@ import {
     LOOP_SLEEP,
     HOME_SAFETY_BUFFER_GB,
     FORMULAS_EXE,
-    CHANCE_BATCH,
     BATCH_BUDGET_FRAC,
     MAX_FIRES_PER_TICK,
     MAX_BATCH_TARGETS,
@@ -179,7 +178,7 @@ export async function main(ns) {
         const pool = buildPool(ns, rootedHosts, homeReserveExtra);
         const inFlight = inFlightByTarget(ns, rootedHosts);
 
-        const { eligible, needsPrep, idle } = classify(ns, servers);
+        const { eligible, needsPrep } = classify(ns, servers);
 
         // Admission control: cap the actively-batched set to what the pool can
         // sustain (full pipelines), leaving real headroom for prep. Total pool
@@ -239,7 +238,7 @@ export async function main(ns) {
         // it yields the instant batch/prep demand (or a ramp-down) reclaims it.
 
         updateDisplayStats(batchers);
-        renderStatus(ns, servers, pool, batchers, needsPrep, idle);
+        renderStatus(ns, servers, pool, batchers, needsPrep);
 
         // Remember this tick's admitted set for next tick's admission hysteresis.
         wasBatching.clear();
@@ -390,8 +389,17 @@ function launchManagers(ns, servers) {
         }
         if (launchedManagers.has(m.file)) continue; // was running, now gone → stopped/done
         if (m.gate(servers)) {
-            ns.exec(m.file, "home");
-            launchedManagers.add(m.file);
+            const pid = ns.exec(m.file, "home");
+            // Only mark it accounted-for if the exec actually started a process.
+            // exec() fails silently (returns 0, no exception) when home doesn't have
+            // enough free RAM at that instant — e.g. right after a soft reset, before
+            // the reserve has caught up. Without this check, a single failed launch
+            // was indistinguishable from "user stopped it" and was never retried.
+            if (pid !== 0) {
+                launchedManagers.add(m.file);
+            } else {
+                ns.print(`WARN: failed to launch ${m.file} (insufficient RAM on home?) — will retry`);
+            }
         }
         return; // first pending manager is the only candidate this tick
     }
@@ -431,8 +439,11 @@ function pserverFleetBuilt(servers) {
 
 /**
  * Split viable targets into:
- *  - `eligible`: prepped + batch-worthy (chance ≥ CHANCE_BATCH), each with its
- *    best hack-% table row attached, sorted by score (most profitable first).
+ *  - `eligible`: prepped targets, each with its best hack-% table row attached,
+ *    sorted by score (most profitable first). No hack-chance floor — `score`
+ *    already multiplies in `chance` (see bestHackPct), so a low-chance target
+ *    is correctly ranked low rather than excluded outright; it only gets a
+ *    batch slot if nothing better is competing for the RAM.
  *  - `needsPrep`: not yet at baseline, sorted by maxMoney (prep value first).
  *
  * The expensive hack-% table is only built for prepped eligible targets (few),
@@ -443,7 +454,6 @@ function classify(ns, servers) {
     const now = Date.now();
     const eligible = [];
     const needsPrep = [];
-    const idle = []; // prepped but chance < CHANCE_BATCH (held back, not attacked)
 
     for (const s of servers) {
         if (!s.hasRoot || s.maxMoney <= 0 || s.hackLevelReq > level) continue;
@@ -472,7 +482,7 @@ function classify(ns, servers) {
             });
             const healthy =
                 moneyFrac >= BATCH_KEEP_MONEY_FRAC &&
-                secOver <= BATCH_KEEP_SEC_OVER;
+                secOver <= s.minSecurity * BATCH_KEEP_SEC_FRAC;
             // Drift grace: keep batching through a brief unhealthy blip (a
             // bump-fired batch landing late self-heals in a few seconds); only
             // drop to re-prep once unhealthy continuously past DRIFT_GRACE_MS.
@@ -512,14 +522,6 @@ function classify(ns, servers) {
             continue;
         }
         const chance = ns.hackAnalyzeChance(s.hostname);
-        if (chance < CHANCE_BATCH) {
-            // Prepped (at max money / min sec) but hack chance is still too low to be
-            // worth batching — it sits idle until the hacking level rises. Tracked so
-            // the status table can show WHY it isn't being attacked.
-            idle.push({ ...s, chance });
-            continue;
-        }
-
         const best = bestHackPct(ns, s, chance, Infinity, rampLevel);
         if (best) {
             best.ramp = rampLevel;
@@ -536,8 +538,7 @@ function classify(ns, servers) {
     // ones — instead of stalling for hours on un-preppable large servers at the
     // front of the queue. `maxMoney` is the free, tunable prep-cost proxy.
     needsPrep.sort((a, b) => a.maxMoney - b.maxMoney);
-    idle.sort((a, b) => b.chance - a.chance); // closest to batch-worthy first
-    return { eligible, needsPrep, idle };
+    return { eligible, needsPrep };
 }
 
 /** True when a server is at (near) min security and (near) max money. */
@@ -860,7 +861,7 @@ function expectedIncome(t) {
 }
 
 /** Render a refreshing status table to the tail window each tick. */
-function renderStatus(ns, servers, pool, eligible, needsPrep, idle = []) {
+function renderStatus(ns, servers, pool, eligible, needsPrep) {
     ns.clearLog();
     const level = ns.getHackingLevel();
     const rooted = servers.filter((s) => s.hasRoot).length;
@@ -913,15 +914,6 @@ function renderStatus(ns, servers, pool, eligible, needsPrep, idle = []) {
         const items = needsPrep
             .slice(0, 8)
             .map((t) => `${t.hostname}(${Math.round((t.money / t.maxMoney) * 100)}%)`);
-        ns.print("║ " + items.join("  "));
-    }
-    if (idle.length > 0) {
-        // Prepped but held back by CHANCE_BATCH (hack chance too low) — shown with
-        // each target's current chance so it's clear they're waiting on hacking level.
-        ns.print(`╠═ Idle: chance < ${Math.round(CHANCE_BATCH * 100)}% ${"═".repeat(W - 22)}`);
-        const items = idle
-            .slice(0, 8)
-            .map((t) => `${t.hostname}(${Math.round(t.chance * 100)}%)`);
         ns.print("║ " + items.join("  "));
     }
     ns.print(`╚${"═".repeat(W)}`);

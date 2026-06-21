@@ -41,23 +41,31 @@ export const GROW_SEC = 0.004;
 export const HACK_SEC = 0.002;
 
 // ── Target selection & prep thresholds ─────────────────────────────────────
+//
+// No hack-chance floor: chance is already a multiplier in bestHackPct's score
+// (moneyPerBatch = maxMoney × f × chance), so a low-chance target is correctly
+// scored low rather than excluded — it only wins a batch slot if nothing
+// higher-scoring is competing for the RAM. Removed CHANCE_FILTER/CHANCE_BATCH
+// (0.5 / 0.8 floors) in favor of trusting the score outright.
 
-/** Min hackAnalyzeChance to even consider a target. */
-export const CHANCE_FILTER = 0.5;
-/** Min hackAnalyzeChance before a prepped target is batch-eligible. */
-export const CHANCE_BATCH = 0.8;
 /** "Prepped"/healthy if security ≤ minSecurity × (1 + this). */
 export const SEC_MARGIN = 0.05;
 /** "Prepped"/healthy if money ≥ maxMoney × (1 − this). */
 export const MONEY_EPSILON = 0.01;
 
-// Hysteresis: strict to START batching (above), loose to KEEP batching. A
-// healthy batch's money/security oscillate each cycle, so only pull a target
-// for re-prep if it has genuinely drifted past these looser bounds.
+// Hysteresis: strict to START batching (above), looser to KEEP batching — but
+// the within-cycle oscillation is already filtered out upstream by the windowed
+// peak/floor in displayHealth (classify reads peak money / floor security across
+// the recent window, not the raw instantaneous value), so these bounds only need
+// to tolerate genuine, sustained drift, not normal HWGW cycling. ~10% drift on
+// either axis is real drift (e.g. caused by a hacking-level-up shifting hack%/
+// thread counts mid-pipeline) and worth a re-prep.
 /** Keep batching while money ≥ maxMoney × this. */
-export const BATCH_KEEP_MONEY_FRAC = 0.2;
-/** Keep batching while security ≤ minSecurity + this (absolute). */
-export const BATCH_KEEP_SEC_OVER = 5;
+export const BATCH_KEEP_MONEY_FRAC = 0.9;
+/** Keep batching while security ≤ minSecurity × (1 + this) — relative, so it
+ *  scales with the target instead of one flat number being too loose on a
+ *  low-minSecurity server and too tight on a high one. */
+export const BATCH_KEEP_SEC_FRAC = 0.10;
 
 // Drift grace. A batch fired during a transient security bump (caused by a
 // high-grow target's own in-flight grows) lands a little late and briefly

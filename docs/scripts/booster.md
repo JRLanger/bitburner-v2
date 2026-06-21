@@ -16,6 +16,9 @@ extraction via HWGW batching:
   whole fleet is engaged and pool RAM still sits idle, trading efficiency for
   absolute income.
 
+- **Manager orchestration** launches the contracts/pserver/hacknet managers on
+  home, in a fixed dependency order, once each one's gate passes.
+
 It also writes `/data/servers.json` (topology for managers) and refreshes a live
 status table in the tail window each tick.
 
@@ -27,17 +30,23 @@ The main loop (`main`) each tick:
    rooted hosts once. **home is included as a rooted pool host** (it already holds
    the worker scripts, being the copy source) with `maxMoney 0` so `classify` never
    targets it for hacking — only its RAM is used.
-2. `buildPool` — one entry per rooted host with free RAM, largest-first; home
+2. `launchManagers` — exec's the first not-yet-running manager (contracts →
+   pserver → hacknet, fixed order) on home, if its gate passes. `nextManagerReserve`
+   (called just before this) returns the RAM the *next* pending manager needs, fed
+   into `buildPool` below so that headroom is walled off from workers before they
+   can claim it.
+3. `buildPool` — one entry per rooted host with free RAM, largest-first; home
    keeps the safety buffer **plus the next pending manager's RAM reservation** free,
    and contributes the rest to the pool.
-3. `classify` — splits viable servers into `eligible` (prepped + batch-worthy,
-   each scored by $/GB/s via `bestHackPct`), `needsPrep` (not yet at baseline), and
-   `idle` (prepped but `hackAnalyzeChance < CHANCE_BATCH` — held back until the
-   hacking level rises, surfaced in the status table so it's clear *why* a ready
-   server isn't being attacked rather than vanishing from every list). Uses hysteresis:
-   **strict** bounds (on the raw read) to *start* batching, **loose** bounds to
-   *keep* batching. The keep-test is judged on the **grid-aligned windowed
-   baseline** (`displayHealth`'s peak money / floor security), not the raw
+4. `classify` — splits viable servers into `eligible` (prepped targets, each
+   scored by $/GB/s via `bestHackPct`) and `needsPrep` (not yet at baseline). There
+   is **no hack-chance floor** — `bestHackPct`'s `score` already multiplies in
+   `chance` (`moneyPerBatch = maxMoney × f × chance`), so a low-chance target is
+   correctly ranked low rather than excluded; it only wins a batch slot via
+   `selectBatchers` if nothing higher-scoring is competing for the RAM. Uses
+   hysteresis: **strict** bounds (on the raw read) to *start* batching, **looser**
+   bounds to *keep* batching. The keep-test is judged on the **grid-aligned
+   windowed baseline** (`displayHealth`'s peak money / floor security), not the raw
    instantaneous read — a healthy batch's money legitimately plunges to ~(1−hack%)
    each cycle, and its security legitimately spikes by the grow's full bump in the
    gap between the grow landing and its counter-weaken (at high hack-% that bump is
@@ -46,7 +55,7 @@ The main loop (`main`) each tick:
    admitted, `chance` only degrades via security, which the floor-security bound
    already catches — and the raw `chance` read dips on the same mid-cycle spike.
    `needsPrep` is sorted **easiest-earner first** (ascending `maxMoney`).
-4. `selectBatchers` — **admission control + depth-first allocation.** Walks the
+5. `selectBatchers` — **admission control + depth-first allocation.** Walks the
    score-sorted `eligible` list in rank order and gives each target, greedily, the
    RAM it can use before moving to the next — filling the best target toward its
    full pipeline before a lower-ranked one starts. Per target, against the
@@ -57,7 +66,7 @@ The main loop (`main`) each tick:
    waits. Ceilings: `BATCH_BUDGET_FRAC` of the *total* pool and `MAX_BATCH_TARGETS`.
    Last tick's batchers (`wasBatching`) get first claim so the set doesn't flap.
    Returns `{ batchers, reserved }`.
-5. `batchPhase` — a **self-pacing scheduler** that tops each admitted target's
+6. `batchPhase` — a **self-pacing scheduler** that tops each admitted target's
    pipeline up to a target depth. It keeps a per-target `pipelines` entry
    (`committed[]` future W1 landing times, `lastLand`, `depth`); each tick it drops
    landings that have passed and fires enough new batches to refill to `depth`, each
@@ -68,13 +77,13 @@ The main loop (`main`) each tick:
    fire gate, no skipped slots, and no recovery wave** (see below). The pipeline
    fills gradually (≤ `MAX_FIRES_PER_TICK` per tick) so RAM use ramps over ~a weaken
    time; a momentarily full pool just defers the rest to a later tick.
-6. `prepPhase` — spends remaining RAM driving `needsPrep` targets to baseline, one
+7. `prepPhase` — spends remaining RAM driving `needsPrep` targets to baseline, one
    corrective wave per target (`prepWave`), skipping any with workers already in
    flight; prepares at most `MAX_BATCH_TARGETS + PREP_LOOKAHEAD` servers at once.
    Stops at a `prepFloor` = the batchers' reserved-but-unclaimed RAM, and each
    `prepWave` is capped to that headroom — so prep can't starve a pipeline that is
    still ramping toward full depth.
-7. **Hack-% ramp controller** — a global `rampLevel` (a hack-% *floor*, starts at
+8. **Hack-% ramp controller** — a global `rampLevel` (a hack-% *floor*, starts at
    0) absorbs idle pool RAM. After prep, the loop nudges `rampLevel` by at most one
    `RAMP_STEP` per tick, driven by actual **pool utilization** (`1 − free/total`,
    measured after this tick's batch + prep placements): **up** when every `eligible`
@@ -84,7 +93,7 @@ The main loop (`main`) each tick:
    at `max(score-optimal f, rampLevel)` capped at `HACK_PCT_RAMP_MAX`, so a raised
    floor pulls low-% targets up to spend the idle RAM. The plan lock stores the
    `rampLevel` it was computed at and recomputes only when the floor moves.
-8. `updateDisplayStats` / `renderStatus` — refresh the tail-window status table.
+9. `updateDisplayStats` / `renderStatus` — refresh the tail-window status table.
    Raw money/security reads land at a random phase of each target's batch grid, so
    they oscillate (e.g. money flips between 100% and `100% − hack%`). For display
    only, `updateDisplayStats` keeps a short rolling window per batcher and
@@ -207,7 +216,7 @@ in a 10-hour run:
   prep (the `prepping` count oscillated), then slowly healed and were re-admitted.
 
 `selectBatchers` fixes the root cause by matching aggregate batch demand to pool
-capacity. `BATCH_BUDGET_FRAC = 0.85` leaves ~15% of the *total* pool as genuine
+capacity. `BATCH_BUDGET_FRAC = 0.80` leaves ~20% of the *total* pool as genuine
 headroom for prep, recovery waves, and per-tick jitter — a proportional reserve,
 not a flat constant that becomes meaningless as the pool grows. Un-admitted prepped
 targets simply idle: since they aren't hacked, they stay at max money at zero RAM
@@ -303,6 +312,53 @@ A **future RAM-share hook** is documented at the end of the main loop: once prep
 clear, `excess = poolFree - poolTotal * (1 - BATCH_BUDGET_FRAC)` is the genuine
 surplus a future `sharePhase` could feed to `ns.share()` for faction-rep bonuses,
 recomputed each tick so it yields the moment hacking demand rises. Not built yet.
+
+**No hack-chance floor — trust the score.** An earlier version excluded any
+prepped target below `CHANCE_BATCH` (80% hack chance) into a separate `idle`
+bucket, shown in the status table but never attacked. This was a redundant,
+blunt gate: `bestHackPct`'s `score` already multiplies in `chance`
+(`moneyPerBatch = maxMoney × f × chance`), so a low-chance target is already
+penalized in proportion to its actual risk — it just naturally ranks low and
+only gets a `selectBatchers` slot when nothing better is competing for the RAM
+(the same philosophy as the hack-% ramp spending otherwise-idle RAM). Removing
+the gate (and the never-wired `CHANCE_FILTER` alongside it) let previously-idle
+targets batch for the first time and took measured income from ~15 b/s to ~80
+b/s on one save — confirming the gate had been suppressing real profit, not
+protecting against it. A failed hack still raises security exactly the amount
+its thread count accounts for (security cost is per-thread, not per-success),
+so a low-chance target doesn't desync the grid by failing more often — it's
+just lower expected value per RAM, which `score` already reflects.
+
+**Manager launches retry on a failed `ns.exec`.** `launchManagers` used to mark
+a manager as accounted-for (`launchedManagers.add`) immediately after calling
+`ns.exec`, regardless of whether the exec actually started a process.
+`ns.exec` fails silently — returns `0`, no exception — when the target host
+doesn't have enough free RAM at that instant (e.g. right after an augmentation
+soft-reset restart, before `buildPool`'s manager reserve has had a tick to take
+effect). A failed launch was then indistinguishable from "the user manually
+stopped it," permanently skipping that manager for the rest of the run. Fixed
+by only adding to `launchedManagers` when `ns.exec` returns a nonzero pid;
+a failed attempt logs a `WARN` line in the tail and retries the very next tick
+instead of being silently abandoned. `nextManagerReserve`/`homeReserveExtra`
+(walling off the next manager's RAM on home before workers can claim it) is
+the *prevention* half of this — it makes the failure rare — and the retry is
+the *safety net* for the one moment prevention can't help: the very first tick
+of a fresh process, before any prior tick has reserved anything yet.
+
+**Keep-bounds tightened to ~10%, security made relative.**
+`BATCH_KEEP_MONEY_FRAC` (0.2 → 0.9) and the old flat `BATCH_KEEP_SEC_OVER` (+5,
+replaced by `BATCH_KEEP_SEC_FRAC = 0.10`, evaluated as `minSecurity × (1 +
+this)`) were originally set loose to avoid false-tripping on normal HWGW
+cycling. That oscillation is already filtered out upstream by `displayHealth`'s
+windowed peak/floor (the keep-test reads the window's *peak* money and *floor*
+security-over, not the raw instantaneous value), so the keep-bounds only ever
+needed to catch genuine, sustained drift — the 0.2/+5 values were tolerating
+far more damage (up to an 80% money loss, or a flat +5 security regardless of
+how small the target's `minSecurity` was) than necessary before triggering a
+re-prep. Security was also switched from an absolute number to a fraction of
+`minSecurity`, mirroring `SEC_MARGIN`'s relative style for the strict
+start-batching check (stricter bound to start, looser to keep — same pattern,
+now consistent units on both ends).
 
 **Drift-prevention tuning.** `THREAD_MARGIN` over-provisions every grow/weaken
 thread count by a small factor (hack is left exact) so each batch grows just past
