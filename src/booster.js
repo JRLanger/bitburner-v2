@@ -4,9 +4,9 @@
  * The cheap "first stage" controller that runs at the start of a BitNode cycle,
  * before Formulas.exe. See docs/devlog/02-booster.md for the full design.
  *
- * BUILD STATUS: Stage 4 — orchestrates the pserver + hacknet managers (gated
- * launch on home, no double-launch) on top of the 3a–3e batcher and status table.
- * Formulas.exe handoff (stage 5) still follows.
+ * BUILD STATUS: Stage 5 — feeds idle pool RAM to ns.share() (sharePhase) on top
+ * of the Stage 4 manager orchestration and the 3a–3e batcher + status table.
+ * Formulas.exe handoff (stage 6) still follows.
  *
  * Prerequisites: the three worker scripts must already exist on home. booster
  * does NOT create them; it errors out and exits if any is missing.
@@ -16,6 +16,10 @@ import {
     HACK_WORKER,
     GROW_WORKER,
     WEAKEN_WORKER,
+    SHARE_WORKER,
+    SHARE_RAM,
+    SHARE_BUDGET_FRAC,
+    SHARE_OFF_FLAG,
     SERVERS_JSON,
     SEC_MARGIN,
     MONEY_EPSILON,
@@ -29,6 +33,7 @@ import {
     RAMP_STEP,
     RAMP_UTIL_LOW,
     RAMP_UTIL_HIGH,
+    RAMP_BUDGET_MIN,
     WORKER_RAM,
     WEAKEN_SEC,
     GROW_SEC,
@@ -40,10 +45,13 @@ import {
     BATCH_BUDGET_FRAC,
     MAX_FIRES_PER_TICK,
     MAX_BATCH_TARGETS,
+    SELECT_KEEP_BIAS,
     PREP_LOOKAHEAD,
     D_GAP,
     BATCH_PERIOD,
     BATCH_SAFETY_MS,
+    BOOSTER_DEBUG,
+    BOOSTER_DEBUG_LOG,
     CONTRACTS_MANAGER,
     PSERVER_MANAGER,
     HACKNET_MANAGER,
@@ -54,11 +62,17 @@ import {
     HACKNET_GATE,
 } from "/config/constants.js";
 
-/** Worker paths that must exist on home and get copied to every rooted server. */
+/** HWGW worker paths that must exist on home and get copied to every rooted server. */
 const WORKERS = [HACK_WORKER, GROW_WORKER, WEAKEN_WORKER];
 
-/** Normalized worker filenames for matching against ns.ps() output. */
+/** Normalized HWGW worker filenames for matching against ns.ps() output. Note this
+ *  intentionally EXCLUDES the share worker: inFlightByTarget uses it to attribute
+ *  workers to a hack target via args[0], but share workers carry only a seq arg. */
 const WORKER_FILES = new Set(WORKERS.map(stripSlash));
+
+/** Everything booster places on rooted hosts: the HWGW workers plus the share
+ *  worker. Used for the prerequisite check and per-host provisioning. */
+const PLACED_WORKERS = [...WORKERS, SHARE_WORKER];
 
 /**
  * Managers booster orchestrates, in fixed dependency order. Each tick booster
@@ -139,6 +153,27 @@ const unhealthySince = new Map();
  */
 let rampLevel = 0;
 
+/** Active share-worker thread count and manual-pause state, for the status line.
+ *  Updated by sharePhase each tick. */
+let shareThreads = 0;
+let shareOff = false;
+
+/** Diagnostic log buffer (flushed once per tick) and a monotonic tick counter so
+ *  log lines from the same tick can be grouped. See BOOSTER_DEBUG in constants. */
+let debugBuf = [];
+let tickNo = 0;
+/** Buffer one diagnostic line for this tick (no-op unless BOOSTER_DEBUG). */
+function dbg(line) {
+    if (BOOSTER_DEBUG) debugBuf.push(line);
+}
+/** Append this tick's buffered diagnostic lines to the log file and clear. */
+function flushDebug(ns) {
+    if (BOOSTER_DEBUG && debugBuf.length > 0) {
+        ns.write(BOOSTER_DEBUG_LOG, debugBuf.join("\n") + "\n", "a");
+    }
+    debugBuf = [];
+}
+
 /**
  * Per-target rolling samples of money fraction and security-over-min, used only
  * for the status display. Raw mid-cycle reads oscillate (a hack has landed
@@ -154,12 +189,17 @@ export async function main(ns) {
     ns.disableLog("ALL");
     ns.ui.openTail();
 
-    // Prerequisite check: all three workers must exist on home.
-    const missing = WORKERS.filter((w) => !ns.fileExists(w, "home"));
+    // Prerequisite check: all workers (HWGW + share) must exist on home.
+    const missing = PLACED_WORKERS.filter((w) => !ns.fileExists(w, "home"));
     if (missing.length > 0) {
         ns.tprint(`ERROR: missing worker script(s): ${missing.join(", ")}`);
         ns.tprint("booster does not create workers. Add them, then re-run.");
         return;
+    }
+
+    // Fresh diagnostic log per run (truncate). No-op cost when BOOSTER_DEBUG off.
+    if (BOOSTER_DEBUG) {
+        ns.write(BOOSTER_DEBUG_LOG, `# booster debug log — ${new Date().toISOString()}\n`, "w");
     }
 
     // Main control loop. Stage 3a: discover/root + prep.
@@ -167,6 +207,7 @@ export async function main(ns) {
     // condition. For now it runs unconditionally so it's testable on saves that
     // already own Formulas.exe.
     while (true) {
+        tickNo++;
         const servers = discoverAndRoot(ns);
         ns.write(SERVERS_JSON, JSON.stringify(servers, null, 2), "w");
 
@@ -188,6 +229,22 @@ export async function main(ns) {
             HOME_SAFETY_BUFFER_GB;
         const { batchers, reserved } = selectBatchers(ns, eligible, poolTotal);
 
+        // Per-tick summary: eligible vs admitted, so a drop is attributable to either
+        // classify (host absent from `eligible`) or selectBatchers (in `eligible`,
+        // absent from `batchers` → budget/cap). dropEligible/dropAdmit logged inside.
+        if (BOOSTER_DEBUG) {
+            const elig = eligible.map((t) => t.hostname);
+            const batched = new Set(batchers.map((t) => t.hostname));
+            const notAdmitted = elig.filter((h) => !batched.has(h));
+            dbg(
+                `T${tickNo} elig=${eligible.length} batch=${batchers.length} ` +
+                `ramp=${Math.round(rampLevel * 100)}% ` +
+                `reserved=${ns.format.ram(reserved)}/${ns.format.ram(poolTotal * BATCH_BUDGET_FRAC)} ` +
+                `poolFree=${ns.format.ram(poolFree(pool))}`
+            );
+            if (notAdmitted.length > 0) dbg(`  selectBatchers excluded: ${notAdmitted.join(", ")}`);
+        }
+
         // Batch the admitted targets first (consumes RAM by rank), then spend
         // whatever's left prepping the next-best targets.
         batchPhase(ns, batchers, pool);
@@ -205,45 +262,55 @@ export async function main(ns) {
         prepPhase(ns, needsPrep, pool, inFlight, prepFloor);
 
         // Hack-% ramp controller (idle-RAM absorber). Move the global ramp floor
-        // at most one step/tick. Signal: actual POOL UTILIZATION (1 − free/total),
-        // measured after this tick's batch + prep placements, so it already counts
-        // whatever prep is consuming — a one-server prep trickle leaves the pool
-        // ~all-free (ramp up), while a fresh-save bootstrap where prep eats the
-        // small pool leaves it nearly full (no ramp). Raise the floor while the
-        // pool is under-used AND admission placed every target it could (up to both
-        // the RAM budget and MAX_BATCH_TARGETS); lower it when the pool is heavily
-        // used or admission is RAM-starved (target-cap exclusions don't count).
-        // The wide LOW..HIGH deadband holds it steady through mid-cycle
-        // oscillation. Plans pick up the new floor next tick (classify).
+        // at most one step/tick. Two signals must BOTH say "spend more" to ramp up:
+        //  - actual POOL UTILIZATION (1 − free/total) below RAMP_UTIL_LOW, and
+        //  - admission-BUDGET headroom (1 − reserved/budget) above RAMP_BUDGET_MIN.
+        // The budget signal is the key fix for the limit cycle: selectBatchers reserves
+        // the full pipeline RAM immediately, but pipelines fill gradually, so actual
+        // utilization lags far behind committed budget. Using utilization alone, the
+        // ramp read the not-yet-filled RAM as "idle" and kept pushing hack-% up even
+        // though the budget was 100% reserved — which can't add throughput, it just
+        // grows batches until the marginal target no longer fits and drops out
+        // (ramp 40↔42%, batchers 10↔8, every tick). Requiring real budget headroom
+        // makes it settle at the highest hack-% where the full admitted set still fits.
+        // Ramp DOWN when admission is starved (fewer targets than it could place) or
+        // the pool is genuinely near-full. The wide LOW..HIGH deadband and the budget
+        // gate together hold it steady. Plans pick up the new floor next tick (classify).
         const poolUsedFrac = poolTotal > 0 ? 1 - poolFree(pool) / poolTotal : 1;
+        const budget = poolTotal * BATCH_BUDGET_FRAC;
+        const budgetHeadroom = budget > 0 ? 1 - reserved / budget : 0;
         // "All batching" means admission placed as many targets as it possibly could
-        // given BOTH ceilings — the RAM budget AND MAX_BATCH_TARGETS. Comparing against
-        // the raw eligible count (pre-MAX_BATCH_TARGETS fix) falsely read as starved
-        // whenever eligible targets exceeded the target-count cap, permanently
-        // blocking — and decaying — the ramp even with the pool nearly empty.
+        // given BOTH ceilings — the RAM budget AND MAX_BATCH_TARGETS.
         const allBatching = batchers.length === Math.min(eligible.length, MAX_BATCH_TARGETS);
-        if (allBatching && poolUsedFrac < RAMP_UTIL_LOW) {
+        if (allBatching && poolUsedFrac < RAMP_UTIL_LOW && budgetHeadroom > RAMP_BUDGET_MIN) {
             rampLevel = Math.min(HACK_PCT_RAMP_MAX, rampLevel + RAMP_STEP);
         } else if (!allBatching || poolUsedFrac > RAMP_UTIL_HIGH) {
             rampLevel = Math.max(0, rampLevel - RAMP_STEP);
         }
 
-        // Share boundary (definition only; sharePhase not built yet). Once
-        // rampLevel == HACK_PCT_RAMP_MAX and needsPrep is empty, every target is
-        // hacking as hard as we allow, so the free RAM still left over —
-        //   residual = poolFree(pool) - poolTotal * (1 - BATCH_BUDGET_FRAC)
-        // (free RAM beyond the reserved prep/jitter headroom) — is the genuine
-        // share residual. A future sharePhase(ns, pool, residual) would place
-        // ns.share() workers there only when residual > 0, recomputed each tick so
-        // it yields the instant batch/prep demand (or a ramp-down) reclaims it.
+        // Share phase (idle-RAM → faction reputation). Once rampLevel is maxed and
+        // prep is clear, the free RAM still left over beyond the reserved
+        // prep/jitter headroom is genuine surplus; sharePhase feeds a fraction of it
+        // to ns.share(). Recomputed each tick so it yields the instant batch/prep
+        // demand (or a ramp-down) reclaims the RAM. Runs after batch + prep so it
+        // only ever sees what they left behind.
+        sharePhase(ns, pool, poolTotal, needsPrep, rootedHosts);
 
-        updateDisplayStats(batchers);
+        // Track the health window for the full ACTIVE set (eligible), not just the
+        // admitted batchers. A target selectBatchers excludes for budget is still
+        // active and still being hacked by its in-flight workers, so its window stays
+        // valid — and classify's next keep-test needs it. Passing only `batchers` here
+        // deleted excluded targets' windows, so their keep-test fell back to the raw
+        // trough read (low money / spiked security at high ramp), false-dropping them
+        // to re-prep and causing the admitted set to flap. See classify keep-test.
+        updateDisplayStats(eligible);
         renderStatus(ns, servers, pool, batchers, needsPrep);
 
         // Remember this tick's admitted set for next tick's admission hysteresis.
         wasBatching.clear();
         for (const t of batchers) wasBatching.add(t.hostname);
 
+        flushDebug(ns);
         await ns.sleep(LOOP_SLEEP);
     }
 }
@@ -305,9 +372,9 @@ function tryRoot(ns, host) {
     return ns.hasRootAccess(host);
 }
 
-/** Copy the three workers onto a rooted host so it can run them. */
+/** Copy the workers (HWGW + share) onto a rooted host so it can run them. */
 function provisionWorkers(ns, host) {
-    ns.scp(WORKERS, host, "home");
+    ns.scp(PLACED_WORKERS, host, "home");
 }
 
 /** Collect static / slow-changing fields for a server. */
@@ -385,11 +452,17 @@ function launchManagers(ns, servers) {
     for (const m of MANAGERS) {
         if (isRunning(ns, m.file)) {
             launchedManagers.add(m.file); // remember it's up so a later kill is detectable
+            dbg(`  mgr ${m.file}: running`);
             continue;
         }
-        if (launchedManagers.has(m.file)) continue; // was running, now gone → stopped/done
-        if (m.gate(servers)) {
+        if (launchedManagers.has(m.file)) {
+            dbg(`  mgr ${m.file}: SUPPRESSED (seen running earlier this run, now gone)`);
+            continue; // was running, now gone → stopped/done
+        }
+        const gateOpen = m.gate(servers);
+        if (gateOpen) {
             const pid = ns.exec(m.file, "home");
+            dbg(`  mgr ${m.file}: gate=open exec pid=${pid}`);
             // Only mark it accounted-for if the exec actually started a process.
             // exec() fails silently (returns 0, no exception) when home doesn't have
             // enough free RAM at that instant — e.g. right after a soft reset, before
@@ -400,6 +473,8 @@ function launchManagers(ns, servers) {
             } else {
                 ns.print(`WARN: failed to launch ${m.file} (insufficient RAM on home?) — will retry`);
             }
+        } else {
+            dbg(`  mgr ${m.file}: gate=closed`);
         }
         return; // first pending manager is the only candidate this tick
     }
@@ -510,6 +585,12 @@ function classify(ns, servers) {
                 }
             }
             // Drifted out → drop to re-prep below.
+            dbg(
+                `  classify DROP ${s.hostname}: moneyFrac=${moneyFrac.toFixed(3)} ` +
+                `(keep≥${BATCH_KEEP_MONEY_FRAC}) secOver=${secOver.toFixed(2)} ` +
+                `(keep≤${(s.minSecurity * BATCH_KEEP_SEC_FRAC).toFixed(2)}) ` +
+                `graceMs=${now - (unhealthySince.get(s.hostname) ?? now)}`
+            );
             unhealthySince.delete(s.hostname); // clear grace state
             activeBatching.delete(s.hostname);
             batchPlan.delete(s.hostname); // recompute a fresh plan on re-admission
@@ -528,6 +609,7 @@ function classify(ns, servers) {
             activeBatching.add(s.hostname);
             batchPlan.set(s.hostname, best); // lock the plan (+ ramp) for this run
             eligible.push({ ...s, chance, sec, money, ...best });
+            dbg(`  classify ADMIT-NEW ${s.hostname} (was re-prepped or fresh)`);
         }
     }
 
@@ -566,9 +648,14 @@ function isPrepped(s, sec, money) {
  *    grows the hack-% climbs back to optimal, then depth fills, then the pipeline
  *    completes and the leftover budget overflows to the next-best target.
  *
- * Hysteresis: last tick's batchers (`wasBatching`) get first claim so the active
- * set doesn't flap. Two ceilings: the RAM budget (early, RAM-limited) and
- * MAX_BATCH_TARGETS (late, lag-limited); whichever binds first wins.
+ * Hysteresis: admission walks targets in score order, but an incumbent (last tick's
+ * batcher) gets a SELECT_KEEP_BIAS score bonus for ordering only — so a marginally
+ * higher newcomer can't evict a running pipeline, while a clearly higher one still
+ * can. (An earlier two-pass "all incumbents first, then newcomers" rule let a
+ * low-score squatter like n00dles, admitted early, hold a capped slot forever and
+ * lock out higher-value servers — the set could never improve.) Two ceilings: the
+ * RAM budget (early, RAM-limited) and MAX_BATCH_TARGETS (late, lag-limited);
+ * whichever binds first wins.
  */
 function selectBatchers(ns, eligible, poolTotal) {
     const budget = poolTotal * BATCH_BUDGET_FRAC;
@@ -576,30 +663,29 @@ function selectBatchers(ns, eligible, poolTotal) {
     // matches real usage (a mismatch here would over- or under-reserve the budget).
     const concurrency = (t) => Math.ceil(t.weakenTime / BATCH_PERIOD);
 
+    // Order by score, giving incumbents a small bonus (anti-flap, anti-squat).
+    const effScore = (t) => t.score * (wasBatching.has(t.hostname) ? 1 + SELECT_KEEP_BIAS : 1);
+    const order = [...eligible].sort((a, b) => effScore(b) - effScore(a));
+
     const admitted = [];
     let used = 0;
-    // Pass 1 keeps already-batching targets; pass 2 admits new ones with whatever
-    // budget is left. Each pass walks `eligible` in its existing rank order.
-    for (const keepPass of [true, false]) {
-        for (const t of eligible) {
-            if (admitted.length >= MAX_BATCH_TARGETS) break;
-            if (wasBatching.has(t.hostname) !== keepPass) continue;
-            const remaining = budget - used;
+    for (const t of order) {
+        if (admitted.length >= MAX_BATCH_TARGETS) break;
+        const remaining = budget - used;
 
-            let entry, ramPerBatch;
-            if (remaining >= t.ramPerBatch) {
-                entry = t; // optimal batch fits → use the locked optimal plan
-                ramPerBatch = t.ramPerBatch;
-            } else {
-                const fitted = bestHackPct(ns, t, t.chance, remaining); // step down
-                if (!fitted) continue; // not even the smallest batch fits → skip
-                entry = { ...t, ...fitted, score: t.score }; // keep optimal score for rank
-                ramPerBatch = fitted.ramPerBatch;
-            }
-
-            used += Math.min(concurrency(t) * ramPerBatch, remaining);
-            admitted.push(entry);
+        let entry, ramPerBatch;
+        if (remaining >= t.ramPerBatch) {
+            entry = t; // optimal batch fits → use the locked optimal plan
+            ramPerBatch = t.ramPerBatch;
+        } else {
+            const fitted = bestHackPct(ns, t, t.chance, remaining); // step down
+            if (!fitted) continue; // not even the smallest batch fits → try the next
+            entry = { ...t, ...fitted, score: t.score }; // keep optimal score for rank
+            ramPerBatch = fitted.ramPerBatch;
         }
+
+        used += Math.min(concurrency(t) * ramPerBatch, remaining);
+        admitted.push(entry);
     }
 
     admitted.sort((a, b) => b.score - a.score); // restore global rank order
@@ -769,6 +855,72 @@ function placeThreads(ns, pool, script, ramPerThread, threads, target, delay) {
     return threads - remaining;
 }
 
+// ── RAM share ───────────────────────────────────────────────────────────────
+
+/**
+ * Feed genuinely-idle pool RAM to ns.share() for a faction-rep boost. Called after
+ * batch + prep so it only sees what they left. Gated to spend ONLY true surplus:
+ *  - paused if the manual SHARE_OFF_FLAG file exists (free fileExists read);
+ *  - otherwise only once the hack-% ramp is maxed AND prep is clear, i.e. every
+ *    target is hacking as hard as we allow and the pool still has idle RAM.
+ * Spends SHARE_BUDGET_FRAC of the residual (free RAM beyond the reserved
+ * prep/jitter headroom). Tops the share-thread count up to target each tick with
+ * single-shot 10s workers; when demand returns it launches fewer and the running
+ * workers free their RAM within ~10s, so no kill is needed. Updates the display
+ * vars (shareThreads / shareOff).
+ */
+function sharePhase(ns, pool, poolTotal, needsPrep, rootedHosts) {
+    // Paused when the flag file's content is "1" (set by /utils/share-off.js;
+    // share-on.js overwrites it with "0"). ns.read is free RAM and returns "" for a
+    // missing file, so the default (no file) reads as on. A content toggle avoids
+    // relying on ns.rm to clear the pause.
+    shareOff = ns.read(SHARE_OFF_FLAG).trim() === "1";
+    if (shareOff) { shareThreads = 0; return; }
+
+    // Gate: only spend surplus that batching/prep provably don't want.
+    if (rampLevel < HACK_PCT_RAMP_MAX || needsPrep.length > 0) {
+        shareThreads = 0;
+        return;
+    }
+
+    const residual = poolFree(pool) - poolTotal * (1 - BATCH_BUDGET_FRAC);
+    const current = countShareThreads(ns, rootedHosts);
+    if (residual <= 0) { shareThreads = current; return; }
+
+    const target = Math.floor((residual * SHARE_BUDGET_FRAC) / SHARE_RAM);
+    const toLaunch = target - current;
+    const placed = toLaunch > 0 ? placeShare(ns, pool, toLaunch) : 0;
+    shareThreads = current + placed;
+}
+
+/** Sum in-flight share-worker threads across the pool (RAM-free: ns.ps is in budget). */
+function countShareThreads(ns, rootedHosts) {
+    const file = stripSlash(SHARE_WORKER);
+    let total = 0;
+    for (const host of rootedHosts) {
+        for (const proc of ns.ps(host)) {
+            if (stripSlash(proc.filename) === file) total += proc.threads;
+        }
+    }
+    return total;
+}
+
+/** Greedily place up to `threads` share workers across the pool, largest free host
+ *  first. Mutates pool free RAM. Returns the number of threads actually placed. */
+function placeShare(ns, pool, threads) {
+    let remaining = threads;
+    for (const server of pool) {
+        if (remaining <= 0) break;
+        const fit = Math.floor(server.free / SHARE_RAM);
+        const n = Math.min(fit, remaining);
+        if (n <= 0) continue;
+        ns.exec(SHARE_WORKER, server.host, n, batchSeq++);
+        server.free -= n * SHARE_RAM;
+        remaining -= n;
+    }
+    return threads - remaining;
+}
+
 // ── Scoring (kept for stage 3b batching; not used in the 3a prep loop) ───────
 
 /**
@@ -883,6 +1035,11 @@ function renderStatus(ns, servers, pool, eligible, needsPrep) {
     const fillPct = depth > 0 ? (inFlight / depth) * 100 : 0;
     const fill = `  |  Pipeline ${inFlight}/${depth} (${fillPct.toFixed(0)}%)`;
     ns.print(`║ Batching ${eligible.length}  |  Prepping ${needsPrep.length}${ramp}${fill}  |  Est income $${ns.format.number(income)}/s`);
+    if (shareOff) {
+        ns.print("║ Share: OFF (manual stop — run /utils/share-on.js to resume)");
+    } else if (shareThreads > 0) {
+        ns.print(`║ Share: ${shareThreads} threads (${ns.format.ram(shareThreads * SHARE_RAM)})`);
+    }
     ns.print(`╠${"═".repeat(W)}`);
     ns.print(
         "║ " +

@@ -106,6 +106,17 @@ export const MAX_FIRES_PER_TICK = 2;
 /** Max number of simultaneously batched targets. */
 export const MAX_BATCH_TARGETS = 10;
 
+// Admission hysteresis. selectBatchers admits targets in score order, but gives a
+// currently-batching incumbent this fractional score bonus when ordering — so a
+// *marginally* higher-scoring newcomer can't evict a running pipeline (which would
+// waste a weaken time of in-flight workers), while a *clearly* higher one (score >
+// incumbent × (1 + this)) still can. Without it, an old two-pass "all incumbents
+// first" rule let low-value squatters (e.g. n00dles, admitted early when few targets
+// were ready) hold a capped slot forever and lock out higher-value servers, so the
+// admitted set could never improve toward the true top-MAX_BATCH_TARGETS by score.
+/** Incumbent score bonus for admission ordering (anti-flap, anti-squat). */
+export const SELECT_KEEP_BIAS = 0.05;
+
 // When the target cap is active, prep no more than (cap + this) servers at once,
 // so prep effort doesn't sprawl onto servers that won't earn a batch slot soon.
 // Inert when MAX_BATCH_TARGETS is effectively unlimited (early game).
@@ -162,6 +173,18 @@ export const RAMP_UTIL_LOW = 0.85;
  *  RAMP_UTIL_LOW..RAMP_UTIL_HIGH is the hold deadband. */
 export const RAMP_UTIL_HIGH = 0.97;
 
+/** Ramp UP also requires this much *admission-budget* headroom (1 − reserved/budget).
+ *  selectBatchers reserves the full pipeline RAM immediately, but pipelines fill
+ *  gradually, so actual pool utilization lags far behind committed budget. Without a
+ *  budget-headroom gate the ramp reads the idle (not-yet-filled) RAM and keeps pushing
+ *  hack-% up even though the budget is already fully reserved — which can't add
+ *  throughput, it just makes batches bigger and shoves the marginal target past the
+ *  budget, dropping it from the admitted set. That coupling produced a 1-tick limit
+ *  cycle (ramp 40↔42%, batchers 10↔8). Gating ramp-up on real budget headroom (≳ one
+ *  ramp step's worth) makes it settle at the highest hack-% where the full admitted
+ *  set still fits. Tune in-game. */
+export const RAMP_BUDGET_MIN = 0.05;
+
 // ── Worker scripts ─────────────────────────────────────────────────────────
 
 export const HACK_WORKER = "/workers/hack.js";
@@ -181,10 +204,39 @@ export const WORKER_RAM = {
     weakenRam: 1.75,
 };
 
+// ── RAM share (idle-RAM → faction reputation) ──────────────────────────────
+//
+// Once booster has ramped every target to HACK_PCT_RAMP_MAX and prep is clear,
+// the pool still sits on idle RAM. sharePhase feeds the genuine surplus to
+// ns.share() (a faction-rep boost while doing faction work). The surplus is the
+// share residual already defined in booster's main loop:
+//   residual = poolFree - poolTotal * (1 - BATCH_BUDGET_FRAC)
+// sharePhase spends only SHARE_BUDGET_FRAC of that, using single-shot 10s workers
+// re-topped-up each tick — so when batch/prep demand returns booster launches
+// fewer and the running workers free their RAM within ~10s (no kill). NOTE:
+// ns.share() only boosts rep WHILE you are doing faction work; otherwise the
+// cycles are wasted (but never harm the batcher). Pause it manually with
+// /utils/share-off.js (writes SHARE_OFF_FLAG).
+
+export const SHARE_WORKER = "/workers/share.js";
+
+/** share.js total RAM, GB (1.60 base + 2.40 share). Measure with `mem`. */
+export const SHARE_RAM = 4.0;
+
+/** Fraction of the share residual sharePhase will consume. <1 leaves a cushion
+ *  against the ≤10s worker-expiry lag; ns.share's sharply-diminishing per-thread
+ *  returns make this nearly as good as 1.0 anyway. Tune in-game. */
+export const SHARE_BUDGET_FRAC = 0.75;
+
+/** Presence of this file pauses sharing (manual opt-out). booster checks it with
+ *  a free fileExists read; /utils/share-off.js and share-on.js toggle it. */
+export const SHARE_OFF_FLAG = "/data/share-off.txt";
+
 // ── RAM reservation ────────────────────────────────────────────────────────
 
-/** booster's own RAM footprint, GB (its function budget — see devlog). */
-export const BOOSTER_RAM_GB = 8.2;
+/** booster's own RAM footprint, GB (its function budget — see devlog). Measured
+ *  with `mem booster.js` (8.35 at Stage 5; sharePhase added no NS calls). */
+export const BOOSTER_RAM_GB = 8.35;
 /** Extra home RAM left free as a safety buffer, GB. */
 export const HOME_SAFETY_BUFFER_GB = 2;
 
@@ -301,6 +353,15 @@ export const SERVERS_JSON = "/data/servers.json";
  *  ROI horizon. Survives aug installs (a soft reset keeps files); delete on a full
  *  BitNode reset to start the horizon history fresh. */
 export const BN_DURATIONS_JSON = "/data/bn-durations.json";
+
+// ── Diagnostics ────────────────────────────────────────────────────────────
+
+/** When true, booster appends per-tick admission/keep decisions to
+ *  BOOSTER_DEBUG_LOG (write is free RAM, so this costs booster nothing). Used to
+ *  diagnose batching flap: which targets drop, and whether classify (drift keep-
+ *  test) or selectBatchers (budget/cap) dropped them. Set false to silence. */
+export const BOOSTER_DEBUG = false;
+export const BOOSTER_DEBUG_LOG = "/data/booster-debug.txt";
 
 // ── Detection / handoff ────────────────────────────────────────────────────
 

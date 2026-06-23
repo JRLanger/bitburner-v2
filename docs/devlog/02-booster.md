@@ -22,7 +22,7 @@ home RAM). Source: `src/booster.js`, workers in `src/workers/`, tunables in
 | 3f | Live status table (tail window) | ✅ done |
 | 4 | Manager orchestration: pserver + hacknet managers, gated launch in booster | ✅ done |
 | 4 (cont.) | Contracts solver manager (`managers/contracts.js`), launched order-1 by booster | ✅ done |
-| 5 | `sharePhase` in booster: feed idle pool residual to `ns.share()` | ⬜ planned |
+| 5 | `sharePhase` in booster: feed idle pool residual to `ns.share()` (on by default, opt-out via `/utils/share-off.js`) | ✅ done |
 | 6 | Formulas.exe handoff | ⬜ **deliberately disabled** — loop is `while(true)` so it can be tested on a save that already owns Formulas.exe. Restore the `while(!fileExists(FORMULAS_EXE))` exit when moving to a fresh BN. |
 
 Key lessons captured during implementation: the NS-property RAM collision (see
