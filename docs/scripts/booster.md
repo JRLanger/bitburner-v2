@@ -97,8 +97,8 @@ The main loop (`main`) each tick:
 9. `sharePhase` — feeds the genuinely-idle pool residual to `ns.share()` for a
    faction-reputation boost. Runs *after* batch + prep so it only ever sees what they
    left. Gated to spend true surplus only: paused while the manual `SHARE_OFF_FLAG`
-   file's content is `"1"` (a free `ns.read`; `/utils/share-off.js` writes `"1"`,
-   `share-on.js` overwrites `"0"` — a content toggle avoids relying on `ns.rm`),
+   flag is set in the flag port (`/utils/share-off.js` sets it, `share-on.js` clears it;
+   the port clears on reset/reload so a pause lifts on a fresh run),
    otherwise active only once `rampLevel` is maxed
    **and** `needsPrep` is empty — i.e. every target is hacking as hard as allowed and
    the pool still has idle RAM. It spends `SHARE_BUDGET_FRAC` (0.75) of the residual
@@ -307,8 +307,9 @@ as 100 % anyway); and it uses **single-shot 10 s workers** topped up each tick r
 than long-lived ones, so reclaiming RAM needs no `ns.kill` — booster just launches
 fewer and the rest expire within ~10 s. It is **on by default** (the user accepted
 that `ns.share()` only boosts rep *while doing faction work*, so off-faction-work it
-wastes cycles but never harms hacking); `/utils/share-off.js` writes `"1"` to
-`SHARE_OFF_FLAG` to pause it and `/utils/share-on.js` overwrites `"0"` to resume. A standalone manager
+wastes cycles but never harms hacking); `/utils/share-off.js` sets the
+`SHARE_OFF_FLAG` flag in the flag port (`lib/flags.js`) to pause it and
+`/utils/share-on.js` clears it to resume. A standalone manager
 was rejected: the residual only exists inside booster's per-tick pool accounting, so
 a separate process couldn't see it without a lagging coordination file.
 
@@ -323,17 +324,20 @@ target doesn't desync the grid by failing more often — it's just lower expecte
 value per RAM, which `score` already reflects. See [History](#history) for the
 admission gate this replaced.
 
-**Manager launches retry on a failed `ns.exec`.** `launchManagers` used to mark
-a manager as accounted-for (`launchedManagers.add`) immediately after calling
-`ns.exec`, regardless of whether the exec actually started a process.
-`ns.exec` fails silently — returns `0`, no exception — when the target host
-doesn't have enough free RAM at that instant (e.g. right after an augmentation
-soft-reset restart, before `buildPool`'s manager reserve has had a tick to take
-effect). A failed launch was then indistinguishable from "the user manually
-stopped it," permanently skipping that manager for the rest of the run. Fixed
-by only adding to `launchedManagers` when `ns.exec` returns a nonzero pid;
-a failed attempt logs a `WARN` line in the tail and retries the very next tick
-instead of being silently abandoned. `nextManagerReserve`/`homeReserveExtra`
+**Manager suppression lives in the flag port; launches retry on a failed `ns.exec`.**
+The "seen running this run" set (`managersSeen`) is stored in the shared flag port
+(`lib/flags.js`), not in booster's memory. Netscript ports are wiped on game restart
+**and on aug/soft reset** (verified in-game), so the suppression
+is inherently per-run: a manager that self-completed or was stopped stays down until a
+reset clears the port, at which point the wiped pservers/hacknet rebuild — correct even
+if the booster process *survives* the reset (a survived in-memory set used to wrongly
+suppress everything; an earlier hacking-level reset-detector was deleted once the port
+made it unnecessary). `launchManagers` only records a manager as seen when `ns.exec`
+returns a nonzero pid: `ns.exec` fails silently — returns `0`, no exception — when home
+lacks free RAM at that instant (e.g. right after a reset, before `buildPool`'s manager
+reserve has had a tick to take effect). A failed launch would otherwise be
+indistinguishable from "the user manually stopped it," permanently skipping that manager;
+instead it logs a `WARN` line and retries the very next tick. `nextManagerReserve`/`homeReserveExtra`
 (walling off the next manager's RAM on home before workers can claim it) is
 the *prevention* half of this — it makes the failure rare — and the retry is
 the *safety net* for the one moment prevention can't help: the very first tick

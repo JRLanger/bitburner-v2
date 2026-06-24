@@ -326,23 +326,40 @@ restarted).
 
 Two cases must NOT trigger a relaunch: the user manually kills a manager, and a manager
 that has nothing worth buying exits on its own. The plain "not running → relaunch" rule
-would re-exec both immediately. A single in-memory mechanism handles both:
+would re-exec both immediately. A **port-backed flag** handles both:
 
-- **In-memory `launchedManagers` set.** `booster` records every manager it has seen
-  running this run. A manager that was seen running and is now gone — whether the user
-  killed it or it self-exited — is not relaunched for the rest of this `booster` run.
-  Treated as "accounted for" in the fixed-order scan, so it doesn't block later managers
-  (e.g. hacknet still launches after pserver finishes); `nextManagerReserve` skips it too,
-  so no `home` RAM is reserved for a manager that won't relaunch.
+- **`managersSeen` in the flag port** (`lib/flags.js`). `booster` records every manager it
+  has seen running this run in the shared flag port. A manager that was seen running and is
+  now gone — whether the user killed it or it self-exited — is not relaunched for the rest
+  of this run. Treated as "accounted for" in the fixed-order scan, so it doesn't block later
+  managers (e.g. hacknet still launches after pserver finishes); `nextManagerReserve` skips
+  it too, so no `home` RAM is reserved for a manager that won't relaunch.
 
-A fresh `booster` start clears the set and relaunches everything. That's exactly right for
-self-completed managers, because **an aug install (soft reset) wipes purchased servers and
-hacknet nodes** — so each run the managers must rebuild from scratch. A persistent "done"
-marker would be *wrong* here: it would stop a manager that genuinely needs to rebuild. The
-trade-off is that a manual stop only lasts until you restart `booster` (kill a manager and
-it stays dead; reload/restart resumes it) — the agreed, low-friction behavior. The cost of
-the in-memory approach is a brief relaunch-then-exit on a `booster` restart for a manager
-that's already maxed (e.g. a page reload mid-run with the fleet full) — harmless.
+Why a port and not an in-memory set: **an aug/soft reset wipes purchased servers and hacknet
+nodes**, so each run the managers must rebuild from scratch — the "seen" record must clear on
+reset. The first design kept the set in memory and assumed a soft reset always tears `booster`
+down and restarts it fresh (clearing the set). In practice a `booster` process can *survive*
+the install (it may be the script that triggered it, or the runtime restarts scripts in place),
+and then the in-memory set persisted and **wrongly suppressed every manager** — the wiped infra
+never rebuilt. An interim fix detected the reset via a hacking-level drop and cleared the caches,
+but that was extra machinery for something the engine already gives us:
+
+> **Netscript ports are wiped on game restart AND on aug/soft reset** (verified in-game).
+> So a flag stored in a port is *inherently* per-run — it survives
+> ticks and separate scripts but clears the instant the run resets, with no detection needed.
+
+Moving `managersSeen` into the flag port makes the suppression correct whether or not `booster`
+survives the reset, and let the level-detection and the `resetRunState` cache-clear be deleted
+entirely. The other per-run caches `resetRunState` used to clear now **self-heal** instead:
+`pipelines`/`activeBatching`/`batchPlan` are dropped by `classify` when a target drifts (post-
+reset money/security make every batcher drift out), ramp/share recompute from live truth, and
+**provisioning is self-healing** — `discoverAndRoot` re-`scp`s a host's workers whenever
+`fileExists` shows them missing (a reset wipes copied scripts off non-home servers), replacing
+the old `provisioned` set.
+
+The trade-off is that a manual stop now lasts until the next reset/reload (a port survives a
+plain `booster` re-exec, where the old in-memory set did not). In practice that's fine: to
+un-suppress a manually-stopped manager, reload or reset; or clear the flag port.
 
 The pserver and hacknet managers self-exit when there's nothing left worth buying (pserver:
 fleet fully maxed; hacknet: maxed, or no upgrade pays back within the fixed run horizon —
