@@ -61,6 +61,7 @@ import {
     PSERVER_PREFIX,
     HACKNET_GATE,
 } from "/config/constants.js";
+import { readFlags, writeFlags } from "/lib/flags.js";
 
 /** HWGW worker paths that must exist on home and get copied to every rooted server. */
 const WORKERS = [HACK_WORKER, GROW_WORKER, WEAKEN_WORKER];
@@ -94,20 +95,17 @@ const MANAGERS = [
 ];
 
 /**
- * Manager filenames booster has seen running during THIS run (in-memory, cleared on a
- * fresh booster start). A manager that was seen running and is now gone was either
- * stopped by the user or self-killed because it had nothing left worth buying — booster
- * will not relaunch it for the rest of this run. A fresh booster start (e.g. after an
- * aug install, which wipes pservers/hacknet nodes) clears the set, so the managers
- * relaunch and rebuild. See launchManagers.
+ * Manager-launch suppression now lives in the shared flag port (lib/flags.js) under the
+ * `managersSeen` key — a list of manager filenames booster has seen running this run. A
+ * manager that was seen running and is now gone (user-stopped or self-completed) is not
+ * relaunched. The port is wiped on aug/soft reset, so a wiped infra always rebuilds even
+ * if this booster process survives the reset — no in-memory set, no reset detection. See
+ * launchManagers / nextManagerReserve.
  */
-const launchedManagers = new Set();
+const MANAGERS_SEEN_FLAG = "managersSeen";
 
 /** Monotonic id appended to every worker exec so concurrent workers are unique. */
 let batchSeq = 0;
-
-/** Hosts we've already copied the workers onto this run (avoid re-scp each tick). */
-const provisioned = new Set();
 
 /**
  * Per-target HWGW pipeline state: target -> { committed, lastLand, depth }.
@@ -162,6 +160,17 @@ let shareOff = false;
  *  log lines from the same tick can be grouped. See BOOSTER_DEBUG in constants. */
 let debugBuf = [];
 let tickNo = 0;
+/** Last hacking level seen, to log level-ups (a prime drift suspect: the locked
+ *  plan's hack-thread count goes stale as per-thread hack fraction rises). */
+let lastHackLevel = 0;
+/** Tick-timing diagnostics. `lastTickStart` is the wall-clock time the previous
+ *  tick began; `gap` (this start − last start) is the real engine-lag signal: it
+ *  should be ≈ LOOP_SLEEP + work, so a gap far above that means the engine slept
+ *  long / lagged (too many live worker scripts), which delays op landings and is
+ *  the suspected correlated-security-spike cause. `lastWorkMs` is the previous
+ *  tick's body duration (top → just before sleep). */
+let lastTickStart = 0;
+let lastWorkMs = 0;
 /** Buffer one diagnostic line for this tick (no-op unless BOOSTER_DEBUG). */
 function dbg(line) {
     if (BOOSTER_DEBUG) debugBuf.push(line);
@@ -208,6 +217,24 @@ export async function main(ns) {
     // already own Formulas.exe.
     while (true) {
         tickNo++;
+        // Tick-timing: gap = elapsed since the previous tick began. ≈ LOOP_SLEEP +
+        // work in the healthy case; a gap far above that = engine lag (op landings
+        // delayed → the suspected correlated security spikes). lastWorkMs is the
+        // previous tick's body time. Both surface on this tick's summary line.
+        const tickStart = Date.now();
+        const tickGap = lastTickStart ? tickStart - lastTickStart : 0;
+        lastTickStart = tickStart;
+        // Log hacking-level changes: a level-up raises per-thread hack fraction, so a
+        // plan locked at admission now hacks MORE than its f while its grow still
+        // restores only the old f — a leading drift suspect. Correlate trace lines
+        // (classify) against these to see drift onset track level-ups.
+        if (BOOSTER_DEBUG) {
+            const lvl = ns.getHackingLevel();
+            if (lvl !== lastHackLevel) {
+                dbg(`T${tickNo} LEVEL ${lastHackLevel} -> ${lvl}`);
+                lastHackLevel = lvl;
+            }
+        }
         const servers = discoverAndRoot(ns);
         ns.write(SERVERS_JSON, JSON.stringify(servers, null, 2), "w");
 
@@ -236,11 +263,16 @@ export async function main(ns) {
             const elig = eligible.map((t) => t.hostname);
             const batched = new Set(batchers.map((t) => t.hostname));
             const notAdmitted = elig.filter((h) => !batched.has(h));
+            // gap≈LOOP_SLEEP+work is healthy; gap ≫ that = engine lag. SLOW marks a
+            // gap over twice LOOP_SLEEP so lag ticks are greppable and can be lined up
+            // against the correlated security spikes in the trace lines.
+            const slow = tickGap > 2 * LOOP_SLEEP ? " SLOW" : "";
             dbg(
                 `T${tickNo} elig=${eligible.length} batch=${batchers.length} ` +
                 `ramp=${Math.round(rampLevel * 100)}% ` +
                 `reserved=${ns.format.ram(reserved)}/${ns.format.ram(poolTotal * BATCH_BUDGET_FRAC)} ` +
-                `poolFree=${ns.format.ram(poolFree(pool))}`
+                `poolFree=${ns.format.ram(poolFree(pool))} ` +
+                `gap=${tickGap}ms work=${lastWorkMs}ms (sleep=${LOOP_SLEEP}ms)${slow}`
             );
             if (notAdmitted.length > 0) dbg(`  selectBatchers excluded: ${notAdmitted.join(", ")}`);
         }
@@ -310,6 +342,8 @@ export async function main(ns) {
         wasBatching.clear();
         for (const t of batchers) wasBatching.add(t.hostname);
 
+        // Record this tick's body duration for the next tick's summary line.
+        lastWorkMs = Date.now() - tickStart;
         flushDebug(ns);
         await ns.sleep(LOOP_SLEEP);
     }
@@ -345,9 +379,14 @@ function discoverAndRoot(ns) {
         }
 
         const rooted = ns.hasRootAccess(host) || tryRoot(ns, host);
-        if (rooted && !provisioned.has(host)) {
-            provisionWorkers(ns, host); // copy workers once per host
-            provisioned.add(host);
+        // Self-healing provisioning: scp the workers whenever the host is missing them,
+        // rather than tracking a "done" set in memory. An aug/soft reset wipes copied
+        // scripts from non-home servers, so checking file presence (free — fileExists is
+        // already in the RAM budget) re-provisions automatically after a reset without any
+        // cache to clear. scp copies all PLACED_WORKERS together, so HACK_WORKER's presence
+        // is a sufficient proxy for the whole set.
+        if (rooted && !ns.fileExists(HACK_WORKER, host)) {
+            provisionWorkers(ns, host);
         }
 
         result.push(gatherInfo(ns, host, rooted));
@@ -438,24 +477,29 @@ function inFlightByTarget(ns, rootedHosts) {
  * Launch managers in fixed dependency order. Each tick, find the FIRST manager that is
  * not running and hasn't already been accounted for this run, and if its gate passes,
  * exec it. A later manager is never launched until every earlier one is accounted for,
- * which makes the order "fixed." Checks ns.ps("home") (not just in-memory state) so a
+ * which makes the order "fixed." Checks ns.ps("home") (not just stored state) so a
  * booster restart never double-launches a persistent manager.
  *
- * In-memory `launchedManagers` suppresses relaunch: a manager booster saw running that
- * is now gone was either stopped by the user or self-killed (nothing worth buying), so
- * it stays down for the rest of this booster run. A fresh booster start clears the set,
- * so the managers relaunch (and, after an aug install that wipes their infra, rebuild).
- * A suppressed manager is treated as "accounted for" so the loop moves past it to later
- * managers (e.g. hacknet still launches after pserver finishes).
+ * The "seen running" set lives in the shared flag port (MANAGERS_SEEN_FLAG): a manager
+ * booster saw running that is now gone — user-stopped or self-completed (nothing worth
+ * buying) — stays down for the rest of the run. Because the port is wiped on aug/soft
+ * reset, the managers relaunch and rebuild the wiped infra automatically, even if this
+ * booster process survived the reset (no reset detection needed). A suppressed manager
+ * is treated as "accounted for" so the loop moves past it to later managers (e.g.
+ * hacknet still launches after pserver finishes).
  */
 function launchManagers(ns, servers) {
+    const flags = readFlags(ns);
+    const seen = new Set(flags[MANAGERS_SEEN_FLAG] ?? []);
+    const sizeBefore = seen.size;
+
     for (const m of MANAGERS) {
         if (isRunning(ns, m.file)) {
-            launchedManagers.add(m.file); // remember it's up so a later kill is detectable
+            seen.add(m.file); // remember it's up so a later disappearance is detectable
             dbg(`  mgr ${m.file}: running`);
             continue;
         }
-        if (launchedManagers.has(m.file)) {
+        if (seen.has(m.file)) {
             dbg(`  mgr ${m.file}: SUPPRESSED (seen running earlier this run, now gone)`);
             continue; // was running, now gone → stopped/done
         }
@@ -463,30 +507,29 @@ function launchManagers(ns, servers) {
         if (gateOpen) {
             const pid = ns.exec(m.file, "home");
             dbg(`  mgr ${m.file}: gate=open exec pid=${pid}`);
-            // Only mark it accounted-for if the exec actually started a process.
-            // exec() fails silently (returns 0, no exception) when home doesn't have
-            // enough free RAM at that instant — e.g. right after a soft reset, before
-            // the reserve has caught up. Without this check, a single failed launch
-            // was indistinguishable from "user stopped it" and was never retried.
-            if (pid !== 0) {
-                launchedManagers.add(m.file);
-            } else {
-                ns.print(`WARN: failed to launch ${m.file} (insufficient RAM on home?) — will retry`);
-            }
+            // Only mark it accounted-for if the exec actually started a process. exec()
+            // fails silently (returns 0, no exception) when home lacks free RAM at that
+            // instant — e.g. right after a reset, before the reserve has caught up.
+            // Without this check a single failed launch looked like "user stopped it".
+            if (pid !== 0) seen.add(m.file);
+            else ns.print(`WARN: failed to launch ${m.file} (insufficient RAM on home?) — will retry`);
         } else {
             dbg(`  mgr ${m.file}: gate=closed`);
         }
-        return; // first pending manager is the only candidate this tick
+        break; // first pending manager is the only candidate this tick
     }
+
+    if (seen.size !== sizeBefore) writeFlags(ns, { ...flags, [MANAGERS_SEEN_FLAG]: [...seen] });
 }
 
 /** RAM to reserve on home for the next pending manager, GB. Skips managers that are
  *  running or already accounted for (stopped/done) — none of those will be (re)launched,
  *  so reserving for them would needlessly shrink the worker pool. */
 function nextManagerReserve(ns) {
+    const seen = new Set(readFlags(ns)[MANAGERS_SEEN_FLAG] ?? []);
     for (const m of MANAGERS) {
         if (isRunning(ns, m.file)) continue;
-        if (launchedManagers.has(m.file)) continue;
+        if (seen.has(m.file)) continue;
         return m.ramGB;
     }
     return 0; // nothing left to launch → no reserve needed
@@ -570,17 +613,51 @@ function classify(ns, servers) {
                 keep = now - since < DRIFT_GRACE_MS;
             }
             if (keep) {
-                // Reuse the locked plan (don't re-optimise mid-pipeline) UNLESS
-                // the global ramp floor has moved since it was locked — then the
-                // target's hack-% target changed and the plan must be recomputed.
+                // Reuse the locked plan (don't re-optimise mid-pipeline) UNLESS the
+                // global ramp floor OR the hacking LEVEL has moved since it was locked.
+                // A level-up raises per-thread hack fraction, so the locked h steals
+                // more than the locked g restores — money settles at a stable fixed
+                // point just below max (the flat-pinned drift that re-prepped catalyst
+                // /zb-def). Recomputing h/g at the live level in place restores the
+                // balance with no destructive re-prep.
                 const locked = batchPlan.get(s.hostname);
-                const best = locked && locked.ramp === rampLevel
+                const best = locked && locked.ramp === rampLevel && locked.level === level
                     ? locked
                     : bestHackPct(ns, s, chance, Infinity, rampLevel);
                 if (best) {
                     best.ramp = rampLevel;
+                    best.level = level;
                     batchPlan.set(s.hostname, best);
                     eligible.push({ ...s, chance, sec, money, ...best });
+                    // Drift trajectory trace. Logged when the WINDOWED baseline shows
+                    // genuine drift (not the normal per-cycle oscillation, which the
+                    // window already filters), plus a sparse heartbeat for context.
+                    // `effF` = locked hack-threads × CURRENT per-thread hack fraction:
+                    // if it has crept above the locked `f`, the hack now steals more
+                    // than the locked grow restores → money drifts down. That gap
+                    // (f vs effF), tracked against the LEVEL lines, is the staleness
+                    // smoking gun. lockWt vs the live weaken time is a secondary tell.
+                    const rawM = money / s.maxMoney;
+                    const rawS = sec - s.minSecurity;
+                    if (BOOSTER_DEBUG && (moneyFrac < 0.99 || secOver > 0.3 || rawM < 0.9 || rawS > 1 || tickNo % 30 === 0)) {
+                        const effF = best.h * ns.hackAnalyze(s.hostname);
+                        const liveWt = ns.getWeakenTime(s.hostname);
+                        // pipe is last tick's state (batchPhase refills after classify):
+                        // fill = in-flight committed landings vs target depth. A fill far
+                        // below depth = pipeline still ramping (fill transient); fill ≈ depth
+                        // while money/sec drift = steady-state deep-pipeline instability.
+                        const pipe = pipelines.get(s.hostname);
+                        const fill = pipe ? `${pipe.committed.length}/${pipe.depth}` : "-";
+                        dbg(
+                            `  trace ${s.hostname} L${level} ` +
+                            `rawM=${rawM.toFixed(3)} rawS=${rawS.toFixed(2)} ` +
+                            `winM=${moneyFrac.toFixed(3)} winS=${secOver.toFixed(2)} ` +
+                            `f=${best.f.toFixed(2)} effF=${effF.toFixed(3)} h=${best.h} g=${best.g} ` +
+                            `fill=${fill} ` +
+                            `lockWt=${(best.weakenTime / 1000).toFixed(1)}s liveWt=${(liveWt / 1000).toFixed(1)}s ` +
+                            `ramp=${Math.round(best.ramp * 100)}% grace=${unhealthySince.has(s.hostname) ? now - unhealthySince.get(s.hostname) : 0}`
+                        );
+                    }
                     continue;
                 }
             }
@@ -606,8 +683,9 @@ function classify(ns, servers) {
         const best = bestHackPct(ns, s, chance, Infinity, rampLevel);
         if (best) {
             best.ramp = rampLevel;
+            best.level = level;
             activeBatching.add(s.hostname);
-            batchPlan.set(s.hostname, best); // lock the plan (+ ramp) for this run
+            batchPlan.set(s.hostname, best); // lock the plan (+ ramp + level) for this run
             eligible.push({ ...s, chance, sec, money, ...best });
             dbg(`  classify ADMIT-NEW ${s.hostname} (was re-prepped or fresh)`);
         }
@@ -743,13 +821,26 @@ function batchPhase(ns, eligible, pool) {
         // or a fresh weaken-time + safety ahead if the pipeline drained. A momentarily
         // full pool just defers the rest to a later tick (no skipped slots).
         let k = 0;
+        let deferred = false;
         while (pipe.committed.length < depth && k < MAX_FIRES_PER_TICK) {
-            if (ramPerBatch > poolFree(pool)) break;
+            if (ramPerBatch > poolFree(pool)) { deferred = true; break; }
             const land = Math.max(now + weakenTime + BATCH_SAFETY_MS, pipe.lastLand + BATCH_PERIOD);
             fireBatch(ns, pool, t, land, now, hackTime, growTime, weakenTime);
             pipe.committed.push(land);
             pipe.lastLand = land;
             k++;
+        }
+
+        // A pipeline that wanted to refill but couldn't (pool momentarily full) runs
+        // shallower than `depth`: fewer grows land per cycle than the hacks need, so
+        // money can drift down even though the locked plan is balanced. Logging the
+        // defer + the resulting under-fill separates this RAM-starvation drift cause
+        // from the plan-staleness one the classify trace captures.
+        if (BOOSTER_DEBUG && deferred) {
+            dbg(
+                `  batch ${target} DEFER: ramPerBatch=${ns.format.ram(ramPerBatch)} > ` +
+                `poolFree=${ns.format.ram(poolFree(pool))} fill=${pipe.committed.length}/${depth} fired=${k}`
+            );
         }
     }
 }
@@ -860,7 +951,7 @@ function placeThreads(ns, pool, script, ramPerThread, threads, target, delay) {
 /**
  * Feed genuinely-idle pool RAM to ns.share() for a faction-rep boost. Called after
  * batch + prep so it only sees what they left. Gated to spend ONLY true surplus:
- *  - paused if the manual SHARE_OFF_FLAG file exists (free fileExists read);
+ *  - paused if the manual SHARE_OFF_FLAG flag is set in the flag port;
  *  - otherwise only once the hack-% ramp is maxed AND prep is clear, i.e. every
  *    target is hacking as hard as we allow and the pool still has idle RAM.
  * Spends SHARE_BUDGET_FRAC of the residual (free RAM beyond the reserved
@@ -870,11 +961,10 @@ function placeThreads(ns, pool, script, ramPerThread, threads, target, delay) {
  * vars (shareThreads / shareOff).
  */
 function sharePhase(ns, pool, poolTotal, needsPrep, rootedHosts) {
-    // Paused when the flag file's content is "1" (set by /utils/share-off.js;
-    // share-on.js overwrites it with "0"). ns.read is free RAM and returns "" for a
-    // missing file, so the default (no file) reads as on. A content toggle avoids
-    // relying on ns.rm to clear the pause.
-    shareOff = ns.read(SHARE_OFF_FLAG).trim() === "1";
+    // Paused when the SHARE_OFF_FLAG flag is truthy in the flag port (set by
+    // /utils/share-off.js; share-on.js clears it). The port clears on aug/soft reset
+    // and game reload, so a manual pause naturally lifts on a fresh run.
+    shareOff = readFlags(ns)[SHARE_OFF_FLAG] === true;
     if (shareOff) { shareThreads = 0; return; }
 
     // Gate: only spend surplus that batching/prep provably don't want.

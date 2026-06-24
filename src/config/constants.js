@@ -128,7 +128,7 @@ export const PREP_LOOKAHEAD = 2;
 // absorbs the small per-cycle under-restore that otherwise lets long-pipeline
 // targets slowly drift down. Hack threads are NOT scaled. Tune in-game.
 /** Multiplier applied to all grow/weaken thread counts. */
-export const THREAD_MARGIN = 1.05;
+export const THREAD_MARGIN = 1.10;
 
 // ── Hack-percentage table ──────────────────────────────────────────────────
 
@@ -228,9 +228,11 @@ export const SHARE_RAM = 4.0;
  *  returns make this nearly as good as 1.0 anyway. Tune in-game. */
 export const SHARE_BUDGET_FRAC = 0.75;
 
-/** Presence of this file pauses sharing (manual opt-out). booster checks it with
- *  a free fileExists read; /utils/share-off.js and share-on.js toggle it. */
-export const SHARE_OFF_FLAG = "/data/share-off.txt";
+/** Flag-port key (see lib/flags.js): when truthy, sharing is manually paused.
+ *  booster reads it each tick; /utils/share-off.js and share-on.js toggle it. Lives in
+ *  the flag port (not a file), so a manual pause clears on aug/soft reset and game reload
+ *  — sharing resumes automatically on a fresh run. */
+export const SHARE_OFF_FLAG = "shareOff";
 
 // ── RAM reservation ────────────────────────────────────────────────────────
 
@@ -349,6 +351,13 @@ export const HACKNET_RAM_MULT_BASE = 1.035;
 /** Topology JSON written by booster for managers to consume. */
 export const SERVERS_JSON = "/data/servers.json";
 
+/**
+ * Netscript port holding the shared runtime flag object (see lib/flags.js). Ports
+ * are wiped on game restart AND on aug/soft reset (verified in-game), so every flag
+ * stored here is automatically per-run — no reset detection needed.
+ */
+export const FLAG_PORT = 1;
+
 /** Recorded run (aug-reset) durations + last-seen aug-reset timestamp, for hacknet's
  *  ROI horizon. Survives aug installs (a soft reset keeps files); delete on a full
  *  BitNode reset to start the horizon history fresh. */
@@ -356,11 +365,16 @@ export const BN_DURATIONS_JSON = "/data/bn-durations.json";
 
 // ── Diagnostics ────────────────────────────────────────────────────────────
 
-/** When true, booster appends per-tick admission/keep decisions to
- *  BOOSTER_DEBUG_LOG (write is free RAM, so this costs booster nothing). Used to
- *  diagnose batching flap: which targets drop, and whether classify (drift keep-
- *  test) or selectBatchers (budget/cap) dropped them. Set false to silence. */
-export const BOOSTER_DEBUG = false;
+/** When true, booster appends per-tick diagnostics to BOOSTER_DEBUG_LOG (write is
+ *  free RAM, so this costs booster nothing). Captures: per-tick admission summary;
+ *  which targets drop and whether classify (drift keep-test) or selectBatchers
+ *  (budget/cap) dropped them; hacking-LEVEL changes; per-target drift TRACE lines
+ *  (raw + windowed money/security, locked f vs current effective hack fraction, and
+ *  locked vs live weaken time — to pin drift on plan-staleness as the level rises);
+ *  and batch DEFER lines (pipeline couldn't refill because the pool was full). Trace
+ *  lines are gated to the windowed-drift case plus a sparse heartbeat, so a healthy
+ *  fleet stays quiet. Set false to silence. */
+export const BOOSTER_DEBUG = true;
 export const BOOSTER_DEBUG_LOG = "/data/booster-debug.txt";
 
 // ── Detection / handoff ────────────────────────────────────────────────────
