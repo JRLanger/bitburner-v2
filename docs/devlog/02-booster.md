@@ -23,7 +23,7 @@ home RAM). Source: `src/booster.js`, workers in `src/workers/`, tunables in
 | 4 | Manager orchestration: pserver + hacknet managers, gated launch in booster | ✅ done |
 | 4 (cont.) | Contracts solver manager (`managers/contracts.js`), launched order-1 by booster | ✅ done |
 | 5 | `sharePhase` in booster: feed idle pool residual to `ns.share()` (on by default, opt-out via `/utils/share-off.js`) | ✅ done |
-| 6 | Formulas.exe handoff | ⬜ **deliberately disabled** — loop is `while(true)` so it can be tested on a save that already owns Formulas.exe. Restore the `while(!fileExists(FORMULAS_EXE))` exit when moving to a fresh BN. |
+| 6 | Formulas.exe handoff | ✅ done — once `Formulas.exe` is owned, booster execs `orbiter.js` on home and retires. The check is at the TOP of the loop (not the loop condition) so the fleet keeps running until orbiter actually launches; if home lacks RAM it retries next tick. The Formulas-based controller is [orbiter](../scripts/orbiter.md). |
 
 Key lessons captured during implementation: the NS-property RAM collision (see
 section below), the hysteresis fix for false-drift churn, and the recovery-grow

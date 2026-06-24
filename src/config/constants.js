@@ -127,8 +127,18 @@ export const PREP_LOOKAHEAD = 2;
 // slightly past max (clamps, harmless) and weakens slightly past min, which
 // absorbs the small per-cycle under-restore that otherwise lets long-pipeline
 // targets slowly drift down. Hack threads are NOT scaled. Tune in-game.
-/** Multiplier applied to all grow/weaken thread counts. */
+/** Multiplier applied to all grow/weaken thread counts (booster). */
 export const THREAD_MARGIN = 1.10;
+
+// orbiter sizes grow with Formulas-exact growThreads, so its only job is to break
+// the deep-pipeline under-restore RATCHET (a grow lands on the money the previous
+// grow left; any sub-thread shortfall compounds down to the hack floor). Because
+// the over-grow clamps harmlessly at max, the margin only needs to EXCEED per-cycle
+// timing jitter + integer rounding — it does not compound — so a much smaller cushion
+// than booster's pre-Formulas 1.10 suffices. Tune in-game: raise if big servers still
+// ratchet down, lower toward 1.0 while they hold at ~100%.
+/** Multiplier applied to orbiter's grow/weaken thread counts (Formulas-exact base). */
+export const ORBITER_THREAD_MARGIN = 1.01;
 
 // ── Hack-percentage table ──────────────────────────────────────────────────
 
@@ -381,3 +391,13 @@ export const BOOSTER_DEBUG_LOG = "/data/booster-debug.txt";
 
 /** Presence of this file triggers handoff to the advanced controller. */
 export const FORMULAS_EXE = "Formulas.exe";
+
+/** orbiter.js — the Formulas-based mid-game controller (stage 2 of the lineage).
+ *  booster execs this and exits once Formulas.exe is owned. */
+export const ORBITER = "/orbiter.js";
+
+/** orbiter's own RAM footprint, GB (measured: `mem orbiter.js`). The Formulas API
+ *  functions are free (0 GB) — only owning Formulas.exe is required — so despite the
+ *  +2 GB ns.getServer it lands at 7.85, slightly UNDER booster's 8.35. Re-measure and
+ *  update after any change that adds/removes an NS call. */
+export const ORBITER_RAM_GB = 7.85;
