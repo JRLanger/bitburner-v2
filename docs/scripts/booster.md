@@ -74,7 +74,8 @@ The main loop (`main`) each tick:
    + safety ahead if the pipeline drained). `depth = ceil(weakenTime/BATCH_PERIOD)` is
    derived from the **stable min-security weaken time** locked in the plan, so depth is
    constant and the pipeline holds at exactly N in flight. There is **no baseline
-   fire gate, no skipped slots, and no recovery wave** (see below). The pipeline
+   fire gate, no skipped slots, and no recovery wave** (see "Why it's built this
+   way" and [History](#history) below). The pipeline
    fills gradually (≤ `MAX_FIRES_PER_TICK` per tick) so RAM use ramps over ~a weaken
    time; a momentarily full pool just defers the rest to a later tick.
 7. `prepPhase` — spends remaining RAM driving `needsPrep` targets to baseline, one
@@ -93,7 +94,20 @@ The main loop (`main`) each tick:
    at `max(score-optimal f, rampLevel)` capped at `HACK_PCT_RAMP_MAX`, so a raised
    floor pulls low-% targets up to spend the idle RAM. The plan lock stores the
    `rampLevel` it was computed at and recomputes only when the floor moves.
-9. `updateDisplayStats` / `renderStatus` — refresh the tail-window status table.
+9. `sharePhase` — feeds the genuinely-idle pool residual to `ns.share()` for a
+   faction-reputation boost. Runs *after* batch + prep so it only ever sees what they
+   left. Gated to spend true surplus only: paused while the manual `SHARE_OFF_FLAG`
+   flag is set in the flag port (`/utils/share-off.js` sets it, `share-on.js` clears it;
+   the port clears on reset/reload so a pause lifts on a fresh run),
+   otherwise active only once `rampLevel` is maxed
+   **and** `needsPrep` is empty — i.e. every target is hacking as hard as allowed and
+   the pool still has idle RAM. It spends `SHARE_BUDGET_FRAC` (0.75) of the residual
+   `poolFree − poolTotal × (1 − BATCH_BUDGET_FRAC)`, topping the in-flight
+   share-thread count (`countShareThreads`) up to that target with **single-shot 10 s
+   share workers** (`placeShare`). When batch/prep demand returns, the residual
+   shrinks, booster launches fewer, and the running workers free their RAM within
+   ~10 s — so it yields without any `ns.kill` (keeps booster at 8.2 GB).
+10. `updateDisplayStats` / `renderStatus` — refresh the tail-window status table.
    Raw money/security reads land at a random phase of each target's batch grid, so
    they oscillate (e.g. money flips between 100% and `100% − hack%`). For display
    only, `updateDisplayStats` keeps a short rolling window per batcher and
@@ -151,28 +165,22 @@ fix raises hack-% *above* the per-target peak: more money per batch at worse
 `$/GB/s`, which is a good trade when the GB are otherwise idle. A single sticky
 `rampLevel` floor (not a per-target greedy allocator) keeps the model simple,
 monotonic, and easy to reason about — raising it pulls the cheapest-to-grow targets
-up first. Anti-flap comes from three things together: the move is **gated on actual pool
-utilization** (so it never steals RAM that prep or a new target is using and yields
-the instant utilization climbs), it steps by a small `RAMP_STEP` at most once per
-tick, and the wide `RAMP_UTIL_LOW..HIGH` deadband holds it steady through the normal
-mid-cycle money/security oscillation. The plan lock keys on `rampLevel` so plans
-only recompute on a genuine floor move, preserving the no-flap admission guarantee.
-
-The signal is **pool utilization, not "prep is empty."** An earlier version gated
-ramp-up on `needsPrep` being empty, but a large rooted network almost always has a
-trickle of one server prepping, so the ramp never fired while 98% of the pool sat
-idle. Measuring real utilization (which already counts prep's RAM) fixes that: a
-one-server prep trickle barely moves utilization, so the ramp proceeds — yet a
-fresh-save bootstrap, where prep is consuming the whole small pool, reads as
-fully-used and correctly suppresses the ramp.
+up first. Anti-flap comes from three things together: the move is **gated on actual
+pool utilization** (`1 − free/total`, so it never steals RAM that prep or a new
+target is using and yields the instant utilization climbs), it steps by a small
+`RAMP_STEP` at most once per tick, and the wide `RAMP_UTIL_LOW..HIGH` deadband holds
+it steady through the normal mid-cycle money/security oscillation. The plan lock
+keys on `rampLevel` so plans only recompute on a genuine floor move, preserving the
+no-flap admission guarantee.
 
 **`HACK_PCT_RAMP_MAX` doubles as the share-residual boundary.** Capping the ramp
 (and thus every target's hack-%) at a fixed maximum means that once `rampLevel`
 reaches it and `needsPrep` is empty, every target is hacking as hard as we allow, so
 the free RAM still left over — `poolFree − poolTotal × (1 − BATCH_BUDGET_FRAC)` — is
-genuine, well-defined surplus. A future `sharePhase` can claim exactly that residual
-for `ns.share()` workers, recomputed each tick so a ramp-down or new demand reclaims
-it instantly. Only the boundary is defined for now; `sharePhase` is not yet built.
+genuine, well-defined surplus. `sharePhase` (Stage 5) claims a fraction
+(`SHARE_BUDGET_FRAC`) of exactly that residual for `ns.share()` workers, recomputed
+each tick so a ramp-down or new demand reclaims it as the running single-shot workers
+expire (~10 s).
 
 **Prep can't starve a ramping pipeline.** A pipeline fills gradually (one launch
 per `BATCH_PERIOD`, over ~a weaken time), so a freshly-admitted target's reserved
@@ -258,45 +266,26 @@ charged via `bestHackPct`). The *thread counts* stay locked (they're robust, ove
 provisioned by `THREAD_MARGIN`); only the landing *timing* must track the live level.
 
 **The scheduler is self-pacing, with no baseline fire gate — this is the central
-drift fix.** It evolved through two earlier designs, both of which the test rig
-(`src/test/batch-rig.js`, modes A/B/C) exposed as flawed:
+drift fix.** `batchPhase` tracks each target's committed future landings
+(`pipelines` map) and, each tick, fires enough new batches to refill to `depth`,
+each landing `BATCH_PERIOD` after the last committed one. Nothing is gated and
+nothing is discarded — only clean, collision-free landings are ever scheduled, so
+the pipeline holds full with zero drift. Validated in the isolated rig
+(`src/test/batch-rig.js`): iron-gym at full depth 248 held +0.00 security, ~2 ms
+landing error, 0 skipped, ~98% throughput (≈1469 fires/10 min) indefinitely. See
+[History](#history) for the two earlier scheduler designs this replaced.
 
-- *Mode A — baseline fire gate (original).* A batch only fired while the server read
-  at (near) min security, and the landing clock advanced *only on a fire*. On a deep
-  pipeline (long-`weakenTime` targets like iron-gym) security is perpetually bumped
-  by in-flight hacks/grows, so the gate was shut most of the time; while shut the
-  clock stalled while `now` ran on, until the next fire's `addW1` went negative,
-  clamped to 0, and the batch landed **late and off-grid** — breaking the H‑W1‑G‑W2
-  order so grow-security stopped being cleared and the target ran away. On iron-gym
-  the rig measured landing-error p95 ≈ 2.5 s, 71 % of landings off-optimum.
-- *Mode B — decoupled grid + skip-late.* The gate was dropped (an op fired at `now`
-  lands at `now + freshWeakenTime`, and `fireBatch` sets `addW1` from the fresh
-  weaken time, so it lands on slot regardless of current security — the gate bought
-  no correctness) and slots too stale to land on-grid were *skipped*. This fixed the
-  drift (p95 ≈ 2 ms, +0.00 security) but the skip bookkeeping wasted throughput: the
-  grid drifted ahead of itself and discarded ~⅔ of slots (rig: 502 fired vs 1111
-  skipped over 10 min, ~31 % of theoretical).
-- *Mode C — self-pacing top-up (current).* No grid to skip against: track the
-  committed future landings and each tick fire enough to refill to `depth`, each
-  landing `period` after the last. Nothing is gated, nothing is discarded. Rig on
-  iron-gym at full depth 248: +0.00 security, ~2 ms landing error, **0 skipped,
-  ~98 % throughput** (≈1469 fires/10 min) indefinitely.
-
-Two details make Mode C hold exactly N in flight: `depth = ceil(weakenTime/
+Two details make it hold exactly N in flight: `depth = ceil(weakenTime/
 BATCH_PERIOD)` comes from the **stable min-security weaken time** in the locked plan
-(using the live,
-security-inflated value would grow the depth target on a transient bump and
-overfill), while landing *times* use **fresh op-times** so each op still lands on
-slot. `committed.length` is also the live pipeline fill shown in the status table.
+(using the live, security-inflated value would grow the depth target on a
+transient bump and overfill), while landing *times* use **fresh op-times** so each
+op still lands on slot. `committed.length` is also the live pipeline fill shown in
+the status table.
 
-**Drift recovery is "drop to prep," not an off-grid corrective wave.** An earlier
-`maybeRecover` injected supplemental grow/weaken **off the grid** when a batcher
-dipped; those landings collided with the in-flight pipeline at unanticipated times,
-spiking security past the (then-present) fire gate and locking the target into the
-very runaway it was meant to fix. It was removed. A target that genuinely dips below
-the loose keep-bounds now simply drops to a clean re-prep via `classify`'s
-drift-grace logic. With the self-pacing scheduler holding targets at baseline, such
-dips are rare.
+A target that genuinely dips below the loose keep-bounds simply drops to a clean
+re-prep via `classify`'s drift-grace logic — there is no separate corrective-wave
+mechanism. With the self-pacing scheduler holding targets at baseline, such dips
+are rare.
 
 **Fill is capped per tick** (`MAX_FIRES_PER_TICK`). A target refilling a deep
 pipeline (e.g. after brief RAM starvation) would otherwise fire its entire backlog
@@ -308,38 +297,47 @@ launch every couple of ticks.
 (`placed > 0`) — otherwise a momentarily empty pool would falsely mark a target
 done instead of retrying.
 
-A **future RAM-share hook** is documented at the end of the main loop: once prep is
-clear, `excess = poolFree - poolTotal * (1 - BATCH_BUDGET_FRAC)` is the genuine
-surplus a future `sharePhase` could feed to `ns.share()` for faction-rep bonuses,
-recomputed each tick so it yields the moment hacking demand rises. Not built yet.
+**RAM share is opt-out, single-shot, and self-yielding (Stage 5).** `sharePhase`
+feeds the residual `poolFree − poolTotal × (1 − BATCH_BUDGET_FRAC)` to `ns.share()`
+once prep is clear and the ramp is maxed. Three design choices keep it from ever
+hurting the batcher: it runs **after** batch + prep (sees only leftovers); it spends
+only `SHARE_BUDGET_FRAC` (0.75) of the residual (a cushion against the worker-expiry
+lag — `ns.share()`'s sharply-diminishing per-thread returns make this nearly as good
+as 100 % anyway); and it uses **single-shot 10 s workers** topped up each tick rather
+than long-lived ones, so reclaiming RAM needs no `ns.kill` — booster just launches
+fewer and the rest expire within ~10 s. It is **on by default** (the user accepted
+that `ns.share()` only boosts rep *while doing faction work*, so off-faction-work it
+wastes cycles but never harms hacking); `/utils/share-off.js` sets the
+`SHARE_OFF_FLAG` flag in the flag port (`lib/flags.js`) to pause it and
+`/utils/share-on.js` clears it to resume. A standalone manager
+was rejected: the residual only exists inside booster's per-tick pool accounting, so
+a separate process couldn't see it without a lagging coordination file.
 
-**No hack-chance floor — trust the score.** An earlier version excluded any
-prepped target below `CHANCE_BATCH` (80% hack chance) into a separate `idle`
-bucket, shown in the status table but never attacked. This was a redundant,
-blunt gate: `bestHackPct`'s `score` already multiplies in `chance`
-(`moneyPerBatch = maxMoney × f × chance`), so a low-chance target is already
-penalized in proportion to its actual risk — it just naturally ranks low and
-only gets a `selectBatchers` slot when nothing better is competing for the RAM
-(the same philosophy as the hack-% ramp spending otherwise-idle RAM). Removing
-the gate (and the never-wired `CHANCE_FILTER` alongside it) let previously-idle
-targets batch for the first time and took measured income from ~15 b/s to ~80
-b/s on one save — confirming the gate had been suppressing real profit, not
-protecting against it. A failed hack still raises security exactly the amount
-its thread count accounts for (security cost is per-thread, not per-success),
-so a low-chance target doesn't desync the grid by failing more often — it's
-just lower expected value per RAM, which `score` already reflects.
+**No hack-chance floor — trust the score.** `bestHackPct`'s `score` already
+multiplies in `chance` (`moneyPerBatch = maxMoney × f × chance`), so a low-chance
+target is already penalized in proportion to its actual risk — it just naturally
+ranks low and only gets a `selectBatchers` slot when nothing better is competing
+for the RAM (the same philosophy as the hack-% ramp spending otherwise-idle RAM).
+A failed hack still raises security by exactly the amount its thread count
+accounts for (security cost is per-thread, not per-success), so a low-chance
+target doesn't desync the grid by failing more often — it's just lower expected
+value per RAM, which `score` already reflects. See [History](#history) for the
+admission gate this replaced.
 
-**Manager launches retry on a failed `ns.exec`.** `launchManagers` used to mark
-a manager as accounted-for (`launchedManagers.add`) immediately after calling
-`ns.exec`, regardless of whether the exec actually started a process.
-`ns.exec` fails silently — returns `0`, no exception — when the target host
-doesn't have enough free RAM at that instant (e.g. right after an augmentation
-soft-reset restart, before `buildPool`'s manager reserve has had a tick to take
-effect). A failed launch was then indistinguishable from "the user manually
-stopped it," permanently skipping that manager for the rest of the run. Fixed
-by only adding to `launchedManagers` when `ns.exec` returns a nonzero pid;
-a failed attempt logs a `WARN` line in the tail and retries the very next tick
-instead of being silently abandoned. `nextManagerReserve`/`homeReserveExtra`
+**Manager suppression lives in the flag port; launches retry on a failed `ns.exec`.**
+The "seen running this run" set (`managersSeen`) is stored in the shared flag port
+(`lib/flags.js`), not in booster's memory. Netscript ports are wiped on game restart
+**and on aug/soft reset** (verified in-game), so the suppression
+is inherently per-run: a manager that self-completed or was stopped stays down until a
+reset clears the port, at which point the wiped pservers/hacknet rebuild — correct even
+if the booster process *survives* the reset (a survived in-memory set used to wrongly
+suppress everything; an earlier hacking-level reset-detector was deleted once the port
+made it unnecessary). `launchManagers` only records a manager as seen when `ns.exec`
+returns a nonzero pid: `ns.exec` fails silently — returns `0`, no exception — when home
+lacks free RAM at that instant (e.g. right after a reset, before `buildPool`'s manager
+reserve has had a tick to take effect). A failed launch would otherwise be
+indistinguishable from "the user manually stopped it," permanently skipping that manager;
+instead it logs a `WARN` line and retries the very next tick. `nextManagerReserve`/`homeReserveExtra`
 (walling off the next manager's RAM on home before workers can claim it) is
 the *prevention* half of this — it makes the failure rare — and the retry is
 the *safety net* for the one moment prevention can't help: the very first tick
@@ -374,6 +372,76 @@ are current (see the fresh-`weakenTime` point above). A brief experiment widenin
 to 200 ms appeared to reduce drift, but that was a misdiagnosis: 200 ms only bought
 more staleness headroom before the order flipped. With the stale-time bug fixed,
 `D_GAP` returned to 100 ms for the throughput.
+
+## History
+
+Design decisions whose original code no longer exists in the script — kept for
+context on *why* the current design looks the way it does, and so a future change
+doesn't unknowingly resurrect an approach already tried and rejected.
+
+**Scheduler evolution: baseline fire gate → decoupled skip-late → self-pacing
+top-up.** The current self-pacing scheduler (see "Why it's built this way") is the
+third design, validated against the first two using the test rig
+(`src/test/batch-rig.js`, modes A/B/C):
+
+- *Mode A — baseline fire gate (original).* A batch only fired while the server
+  read at (near) min security, and the landing clock advanced *only on a fire*. On
+  a deep pipeline (long-`weakenTime` targets like iron-gym) security is perpetually
+  bumped by in-flight hacks/grows, so the gate was shut most of the time; while shut
+  the clock stalled while `now` ran on, until the next fire's `addW1` went negative,
+  clamped to 0, and the batch landed **late and off-grid** — breaking the
+  H‑W1‑G‑W2 order so grow-security stopped being cleared and the target ran away.
+  On iron-gym the rig measured landing-error p95 ≈ 2.5 s, 71% of landings
+  off-optimum.
+- *Mode B — decoupled grid + skip-late.* The gate was dropped (an op fired at `now`
+  lands at `now + freshWeakenTime`, so it lands on slot regardless of current
+  security — the gate bought no correctness) and slots too stale to land on-grid
+  were *skipped*. This fixed the drift (p95 ≈ 2 ms, +0.00 security) but the skip
+  bookkeeping wasted throughput: the grid drifted ahead of itself and discarded
+  ~⅔ of slots (rig: 502 fired vs 1111 skipped over 10 min, ~31% of theoretical).
+- *Mode C — self-pacing top-up.* Replaced both: no grid to skip against, just track
+  committed future landings and refill to `depth` each tick. This is the design
+  that shipped and is documented under "Why it's built this way."
+
+**Drift recovery used to be an off-grid corrective wave (`maybeRecover`).** An
+earlier `maybeRecover` function injected supplemental grow/weaken **off the grid**
+when a batcher dipped below health; those landings collided with the in-flight
+pipeline at unanticipated times, spiking security past the (then-present) fire gate
+and locking the target into the very runaway it was meant to fix. It was removed
+entirely, along with its `recoverClock` state. The current behavior — drop to a
+clean re-prep via `classify`'s drift-grace logic — has no separate recovery code
+path at all.
+
+**The hack-% ramp used to gate on `needsPrep` being empty, not pool utilization.**
+An earlier version raised `rampLevel` only when `needsPrep` was empty, but a large
+rooted network almost always has a trickle of one server prepping, so the ramp
+never fired while 98% of the pool sat idle. It was replaced with the current
+pool-utilization signal (`1 − free/total`, which already counts prep's RAM): a
+one-server prep trickle barely moves utilization, so the ramp proceeds, while a
+fresh-save bootstrap (prep consuming the whole small pool) correctly reads as
+fully-used and suppresses it.
+
+**`CONCURRENCY_CAP` — a per-target pipeline-depth cap, removed.** Before the
+self-pacing scheduler existed, each target's pipeline depth was capped at a flat
+`CONCURRENCY_CAP` (50) to keep deep-`weakenTime` targets shallow and self-healing —
+a drift bandaid. Once the self-pacing scheduler fixed drift at the root (rig-
+validated clean at full natural depth, e.g. iron-gym at 248), the cap's original
+purpose was gone; its only remaining job was an incidental lag valve (bounding
+concurrent worker-script count). It was removed entirely and that role handed to
+`MAX_BATCH_TARGETS` (lowered from 999 to a hand-tuned 10) instead — a single
+explicit knob for lag, rather than an implicit side effect of a depth cap that no
+longer needed to exist for correctness.
+
+**A `CHANCE_BATCH`/`CHANCE_FILTER` hack-chance floor used to gate admission,
+with an `idle` bucket for what it excluded.** Any prepped target below
+`CHANCE_BATCH` (80% hack chance) was excluded from `eligible` into a separate
+`idle` bucket, shown in the status table but never attacked; `CHANCE_FILTER`
+(50%) was defined alongside it but never actually wired into any check. Both were
+removed once it was clear the gate was redundant: `score` already accounts for
+`chance`, so excluding a target outright (rather than just letting it rank low)
+was hiding real profit, not preventing any actual risk. Removing the gate and
+folding the `idle` bucket away took measured income from ~15 b/s to ~80 b/s on one
+save.
 
 ## Alternatives considered
 

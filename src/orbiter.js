@@ -1,15 +1,26 @@
 /**
- * booster.js — early-game bootstrap hacking controller.
+ * orbiter.js — mid-game Formulas.exe hacking controller.
  *
- * The cheap "first stage" controller that runs at the start of a BitNode cycle,
- * before Formulas.exe. See docs/devlog/02-booster.md for the full design.
+ * The "second stage" of the controller lineage (booster → orbiter → station).
+ * It is a fork of booster.js with the targeting / thread-math core swapped from
+ * current-state NS getters to the Formulas API: every batch plan is computed
+ * against a HYPOTHETICAL prepped snapshot (the server at min security / max
+ * money) and the live Player, so plans stay exact regardless of the server's
+ * actual state. That exactness removes most of booster's drift-fighting machinery
+ * — no plan locking, no level/ramp re-lock, no drift grace: classify recomputes
+ * each plan from scratch every tick, so it cannot go stale as the hacking level
+ * rises. (THREAD_MARGIN is RETAINED on grow/weaken: per-batch grow exactness still
+ * compounds downward in a deep rolling pipeline, so the over-provision cushion
+ * stays — only hack threads are exact. See bestHackPct.)
  *
- * BUILD STATUS: Stage 5 — feeds idle pool RAM to ns.share() (sharePhase) on top
- * of the Stage 4 manager orchestration and the 3a–3e batcher + status table.
- * Formulas.exe handoff (stage 6) still follows.
+ * Everything else (discovery/root/provision, RAM pool, manager orchestration,
+ * the self-pacing HWGW scheduler, the share phase, and the status table) is
+ * carried over from booster unchanged. See docs/devlog/02-booster.md for the
+ * shared design and docs/scripts/orbiter.md for the Formulas swap.
  *
- * Prerequisites: the three worker scripts must already exist on home. booster
- * does NOT create them; it errors out and exits if any is missing.
+ * Prerequisites: Formulas.exe must be owned (the controller only runs while it
+ * exists) and the three worker scripts must already exist on home. orbiter does
+ * NOT create workers; it errors out and exits if any is missing.
  */
 
 import {
@@ -38,11 +49,10 @@ import {
     WEAKEN_SEC,
     GROW_SEC,
     HACK_SEC,
-    THREAD_MARGIN,
+    ORBITER_THREAD_MARGIN,
     LOOP_SLEEP,
     HOME_SAFETY_BUFFER_GB,
     FORMULAS_EXE,
-    ORBITER,
     BATCH_BUDGET_FRAC,
     MAX_FIRES_PER_TICK,
     MAX_BATCH_TARGETS,
@@ -119,15 +129,21 @@ let batchSeq = 0;
  */
 const pipelines = new Map();
 
-/** Targets currently in the batching rotation (persistent across ticks). */
+/** Targets currently in the batching rotation (persistent across ticks). Drives
+ *  the keep-hysteresis in classify: an incumbent is judged on the loose windowed
+ *  keep-bounds (not the strict prepped check) so its normal per-cycle oscillation
+ *  doesn't false-drop it to re-prep. */
 const activeBatching = new Set();
 
 /**
- * Locked batch plan per batching target: the bestHackPct result captured when the
- * target was admitted. Reused every tick while batching (never recomputed) so the
- * HWGW grid shape and its RAM footprint stay constant — recomputing each tick
- * desyncs the in-flight grid and wobbles the admission estimate, causing flap.
- * Deleted when a target drifts out and must re-prep. host -> bestHackPct result.
+ * Locked Formulas plan per batching target: host -> bestHackPct result, stamped with
+ * the hacking `level` and `ramp` it was computed at. Reused every tick while batching
+ * and recomputed (Formulas-exact) ONLY when the level or ramp changes — see lockedPlan.
+ * Unlike booster's pre-Formulas lock this needs no drift grace: the recompute is exact
+ * (growThreads), so a level-up just re-balances h/g in place with no re-prep. The lock
+ * exists purely for COST — re-sweeping ~75 hack-% steps for every eligible server every
+ * tick was ~100ms/tick of work; locking pins it to admission + level/ramp changes.
+ * Deleted when a target drifts out (classify) so re-admission recomputes fresh.
  */
 const batchPlan = new Map();
 
@@ -135,11 +151,15 @@ const batchPlan = new Map();
 const wasBatching = new Set();
 
 /**
- * Per-target timestamp (ms) when a batching target first went unhealthy (outside
- * the keep-bounds), cleared whenever it reads healthy again. Drives the drift
- * grace: a target is only dropped for re-prep once it has been continuously
- * unhealthy for DRIFT_GRACE_MS, so a brief self-healing transient (a bump-fired
- * batch landing late) doesn't trigger a destructive re-prep. host -> timestamp.
+ * Per-target timestamp (ms) when a batching target first went unhealthy (outside the
+ * windowed keep-bounds), cleared whenever it reads healthy again. Drives the drift
+ * grace: a target is dropped for re-prep only after it stays unhealthy continuously for
+ * DRIFT_GRACE_MS. Without it, a single momentary windowed dip (a SLOW engine tick or a
+ * level-up) drops a batcher instantly — cheap for a shallow target, but catastrophic for
+ * a very deep one (e.g. ecorp, depth ~2000 ⇒ weakenTime ~14 min): its in-flight grid
+ * keeps landing for the full weaken time, so it can't cleanly re-prep and flaps "on and
+ * on." host -> timestamp. (Steady state is stable via live-time scheduling + locked exact
+ * plans, so this only ever fires on genuine transients.)
  */
 const unhealthySince = new Map();
 
@@ -199,26 +219,31 @@ export async function main(ns) {
     ns.disableLog("ALL");
     ns.ui.openTail();
 
+    // Prerequisite: Formulas.exe must be owned — the entire targeting core depends
+    // on the Formulas API. (booster is the pre-Formulas controller; this one only
+    // makes sense once Formulas.exe exists.)
+    if (!ns.fileExists(FORMULAS_EXE, "home")) {
+        ns.tprint(`ERROR: ${FORMULAS_EXE} not found on home. orbiter is the Formulas`);
+        ns.tprint("stage — run booster.js until Formulas.exe is owned, then re-run orbiter.");
+        return;
+    }
+
     // Prerequisite check: all workers (HWGW + share) must exist on home.
     const missing = PLACED_WORKERS.filter((w) => !ns.fileExists(w, "home"));
     if (missing.length > 0) {
         ns.tprint(`ERROR: missing worker script(s): ${missing.join(", ")}`);
-        ns.tprint("booster does not create workers. Add them, then re-run.");
+        ns.tprint("orbiter does not create workers. Add them, then re-run.");
         return;
     }
 
     // Fresh diagnostic log per run (truncate). No-op cost when BOOSTER_DEBUG off.
     if (BOOSTER_DEBUG) {
-        ns.write(BOOSTER_DEBUG_LOG, `# booster debug log — ${new Date().toISOString()}\n`, "w");
+        ns.write(BOOSTER_DEBUG_LOG, `# orbiter debug log — ${new Date().toISOString()}\n`, "w");
     }
 
-    // Main control loop. Exits via the stage-6 handoff inside the loop: once
-    // Formulas.exe is owned, booster execs orbiter on home and returns (see below).
-    // The loop is `while (true)` rather than `while (!fileExists(FORMULAS_EXE))`
-    // because the handoff must keep the fleet running until orbiter ACTUALLY launches
-    // (home may lack RAM for a tick or two) — a bare exit condition would stop booster
-    // before orbiter started.
-    while (true) {
+    // Main control loop. Runs while Formulas.exe is owned (effectively forever once
+    // bought); the condition leaves a clean seam for a future station/SF4 handoff.
+    while (ns.fileExists(FORMULAS_EXE, "home")) {
         tickNo++;
         // Tick-timing: gap = elapsed since the previous tick began. ≈ LOOP_SLEEP +
         // work in the healthy case; a gap far above that = engine lag (op landings
@@ -238,26 +263,6 @@ export async function main(ns) {
                 lastHackLevel = lvl;
             }
         }
-
-        // Stage 6 handoff: once Formulas.exe is owned, launch the orbiter controller
-        // and retire. Checked at the top of the tick (not as the loop condition) so
-        // booster keeps the fleet running until orbiter ACTUALLY starts — if home
-        // lacks the RAM this tick, exec returns 0 and booster just retries next tick.
-        // The managers (separate processes) keep running across the swap; orbiter
-        // re-discovers and continues from the in-flight state.
-        if (ns.fileExists(FORMULAS_EXE, "home")) {
-            if (isRunning(ns, ORBITER)) {
-                ns.tprint("orbiter already running — booster retiring.");
-                return;
-            }
-            const pid = ns.exec(ORBITER, "home");
-            if (pid !== 0) {
-                ns.tprint("Formulas.exe detected — handed off to orbiter; booster retiring.");
-                return;
-            }
-            ns.print("WARN: Formulas.exe owned but orbiter launch failed (home RAM?) — will retry.");
-        }
-
         const servers = discoverAndRoot(ns);
         ns.write(SERVERS_JSON, JSON.stringify(servers, null, 2), "w");
 
@@ -269,7 +274,10 @@ export async function main(ns) {
         const pool = buildPool(ns, rootedHosts, homeReserveExtra);
         const inFlight = inFlightByTarget(ns, rootedHosts);
 
-        const { eligible, needsPrep } = classify(ns, servers);
+        // One Player snapshot per tick, fed to every Formulas call (hack %, chance,
+        // op-times, grow threads). Cheap and constant within a tick.
+        const player = ns.getPlayer();
+        const { eligible, needsPrep } = classify(ns, servers, player);
 
         // Admission control: cap the actively-batched set to what the pool can
         // sustain (full pipelines), leaving real headroom for prep. Total pool
@@ -277,7 +285,7 @@ export async function main(ns) {
         const poolTotal =
             servers.reduce((sum, s) => (s.hasRoot ? sum + s.maxRam : sum), 0) -
             HOME_SAFETY_BUFFER_GB;
-        const { batchers, reserved } = selectBatchers(ns, eligible, poolTotal);
+        const { batchers, reserved } = selectBatchers(ns, eligible, poolTotal, player);
 
         // Per-tick summary: eligible vs admitted, so a drop is attributable to either
         // classify (host absent from `eligible`) or selectBatchers (in `eligible`,
@@ -314,7 +322,7 @@ export async function main(ns) {
             batchRunningRam += (inFlight.get(t.hostname) ?? 0) * WORKER_RAM.weakenRam;
         }
         const prepFloor = Math.max(0, reserved - batchRunningRam);
-        prepPhase(ns, needsPrep, pool, inFlight, prepFloor);
+        prepPhase(ns, needsPrep, pool, inFlight, player, prepFloor);
 
         // Hack-% ramp controller (idle-RAM absorber). Move the global ramp floor
         // at most one step/tick. Two signals must BOTH say "spend more" to ramp up:
@@ -580,17 +588,22 @@ function pserverFleetBuilt(servers) {
 
 /**
  * Split viable targets into:
- *  - `eligible`: prepped targets, each with its best hack-% table row attached,
- *    sorted by score (most profitable first). No hack-chance floor — `score`
- *    already multiplies in `chance` (see bestHackPct), so a low-chance target
- *    is correctly ranked low rather than excluded outright; it only gets a
- *    batch slot if nothing better is competing for the RAM.
+ *  - `eligible`: targets with a Formulas-exact best hack-% plan attached, sorted
+ *    by score (most profitable first). No hack-chance floor — `score` already
+ *    multiplies in `chance` (see bestHackPct), so a low-chance target is correctly
+ *    ranked low rather than excluded; it only wins a batch slot if nothing better
+ *    competes for the RAM.
  *  - `needsPrep`: not yet at baseline, sorted by maxMoney (prep value first).
  *
- * The expensive hack-% table is only built for prepped eligible targets (few),
- * never for the whole network.
+ * Plans are LOCKED (see batchPlan / lockedPlan): computed once at admission and
+ * recomputed Formulas-exact only when the hacking level or ramp changes. Because the
+ * recompute is exact, a level-up just re-balances h/g in place. Incumbents are kept on a
+ * loose WINDOWED keep-test plus a DRIFT_GRACE_MS grace (see unhealthySince), so a brief
+ * desync from a SLOW tick or level-up doesn't needlessly drop a deep pipeline. Locking is
+ * purely a cost win: re-sweeping the hack-% table for every server every tick cost
+ * ~100ms/tick.
  */
-function classify(ns, servers) {
+function classify(ns, servers, player) {
     const level = ns.getHackingLevel();
     const now = Date.now();
     const eligible = [];
@@ -601,19 +614,13 @@ function classify(ns, servers) {
         const sec = ns.getServerSecurityLevel(s.hostname);
         const money = ns.getServerMoneyAvailable(s.hostname);
 
-        // Already batching: keep going unless GENUINELY drifted (loose bounds —
-        // healthy batches oscillate within each cycle).
+        // Already batching: keep going unless GENUINELY drifted (loose windowed
+        // bounds — healthy batches oscillate within each cycle). Judge drift on the
+        // grid-aligned WINDOWED baseline (peak money / floor security), not the raw
+        // instantaneous read: at high hack-% the raw money legitimately plunges to
+        // ~(1−f) of max each cycle and security momentarily spikes, so judging on
+        // those troughs would false-drop healthy targets and break their pipeline.
         if (activeBatching.has(s.hostname)) {
-            const chance = ns.hackAnalyzeChance(s.hostname);
-            // Judge drift on the grid-aligned WINDOWED baseline (peak money /
-            // floor security), not the raw instantaneous read. At high hack-% the
-            // raw money legitimately plunges to ~(1−f) of max each cycle (hack
-            // lands, money sits low until the grow lands) and security momentarily
-            // spikes — judging on those troughs false-drops healthy targets, which
-            // breaks their pipeline and snowballs into real drift. The window's
-            // peak/floor is the true baseline the status table already trusts.
-            // Chance is dropped from the keep-test: once admitted it only degrades
-            // via security, which the security-floor bound already catches.
             const { moneyFrac, secOver } = displayHealth({
                 hostname: s.hostname,
                 money,
@@ -624,9 +631,10 @@ function classify(ns, servers) {
             const healthy =
                 moneyFrac >= BATCH_KEEP_MONEY_FRAC &&
                 secOver <= s.minSecurity * BATCH_KEEP_SEC_FRAC;
-            // Drift grace: keep batching through a brief unhealthy blip (a
-            // bump-fired batch landing late self-heals in a few seconds); only
-            // drop to re-prep once unhealthy continuously past DRIFT_GRACE_MS.
+            // Drift grace: keep batching through a brief unhealthy blip (a SLOW engine
+            // tick or a level-up momentarily desyncs the windowed baseline); only drop
+            // once unhealthy continuously past DRIFT_GRACE_MS. Critical for deep targets
+            // whose multi-minute weaken time makes a needless drop very expensive.
             let keep = healthy;
             if (healthy) {
                 unhealthySince.delete(s.hostname);
@@ -636,80 +644,36 @@ function classify(ns, servers) {
                 keep = now - since < DRIFT_GRACE_MS;
             }
             if (keep) {
-                // Reuse the locked plan (don't re-optimise mid-pipeline) UNLESS the
-                // global ramp floor OR the hacking LEVEL has moved since it was locked.
-                // A level-up raises per-thread hack fraction, so the locked h steals
-                // more than the locked g restores — money settles at a stable fixed
-                // point just below max (the flat-pinned drift that re-prepped catalyst
-                // /zb-def). Recomputing h/g at the live level in place restores the
-                // balance with no destructive re-prep.
-                const locked = batchPlan.get(s.hostname);
-                const best = locked && locked.ramp === rampLevel && locked.level === level
-                    ? locked
-                    : bestHackPct(ns, s, chance, Infinity, rampLevel);
+                const best = lockedPlan(ns, s, player, level);
                 if (best) {
-                    best.ramp = rampLevel;
-                    best.level = level;
-                    batchPlan.set(s.hostname, best);
-                    eligible.push({ ...s, chance, sec, money, ...best });
-                    // Drift trajectory trace. Logged when the WINDOWED baseline shows
-                    // genuine drift (not the normal per-cycle oscillation, which the
-                    // window already filters), plus a sparse heartbeat for context.
-                    // `effF` = locked hack-threads × CURRENT per-thread hack fraction:
-                    // if it has crept above the locked `f`, the hack now steals more
-                    // than the locked grow restores → money drifts down. That gap
-                    // (f vs effF), tracked against the LEVEL lines, is the staleness
-                    // smoking gun. lockWt vs the live weaken time is a secondary tell.
-                    const rawM = money / s.maxMoney;
-                    const rawS = sec - s.minSecurity;
-                    if (BOOSTER_DEBUG && (moneyFrac < 0.99 || secOver > 0.3 || rawM < 0.9 || rawS > 1 || tickNo % 30 === 0)) {
-                        const effF = best.h * ns.hackAnalyze(s.hostname);
-                        const liveWt = ns.getWeakenTime(s.hostname);
-                        // pipe is last tick's state (batchPhase refills after classify):
-                        // fill = in-flight committed landings vs target depth. A fill far
-                        // below depth = pipeline still ramping (fill transient); fill ≈ depth
-                        // while money/sec drift = steady-state deep-pipeline instability.
-                        const pipe = pipelines.get(s.hostname);
-                        const fill = pipe ? `${pipe.committed.length}/${pipe.depth}` : "-";
-                        dbg(
-                            `  trace ${s.hostname} L${level} ` +
-                            `rawM=${rawM.toFixed(3)} rawS=${rawS.toFixed(2)} ` +
-                            `winM=${moneyFrac.toFixed(3)} winS=${secOver.toFixed(2)} ` +
-                            `f=${best.f.toFixed(2)} effF=${effF.toFixed(3)} h=${best.h} g=${best.g} ` +
-                            `fill=${fill} ` +
-                            `lockWt=${(best.weakenTime / 1000).toFixed(1)}s liveWt=${(liveWt / 1000).toFixed(1)}s ` +
-                            `ramp=${Math.round(best.ramp * 100)}% grace=${unhealthySince.has(s.hostname) ? now - unhealthySince.get(s.hostname) : 0}`
-                        );
-                    }
+                    eligible.push({ ...s, sec, money, ...best });
                     continue;
                 }
+            } else {
+                // Genuinely drifted (unhealthy past the grace window) → drop to re-prep.
+                dbg(
+                    `  classify DROP ${s.hostname}: moneyFrac=${moneyFrac.toFixed(3)} ` +
+                    `(keep≥${BATCH_KEEP_MONEY_FRAC}) secOver=${secOver.toFixed(2)} ` +
+                    `(keep≤${(s.minSecurity * BATCH_KEEP_SEC_FRAC).toFixed(2)}) ` +
+                    `graceMs=${now - (unhealthySince.get(s.hostname) ?? now)}`
+                );
+                unhealthySince.delete(s.hostname);  // clear grace state
+                activeBatching.delete(s.hostname);
+                batchPlan.delete(s.hostname);  // recompute a fresh plan on re-admission
+                pipelines.delete(s.hostname);  // re-anchor the pipeline on re-admission
             }
-            // Drifted out → drop to re-prep below.
-            dbg(
-                `  classify DROP ${s.hostname}: moneyFrac=${moneyFrac.toFixed(3)} ` +
-                `(keep≥${BATCH_KEEP_MONEY_FRAC}) secOver=${secOver.toFixed(2)} ` +
-                `(keep≤${(s.minSecurity * BATCH_KEEP_SEC_FRAC).toFixed(2)}) ` +
-                `graceMs=${now - (unhealthySince.get(s.hostname) ?? now)}`
-            );
-            unhealthySince.delete(s.hostname); // clear grace state
-            activeBatching.delete(s.hostname);
-            batchPlan.delete(s.hostname); // recompute a fresh plan on re-admission
-            pipelines.delete(s.hostname); // re-anchor the pipeline on re-admission
         }
 
-        // Not batching: STRICT prepped check to start (ensures table accuracy).
+        // Not batching: STRICT prepped check before admitting, so the first batches
+        // land on a true baseline.
         if (!isPrepped(s, sec, money)) {
             needsPrep.push({ ...s, sec, money });
             continue;
         }
-        const chance = ns.hackAnalyzeChance(s.hostname);
-        const best = bestHackPct(ns, s, chance, Infinity, rampLevel);
+        const best = lockedPlan(ns, s, player, level);
         if (best) {
-            best.ramp = rampLevel;
-            best.level = level;
             activeBatching.add(s.hostname);
-            batchPlan.set(s.hostname, best); // lock the plan (+ ramp + level) for this run
-            eligible.push({ ...s, chance, sec, money, ...best });
+            eligible.push({ ...s, sec, money, ...best });
             dbg(`  classify ADMIT-NEW ${s.hostname} (was re-prepped or fresh)`);
         }
     }
@@ -758,7 +722,7 @@ function isPrepped(s, sec, money) {
  * RAM budget (early, RAM-limited) and MAX_BATCH_TARGETS (late, lag-limited);
  * whichever binds first wins.
  */
-function selectBatchers(ns, eligible, poolTotal) {
+function selectBatchers(ns, eligible, poolTotal, player) {
     const budget = poolTotal * BATCH_BUDGET_FRAC;
     // Reserve the same full-pipeline depth batchPhase actually runs, so the estimate
     // matches real usage (a mismatch here would over- or under-reserve the budget).
@@ -779,7 +743,7 @@ function selectBatchers(ns, eligible, poolTotal) {
             entry = t; // optimal batch fits → use the locked optimal plan
             ramPerBatch = t.ramPerBatch;
         } else {
-            const fitted = bestHackPct(ns, t, t.chance, remaining); // step down
+            const fitted = bestHackPct(ns, t, player, remaining); // step down
             if (!fitted) continue; // not even the smallest batch fits → try the next
             entry = { ...t, ...fitted, score: t.score }; // keep optimal score for rank
             ramPerBatch = fitted.ramPerBatch;
@@ -804,14 +768,16 @@ function selectBatchers(ns, eligible, poolTotal) {
  * clean, collision-free landings are ever scheduled, so the pipeline holds full
  * with zero drift.
  *
- * Cadence and depth are derived from the STABLE min-security weaken time locked in
- * the plan (`t.weakenTime`), so the depth target is constant and the pipeline holds
- * at exactly N in flight; using the live (security-inflated) weaken time here would
- * grow the target on a transient bump and overfill. Landing *times*, however, use
- * FRESH op-times (current security) so each op lands exactly on its slot regardless
- * of security — see fireBatch. Validated in the isolated rig (src/test/batch-rig.js,
- * Mode C on iron-gym at full depth): +0.00 security, ~2ms landing error, ~full
- * throughput indefinitely.
+ * DEPTH is derived from the STABLE prepped-snapshot weaken time carried in the plan
+ * (`t.weakenTime`, min security), so the pipeline target stays constant and never
+ * overfills on a transient security bump. LANDING TIMES, however, use FRESH live
+ * op-times (current security) so each op lands exactly on its slot regardless of
+ * security — see fireBatch. (An earlier version scheduled with the prepped plan
+ * times too; whenever the live server sat above min that delayed each weaken ~4× more
+ * than its hack, so counter-weakens fell behind and the grid ran away. Live times
+ * match booster's proven scheduler.) Validated in the isolated rig (src/test/
+ * batch-rig.js, Mode C on iron-gym at full depth): +0.00 security, ~2ms landing
+ * error, ~full throughput indefinitely.
  */
 function batchPhase(ns, eligible, pool) {
     const now = Date.now();
@@ -820,12 +786,19 @@ function batchPhase(ns, eligible, pool) {
         const target = t.hostname;
         const ramPerBatch = t.ramPerBatch;
 
-        // In-flight depth = a full pipeline at BATCH_PERIOD spacing, from the stable
-        // plan weaken time (constant depth, no overfill on a transient security bump).
-        // Lag is governed by MAX_BATCH_TARGETS (number of targets), not per-target depth.
+        // Depth comes from the STABLE plan weaken time (prepped, min security) so the
+        // pipeline target doesn't wobble as live security oscillates. Lag is governed
+        // by MAX_BATCH_TARGETS (number of targets), not per-target depth.
         const depth = Math.ceil(t.weakenTime / BATCH_PERIOD);
 
-        // Fresh op-times for landing math (see fireBatch).
+        // LANDING math uses LIVE op-times (current security), NOT the prepped plan
+        // times. An op lands at base + (actualTime − scheduledTime); if we scheduled
+        // with the min-security plan times while the server sits even slightly above
+        // min, weaken (4× hack's duration) is delayed ~4× more than its paired hack,
+        // so the counter-weaken falls behind, security creeps, and the grid runs away
+        // (observed: money draining at sec 0, or sec spiking to +3 at full money).
+        // Reading live times here keeps each op on its slot regardless of security —
+        // this matches booster's proven scheduler.
         const weakenTime = ns.getWeakenTime(target);
         const growTime = ns.getGrowTime(target);
         const hackTime = ns.getHackTime(target);
@@ -895,7 +868,7 @@ function fireBatch(ns, pool, t, base, now, hackTime, growTime, weakenTime) {
  * valuable first, one corrective wave per target at a time (skip targets that
  * already have workers in flight).
  */
-function prepPhase(ns, needsPrep, pool, inFlight, prepFloor = 0) {
+function prepPhase(ns, needsPrep, pool, inFlight, player, prepFloor = 0) {
     // Breadth guard: when the batch cap is active, don't prep more servers than
     // could earn a slot soon (cap + lookahead). needsPrep is easiest-first, so
     // this preps the cheapest candidates. Inert when MAX_BATCH_TARGETS is large.
@@ -908,7 +881,7 @@ function prepPhase(ns, needsPrep, pool, inFlight, prepFloor = 0) {
         // that RAM belongs to ramping pipelines, not prep.
         if (poolFree(pool) <= prepFloor) break;
         if ((inFlight.get(t.hostname) ?? 0) > 0) continue; // wave already running
-        prepWave(ns, t, pool, poolFree(pool) - prepFloor);
+        prepWave(ns, t, pool, player, poolFree(pool) - prepFloor);
     }
 }
 
@@ -923,11 +896,11 @@ function prepPhase(ns, needsPrep, pool, inFlight, prepFloor = 0) {
  * blow past the prep floor (and into the batchers' reserved RAM). A wave that
  * doesn't fully fit just makes partial progress and finishes on later ticks.
  */
-function prepWave(ns, t, pool, ramBudget = Infinity) {
+function prepWave(ns, t, pool, player, ramBudget = Infinity) {
     const target = t.hostname;
 
     if (t.sec > t.minSecurity * (1 + SEC_MARGIN)) {
-        let need = Math.ceil((t.sec - t.minSecurity) / WEAKEN_SEC * THREAD_MARGIN);
+        let need = Math.ceil((t.sec - t.minSecurity) / WEAKEN_SEC * ORBITER_THREAD_MARGIN);
         need = Math.min(need, Math.floor(ramBudget / WORKER_RAM.weakenRam));
         const placed = placeThreads(ns, pool, WEAKEN_WORKER, WORKER_RAM.weakenRam, need, target, 0);
         // Only count this wave as handled if weaken threads actually landed; if
@@ -936,14 +909,15 @@ function prepWave(ns, t, pool, ramBudget = Infinity) {
         if (placed > 0) return;
     }
 
-    // Security is fine; restore money. Cap grow to the budget, leaving a little for
-    // the counter-weaken (~1 weaken per 12.5 grow, so the grow share dominates).
-    const mult = t.maxMoney / Math.max(t.money, 1);
-    let growNeed = Math.ceil(ns.growthAnalyze(target, mult) * THREAD_MARGIN);
+    // Security is fine; restore money via Formulas-exact growThreads on the live state,
+    // over-provisioned by THREAD_MARGIN (same anti-under-restore cushion as batching).
+    // Cap grow to the budget, leaving a little for the counter-weaken.
+    const snap = ns.getServer(target); // live money/security
+    let growNeed = Math.ceil(ns.formulas.hacking.growThreads(snap, player, t.maxMoney) * ORBITER_THREAD_MARGIN);
     growNeed = Math.min(growNeed, Math.floor((ramBudget * 0.9) / WORKER_RAM.growRam));
     const placed = placeThreads(ns, pool, GROW_WORKER, WORKER_RAM.growRam, growNeed, target, 0);
     if (placed > 0) {
-        const counter = Math.ceil((placed * GROW_SEC) / WEAKEN_SEC * THREAD_MARGIN);
+        const counter = Math.ceil((placed * GROW_SEC) / WEAKEN_SEC * ORBITER_THREAD_MARGIN);
         placeThreads(ns, pool, WEAKEN_WORKER, WORKER_RAM.weakenRam, counter, target, 0);
     }
 }
@@ -1034,47 +1008,94 @@ function placeShare(ns, pool, threads) {
     return threads - remaining;
 }
 
-// ── Scoring (kept for stage 3b batching; not used in the 3a prep loop) ───────
+// ── Scoring (Formulas-exact) ─────────────────────────────────────────────────
+
+/**
+ * Return the locked plan for a target, recomputing it (Formulas-exact) only when the
+ * hacking `level` or the global `rampLevel` differs from the stamp on the cached plan.
+ * This is the cost lock: between level-ups it returns the cached plan with zero NS
+ * calls, instead of re-sweeping the hack-% table for every batcher every tick. The
+ * recompute is exact, so a level change just re-balances h/g with no drift/re-prep.
+ */
+function lockedPlan(ns, s, player, level) {
+    const cached = batchPlan.get(s.hostname);
+    if (cached && cached.level === level && cached.ramp === rampLevel) return cached;
+    const best = bestHackPct(ns, s, player, Infinity, rampLevel);
+    if (best) {
+        best.level = level;
+        best.ramp = rampLevel;
+        batchPlan.set(s.hostname, best);
+    }
+    return best;
+}
+
+/** Build a HYPOTHETICAL prepped Server snapshot — the target at min security and
+ *  max money — so the Formulas calls return the exact baseline numbers a batch
+ *  will actually see, regardless of the server's live state. This is the whole
+ *  reason orbiter needs no prep-before-plan and never drifts on a level-up. */
+function preppedSnapshot(ns, host) {
+    const snap = ns.getServer(host);
+    snap.hackDifficulty = snap.minDifficulty; // baseline security
+    snap.moneyAvailable = snap.moneyMax;      // baseline money
+    return snap;
+}
 
 /**
  * Sweep hack fractions and return the row with the best score ($/GB/s) whose
  * single-batch RAM is ≤ `ramCap`. With the default (Infinity) this is the global
  * optimum. With a finite cap it's the best batch that *fits* — used to step the
- * hack-% down on a small pool so a target can still batch (a single optimal batch
- * may not fit early, when low hacking level makes weakenTime long and batches
- * large). Returns null if not even the smallest (1%) batch fits the cap.
+ * hack-% down on a small pool so a target can still batch.
  *
- * The fitted choice is stable tick-to-tick: `chance` is a common factor across all
- * f, so it never changes which f wins — only hackFrac/weakenTime/ramPerBatch (all
- * stable for a given hacking level) and the cap do. All NS calls here are free RAM.
+ * Formulas-exact: hack thread counts and op-times come from a prepped snapshot +
+ * the live Player, so they are correct even when the live server is off baseline
+ * and stay correct as the hacking level rises (recomputed every tick).
+ *
+ * Grow + the counter-weakens ARE still over-provisioned by THREAD_MARGIN. Although
+ * growThreads is exact for a single batch starting at maxMoney*(1-f), a deep rolling
+ * pipeline (depth = weakenTime/BATCH_PERIOD, hundreds on big servers) lands each grow
+ * on the money the PREVIOUS grow left, not on a clean maxMoney*(1-f) — so any sub-thread
+ * shortfall compounds geometrically and ratchets money down to the (1-f) hack floor
+ * (observed: zb-def/4sigma pinned at ~0.25 while security stayed at min). The margin's
+ * slight over-grow clamps harmlessly at max and breaks that ratchet. Hack threads stay
+ * exact (never scaled). Returns null if hackPercent is 0 or no batch fits the cap.
+ * The returned plan carries the op-times (weakenTime/growTime/hackTime) and
+ * `chance` so batchPhase needs no further NS calls.
  */
-function bestHackPct(ns, server, chance, ramCap = Infinity, floor = 0) {
-    const target = server.hostname;
-    const hackFrac = ns.hackAnalyze(target);
+function bestHackPct(ns, server, player, ramCap = Infinity, floor = 0) {
+    const snap = preppedSnapshot(ns, server.hostname);
+    const fm = ns.formulas.hacking;
+
+    const hackFrac = fm.hackPercent(snap, player); // fraction stolen per thread
     if (hackFrac <= 0) return null;
 
-    const weakenTime = ns.getWeakenTime(target);
-    let best = null;
+    const chance = fm.hackChance(snap, player);
+    const weakenTime = fm.weakenTime(snap, player);
+    const growTime = fm.growTime(snap, player);
+    const hackTime = fm.hackTime(snap, player);
+    const maxMoney = snap.moneyMax;
 
+    let best = null;
     // The ramp floor raises the search's lower bound (spend idle RAM at higher
-    // hack-%); HACK_PCT_RAMP_MAX caps the upper bound so no target ever exceeds
-    // the share-residual boundary. ramCap (small-pool step-down) is applied per
-    // candidate below and wins over the floor — a batch must always fit.
+    // hack-%); HACK_PCT_RAMP_MAX caps the upper bound so no target ever exceeds the
+    // share-residual boundary. ramCap (small-pool step-down) is applied per candidate.
     const lo = Math.max(HACK_PCT_MIN, floor);
     const hi = Math.min(HACK_PCT_MAX, HACK_PCT_RAMP_MAX);
     for (let f = lo; f <= hi + 1e-9; f += HACK_PCT_STEP) {
         const h = Math.ceil(f / hackFrac);
-        // Over-provision grow/weaken (not hack) to absorb per-cycle drift.
-        const g = Math.ceil(ns.growthAnalyze(target, 1 / (1 - f)) * THREAD_MARGIN);
-        const w1 = Math.ceil((h * HACK_SEC) / WEAKEN_SEC * THREAD_MARGIN);
-        const w2 = Math.ceil((g * GROW_SEC) / WEAKEN_SEC * THREAD_MARGIN);
+        // Grow restores the f fraction the hack stole: start at maxMoney*(1−f), target
+        // maxMoney, both at min security (HWGW weakens before the grow lands). Over-
+        // provision by THREAD_MARGIN to break the deep-pipeline under-restore ratchet.
+        snap.moneyAvailable = maxMoney * (1 - f);
+        const g = Math.ceil(fm.growThreads(snap, player, maxMoney) * ORBITER_THREAD_MARGIN);
+        const w1 = Math.ceil((h * HACK_SEC) / WEAKEN_SEC * ORBITER_THREAD_MARGIN); // counter hack sec
+        const w2 = Math.ceil((g * GROW_SEC) / WEAKEN_SEC * ORBITER_THREAD_MARGIN); // counter grow sec
         const ramPerBatch =
             h * WORKER_RAM.hackRam + g * WORKER_RAM.growRam + (w1 + w2) * WORKER_RAM.weakenRam;
         if (ramPerBatch > ramCap) continue; // batch too big for the available RAM
-        const moneyPerBatch = server.maxMoney * f * chance;
+        const moneyPerBatch = maxMoney * f * chance;
         const score = moneyPerBatch / (weakenTime * ramPerBatch);
         if (!best || score > best.score) {
-            best = { f, h, g, w1, w2, ramPerBatch, weakenTime, score };
+            best = { f, h, g, w1, w2, ramPerBatch, weakenTime, growTime, hackTime, chance, score };
         }
     }
     return best;

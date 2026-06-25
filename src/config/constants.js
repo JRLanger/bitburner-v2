@@ -106,6 +106,17 @@ export const MAX_FIRES_PER_TICK = 2;
 /** Max number of simultaneously batched targets. */
 export const MAX_BATCH_TARGETS = 10;
 
+// Admission hysteresis. selectBatchers admits targets in score order, but gives a
+// currently-batching incumbent this fractional score bonus when ordering — so a
+// *marginally* higher-scoring newcomer can't evict a running pipeline (which would
+// waste a weaken time of in-flight workers), while a *clearly* higher one (score >
+// incumbent × (1 + this)) still can. Without it, an old two-pass "all incumbents
+// first" rule let low-value squatters (e.g. n00dles, admitted early when few targets
+// were ready) hold a capped slot forever and lock out higher-value servers, so the
+// admitted set could never improve toward the true top-MAX_BATCH_TARGETS by score.
+/** Incumbent score bonus for admission ordering (anti-flap, anti-squat). */
+export const SELECT_KEEP_BIAS = 0.05;
+
 // When the target cap is active, prep no more than (cap + this) servers at once,
 // so prep effort doesn't sprawl onto servers that won't earn a batch slot soon.
 // Inert when MAX_BATCH_TARGETS is effectively unlimited (early game).
@@ -116,8 +127,18 @@ export const PREP_LOOKAHEAD = 2;
 // slightly past max (clamps, harmless) and weakens slightly past min, which
 // absorbs the small per-cycle under-restore that otherwise lets long-pipeline
 // targets slowly drift down. Hack threads are NOT scaled. Tune in-game.
-/** Multiplier applied to all grow/weaken thread counts. */
-export const THREAD_MARGIN = 1.05;
+/** Multiplier applied to all grow/weaken thread counts (booster). */
+export const THREAD_MARGIN = 1.10;
+
+// orbiter sizes grow with Formulas-exact growThreads, so its only job is to break
+// the deep-pipeline under-restore RATCHET (a grow lands on the money the previous
+// grow left; any sub-thread shortfall compounds down to the hack floor). Because
+// the over-grow clamps harmlessly at max, the margin only needs to EXCEED per-cycle
+// timing jitter + integer rounding — it does not compound — so a much smaller cushion
+// than booster's pre-Formulas 1.10 suffices. Tune in-game: raise if big servers still
+// ratchet down, lower toward 1.0 while they hold at ~100%.
+/** Multiplier applied to orbiter's grow/weaken thread counts (Formulas-exact base). */
+export const ORBITER_THREAD_MARGIN = 1.01;
 
 // ── Hack-percentage table ──────────────────────────────────────────────────
 
@@ -162,6 +183,18 @@ export const RAMP_UTIL_LOW = 0.85;
  *  RAMP_UTIL_LOW..RAMP_UTIL_HIGH is the hold deadband. */
 export const RAMP_UTIL_HIGH = 0.97;
 
+/** Ramp UP also requires this much *admission-budget* headroom (1 − reserved/budget).
+ *  selectBatchers reserves the full pipeline RAM immediately, but pipelines fill
+ *  gradually, so actual pool utilization lags far behind committed budget. Without a
+ *  budget-headroom gate the ramp reads the idle (not-yet-filled) RAM and keeps pushing
+ *  hack-% up even though the budget is already fully reserved — which can't add
+ *  throughput, it just makes batches bigger and shoves the marginal target past the
+ *  budget, dropping it from the admitted set. That coupling produced a 1-tick limit
+ *  cycle (ramp 40↔42%, batchers 10↔8). Gating ramp-up on real budget headroom (≳ one
+ *  ramp step's worth) makes it settle at the highest hack-% where the full admitted
+ *  set still fits. Tune in-game. */
+export const RAMP_BUDGET_MIN = 0.05;
+
 // ── Worker scripts ─────────────────────────────────────────────────────────
 
 export const HACK_WORKER = "/workers/hack.js";
@@ -181,10 +214,41 @@ export const WORKER_RAM = {
     weakenRam: 1.75,
 };
 
+// ── RAM share (idle-RAM → faction reputation) ──────────────────────────────
+//
+// Once booster has ramped every target to HACK_PCT_RAMP_MAX and prep is clear,
+// the pool still sits on idle RAM. sharePhase feeds the genuine surplus to
+// ns.share() (a faction-rep boost while doing faction work). The surplus is the
+// share residual already defined in booster's main loop:
+//   residual = poolFree - poolTotal * (1 - BATCH_BUDGET_FRAC)
+// sharePhase spends only SHARE_BUDGET_FRAC of that, using single-shot 10s workers
+// re-topped-up each tick — so when batch/prep demand returns booster launches
+// fewer and the running workers free their RAM within ~10s (no kill). NOTE:
+// ns.share() only boosts rep WHILE you are doing faction work; otherwise the
+// cycles are wasted (but never harm the batcher). Pause it manually with
+// /utils/share-off.js (writes SHARE_OFF_FLAG).
+
+export const SHARE_WORKER = "/workers/share.js";
+
+/** share.js total RAM, GB (1.60 base + 2.40 share). Measure with `mem`. */
+export const SHARE_RAM = 4.0;
+
+/** Fraction of the share residual sharePhase will consume. <1 leaves a cushion
+ *  against the ≤10s worker-expiry lag; ns.share's sharply-diminishing per-thread
+ *  returns make this nearly as good as 1.0 anyway. Tune in-game. */
+export const SHARE_BUDGET_FRAC = 0.75;
+
+/** Flag-port key (see lib/flags.js): when truthy, sharing is manually paused.
+ *  booster reads it each tick; /utils/share-off.js and share-on.js toggle it. Lives in
+ *  the flag port (not a file), so a manual pause clears on aug/soft reset and game reload
+ *  — sharing resumes automatically on a fresh run. */
+export const SHARE_OFF_FLAG = "shareOff";
+
 // ── RAM reservation ────────────────────────────────────────────────────────
 
-/** booster's own RAM footprint, GB (its function budget — see devlog). */
-export const BOOSTER_RAM_GB = 8.2;
+/** booster's own RAM footprint, GB (its function budget — see devlog). Measured
+ *  with `mem booster.js` (8.35 at Stage 5; sharePhase added no NS calls). */
+export const BOOSTER_RAM_GB = 8.35;
 /** Extra home RAM left free as a safety buffer, GB. */
 export const HOME_SAFETY_BUFFER_GB = 2;
 
@@ -297,12 +361,43 @@ export const HACKNET_RAM_MULT_BASE = 1.035;
 /** Topology JSON written by booster for managers to consume. */
 export const SERVERS_JSON = "/data/servers.json";
 
+/**
+ * Netscript port holding the shared runtime flag object (see lib/flags.js). Ports
+ * are wiped on game restart AND on aug/soft reset (verified in-game), so every flag
+ * stored here is automatically per-run — no reset detection needed.
+ */
+export const FLAG_PORT = 1;
+
 /** Recorded run (aug-reset) durations + last-seen aug-reset timestamp, for hacknet's
  *  ROI horizon. Survives aug installs (a soft reset keeps files); delete on a full
  *  BitNode reset to start the horizon history fresh. */
 export const BN_DURATIONS_JSON = "/data/bn-durations.json";
 
+// ── Diagnostics ────────────────────────────────────────────────────────────
+
+/** When true, booster appends per-tick diagnostics to BOOSTER_DEBUG_LOG (write is
+ *  free RAM, so this costs booster nothing). Captures: per-tick admission summary;
+ *  which targets drop and whether classify (drift keep-test) or selectBatchers
+ *  (budget/cap) dropped them; hacking-LEVEL changes; per-target drift TRACE lines
+ *  (raw + windowed money/security, locked f vs current effective hack fraction, and
+ *  locked vs live weaken time — to pin drift on plan-staleness as the level rises);
+ *  and batch DEFER lines (pipeline couldn't refill because the pool was full). Trace
+ *  lines are gated to the windowed-drift case plus a sparse heartbeat, so a healthy
+ *  fleet stays quiet. Set false to silence. */
+export const BOOSTER_DEBUG = true;
+export const BOOSTER_DEBUG_LOG = "/data/booster-debug.txt";
+
 // ── Detection / handoff ────────────────────────────────────────────────────
 
 /** Presence of this file triggers handoff to the advanced controller. */
 export const FORMULAS_EXE = "Formulas.exe";
+
+/** orbiter.js — the Formulas-based mid-game controller (stage 2 of the lineage).
+ *  booster execs this and exits once Formulas.exe is owned. */
+export const ORBITER = "/orbiter.js";
+
+/** orbiter's own RAM footprint, GB (measured: `mem orbiter.js`). The Formulas API
+ *  functions are free (0 GB) — only owning Formulas.exe is required — so despite the
+ *  +2 GB ns.getServer it lands at 7.85, slightly UNDER booster's 8.35. Re-measure and
+ *  update after any change that adds/removes an NS call. */
+export const ORBITER_RAM_GB = 7.85;
