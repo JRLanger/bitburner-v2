@@ -36,6 +36,7 @@ import {
     MONEY_EPSILON,
     BATCH_KEEP_MONEY_FRAC,
     BATCH_KEEP_SEC_FRAC,
+    DRIFT_GRACE_MS,
     HACK_PCT_MIN,
     HACK_PCT_MAX,
     HACK_PCT_STEP,
@@ -148,6 +149,19 @@ const batchPlan = new Map();
 
 /** Hostnames admitted to batching last tick — drives selectBatchers hysteresis. */
 const wasBatching = new Set();
+
+/**
+ * Per-target timestamp (ms) when a batching target first went unhealthy (outside the
+ * windowed keep-bounds), cleared whenever it reads healthy again. Drives the drift
+ * grace: a target is dropped for re-prep only after it stays unhealthy continuously for
+ * DRIFT_GRACE_MS. Without it, a single momentary windowed dip (a SLOW engine tick or a
+ * level-up) drops a batcher instantly — cheap for a shallow target, but catastrophic for
+ * a very deep one (e.g. ecorp, depth ~2000 ⇒ weakenTime ~14 min): its in-flight grid
+ * keeps landing for the full weaken time, so it can't cleanly re-prep and flaps "on and
+ * on." host -> timestamp. (Steady state is stable via live-time scheduling + locked exact
+ * plans, so this only ever fires on genuine transients.)
+ */
+const unhealthySince = new Map();
 
 /**
  * Global hack-% ramp floor (idle-RAM absorber). Sticky across ticks; moves at
@@ -583,13 +597,15 @@ function pserverFleetBuilt(servers) {
  *
  * Plans are LOCKED (see batchPlan / lockedPlan): computed once at admission and
  * recomputed Formulas-exact only when the hacking level or ramp changes. Because the
- * recompute is exact, a level-up just re-balances h/g in place — no drift grace and no
- * destructive re-prep are needed (the loose windowed keep-test is the only incumbent
- * state). Locking is purely a cost win: re-sweeping the hack-% table for every server
- * every tick cost ~100ms/tick.
+ * recompute is exact, a level-up just re-balances h/g in place. Incumbents are kept on a
+ * loose WINDOWED keep-test plus a DRIFT_GRACE_MS grace (see unhealthySince), so a brief
+ * desync from a SLOW tick or level-up doesn't needlessly drop a deep pipeline. Locking is
+ * purely a cost win: re-sweeping the hack-% table for every server every tick cost
+ * ~100ms/tick.
  */
 function classify(ns, servers, player) {
     const level = ns.getHackingLevel();
+    const now = Date.now();
     const eligible = [];
     const needsPrep = [];
 
@@ -615,21 +631,33 @@ function classify(ns, servers, player) {
             const healthy =
                 moneyFrac >= BATCH_KEEP_MONEY_FRAC &&
                 secOver <= s.minSecurity * BATCH_KEEP_SEC_FRAC;
+            // Drift grace: keep batching through a brief unhealthy blip (a SLOW engine
+            // tick or a level-up momentarily desyncs the windowed baseline); only drop
+            // once unhealthy continuously past DRIFT_GRACE_MS. Critical for deep targets
+            // whose multi-minute weaken time makes a needless drop very expensive.
+            let keep = healthy;
             if (healthy) {
+                unhealthySince.delete(s.hostname);
+            } else {
+                const since = unhealthySince.get(s.hostname) ?? now;
+                unhealthySince.set(s.hostname, since);
+                keep = now - since < DRIFT_GRACE_MS;
+            }
+            if (keep) {
                 const best = lockedPlan(ns, s, player, level);
                 if (best) {
                     eligible.push({ ...s, sec, money, ...best });
                     continue;
                 }
             } else {
-                // Genuinely drifted (windowed baseline outside keep-bounds) → drop to
-                // re-prep. With exact plans + live-time scheduling this should be rare
-                // (an engine-lag transient or a level-requirement change).
+                // Genuinely drifted (unhealthy past the grace window) → drop to re-prep.
                 dbg(
                     `  classify DROP ${s.hostname}: moneyFrac=${moneyFrac.toFixed(3)} ` +
                     `(keep≥${BATCH_KEEP_MONEY_FRAC}) secOver=${secOver.toFixed(2)} ` +
-                    `(keep≤${(s.minSecurity * BATCH_KEEP_SEC_FRAC).toFixed(2)})`
+                    `(keep≤${(s.minSecurity * BATCH_KEEP_SEC_FRAC).toFixed(2)}) ` +
+                    `graceMs=${now - (unhealthySince.get(s.hostname) ?? now)}`
                 );
+                unhealthySince.delete(s.hostname);  // clear grace state
                 activeBatching.delete(s.hostname);
                 batchPlan.delete(s.hostname);  // recompute a fresh plan on re-admission
                 pipelines.delete(s.hostname);  // re-anchor the pipeline on re-admission
