@@ -55,17 +55,31 @@ The main loop (`main`) each tick:
    admitted, `chance` only degrades via security, which the floor-security bound
    already catches — and the raw `chance` read dips on the same mid-cycle spike.
    `needsPrep` is sorted **easiest-earner first** (ascending `maxMoney`).
-5. `selectBatchers` — **admission control + depth-first allocation.** Walks the
-   score-sorted `eligible` list in rank order and gives each target, greedily, the
-   RAM it can use before moving to the next — filling the best target toward its
-   full pipeline before a lower-ranked one starts. Per target, against the
-   `remaining` budget: if a single *optimal* batch fits, use the locked optimal
-   plan; otherwise step the hack-% **down** to the best batch that fits
-   (`bestHackPct(..., remaining)`). It reserves `min(full pipeline, remaining)`, so
-   a stepped-down target claims the whole remaining budget and the next target
-   waits. Ceilings: `BATCH_BUDGET_FRAC` of the *total* pool and `MAX_BATCH_TARGETS`.
-   Last tick's batchers (`wasBatching`) get first claim so the set doesn't flap.
-   Returns `{ batchers, reserved }`.
+5. `selectBatchers` — **admission control + per-target waterfall ramp.** Two passes
+   over the score-sorted `eligible` list in rank order (incumbents from `wasBatching`
+   get a small `SELECT_KEEP_BIAS` so the set doesn't flap). A target's *base pipeline
+   cost* is `concurrency × base ramPerBatch`, where `concurrency = ceil(weakenTime /
+   BATCH_PERIOD)` (f-independent).
+   - **Pass A — pack base load.** Admit each target at its score-optimal (base) plan
+     until the budget (`BATCH_BUDGET_FRAC` of the *total* pool) or `MAX_BATCH_TARGETS`
+     binds. If a target's full base pipeline doesn't fit `remaining`, it's the marginal
+     target: step its hack-% **down** to a single batch that fits (`bestHackPct(...,
+     remaining)`), claim the rest of the budget, and run a shallow pipeline that
+     `batchPhase` deepens later. This is the small-pool path; it consumes the budget, so
+     no excess remains.
+   - **Pass B — waterfall the excess.** If Pass A left budget unspent (every admitted
+     base pipeline fit, with room over), spend it by ramping the **single best** target's
+     hack-% up to `HACK_PCT_RAMP_MAX` first (more money/batch at worse $/GB/s — fine, the
+     GB are idle), then spilling any remainder to the 2nd-best, and so on.
+     `maximizeHackPct` finds the highest f that fits each target's capacity (base cost +
+     running excess). The ramped f is **sticky** (locked in `rampPlan`): a running
+     incumbent reuses its locked ramp and does **not** re-ramp tick-to-tick as the excess
+     pool wobbles — only a fresh/re-anchored target (no in-flight grid to desync) takes a
+     new ramp immediately, and a level-up re-ramps via `classify` clearing `rampPlan`.
+
+   Returns `{ batchers, reserved, rampSaturated }` — `rampSaturated` is true once every
+   placeable target is admitted, all are at `HACK_PCT_RAMP_MAX`, and budget still
+   remains (the share-eligibility signal).
 6. `batchPhase` — a **self-pacing scheduler** that tops each admitted target's
    pipeline up to a target depth. It keeps a per-target `pipelines` entry
    (`committed[]` future W1 landing times, `lastLand`, `depth`); each tick it drops
@@ -84,30 +98,20 @@ The main loop (`main`) each tick:
    Stops at a `prepFloor` = the batchers' reserved-but-unclaimed RAM, and each
    `prepWave` is capped to that headroom — so prep can't starve a pipeline that is
    still ramping toward full depth.
-8. **Hack-% ramp controller** — a global `rampLevel` (a hack-% *floor*, starts at
-   0) absorbs idle pool RAM. After prep, the loop nudges `rampLevel` by at most one
-   `RAMP_STEP` per tick, driven by actual **pool utilization** (`1 − free/total`,
-   measured after this tick's batch + prep placements): **up** when every `eligible`
-   target got a batch slot **and** utilization is below `RAMP_UTIL_LOW`; **down**
-   when admission is RAM/lag-starved or utilization exceeds `RAMP_UTIL_HIGH`;
-   otherwise it holds (the `LOW..HIGH` deadband). `classify` then plans each target
-   at `max(score-optimal f, rampLevel)` capped at `HACK_PCT_RAMP_MAX`, so a raised
-   floor pulls low-% targets up to spend the idle RAM. The plan lock stores the
-   `rampLevel` it was computed at and recomputes only when the floor moves.
-9. `sharePhase` — feeds the genuinely-idle pool residual to `ns.share()` for a
+8. `sharePhase` — feeds the genuinely-idle pool residual to `ns.share()` for a
    faction-reputation boost. Runs *after* batch + prep so it only ever sees what they
    left. Gated to spend true surplus only: paused while the manual `SHARE_OFF_FLAG`
    flag is set in the flag port (`/utils/share-off.js` sets it, `share-on.js` clears it;
    the port clears on reset/reload so a pause lifts on a fresh run),
-   otherwise active only once `rampLevel` is maxed
-   **and** `needsPrep` is empty — i.e. every target is hacking as hard as allowed and
-   the pool still has idle RAM. It spends `SHARE_BUDGET_FRAC` (0.75) of the residual
+   otherwise active only once `rampSaturated` (from `selectBatchers`)
+   **and** `needsPrep` is empty — i.e. every admitted target is at `HACK_PCT_RAMP_MAX`
+   and the pool still has idle RAM. It spends `SHARE_BUDGET_FRAC` (0.75) of the residual
    `poolFree − poolTotal × (1 − BATCH_BUDGET_FRAC)`, topping the in-flight
    share-thread count (`countShareThreads`) up to that target with **single-shot 10 s
    share workers** (`placeShare`). When batch/prep demand returns, the residual
    shrinks, booster launches fewer, and the running workers free their RAM within
    ~10 s — so it yields without any `ns.kill` (keeps booster at 8.2 GB).
-10. `updateDisplayStats` / `renderStatus` — refresh the tail-window status table.
+9. `updateDisplayStats` / `renderStatus` — refresh the tail-window status table.
    Raw money/security reads land at a random phase of each target's batch grid, so
    they oscillate (e.g. money flips between 100% and `100% − hack%`). For display
    only, `updateDisplayStats` keeps a short rolling window per batcher and
@@ -157,30 +161,33 @@ progression. The fitted choice is stable tick-to-tick (`chance` is a common fact
 across all f, so it never flips which f wins), so re-fitting each tick doesn't
 cause flap.
 
-**The hack-% ramp spends idle RAM without flapping.** `bestHackPct` picks the `f`
-that maximizes `$/GB/s` — RAM *efficiency* — which is correct only while RAM is the
-bottleneck. After hours on a fresh save, every available target batches at that
+**The hack-% waterfall spends idle RAM where it pays most.** `bestHackPct` picks the
+`f` that maximizes `$/GB/s` — RAM *efficiency* — which is correct only while RAM is
+the bottleneck. After hours on a fresh save, every available target batches at that
 efficiency peak yet the pool still sits on huge free RAM (idle GB earn nothing). The
 fix raises hack-% *above* the per-target peak: more money per batch at worse
-`$/GB/s`, which is a good trade when the GB are otherwise idle. A single sticky
-`rampLevel` floor (not a per-target greedy allocator) keeps the model simple,
-monotonic, and easy to reason about — raising it pulls the cheapest-to-grow targets
-up first. Anti-flap comes from three things together: the move is **gated on actual
-pool utilization** (`1 − free/total`, so it never steals RAM that prep or a new
-target is using and yields the instant utilization climbs), it steps by a small
-`RAMP_STEP` at most once per tick, and the wide `RAMP_UTIL_LOW..HIGH` deadband holds
-it steady through the normal mid-cycle money/security oscillation. The plan lock
-keys on `rampLevel` so plans only recompute on a genuine floor move, preserving the
-no-flap admission guarantee.
+`$/GB/s`, which is a good trade when the GB are otherwise idle. Crucially this is done
+**per target, not as a flat global floor.** A flat floor raised every target's hack-%
+in lockstep — which buys little extra money on weak targets while inflating the whole
+admitted set's RAM, shoving the marginal target past the budget so it drops out (the
+old `rampLevel` produced a 1-tick limit cycle: ramp 40↔42%, batchers 10↔8). The
+waterfall instead pushes the **single most lucrative** target to `HACK_PCT_RAMP_MAX`
+first and only spills leftover budget down the ranked list, so every excess GB goes to
+the highest-payout target available. Anti-flap comes from the **sticky ramp lock**
+(`rampPlan`): a running incumbent keeps its ramped `f` while it still fits, so its
+pipeline RAM footprint never jitters as the excess pool wobbles tick-to-tick (the same
+reason the base plan is locked). Only a fresh/re-anchored target — which has no
+in-flight grid to desync — takes a new ramp immediately; a level-up re-ramps via
+`classify` clearing `rampPlan` when the base recomputes.
 
-**`HACK_PCT_RAMP_MAX` doubles as the share-residual boundary.** Capping the ramp
-(and thus every target's hack-%) at a fixed maximum means that once `rampLevel`
-reaches it and `needsPrep` is empty, every target is hacking as hard as we allow, so
-the free RAM still left over — `poolFree − poolTotal × (1 − BATCH_BUDGET_FRAC)` — is
-genuine, well-defined surplus. `sharePhase` (Stage 5) claims a fraction
-(`SHARE_BUDGET_FRAC`) of exactly that residual for `ns.share()` workers, recomputed
-each tick so a ramp-down or new demand reclaims it as the running single-shot workers
-expire (~10 s).
+**`HACK_PCT_RAMP_MAX` doubles as the share-residual boundary.** Capping each target's
+hack-% at a fixed maximum means that once the waterfall is **saturated**
+(`rampSaturated`: every placeable target admitted, all at the cap) and `needsPrep` is
+empty, every target is hacking as hard as we allow, so the free RAM still left over —
+`poolFree − poolTotal × (1 − BATCH_BUDGET_FRAC)` — is genuine, well-defined surplus.
+`sharePhase` (Stage 5) claims a fraction (`SHARE_BUDGET_FRAC`) of exactly that residual
+for `ns.share()` workers, recomputed each tick so falling demand reclaims it as the
+running single-shot workers expire (~10 s).
 
 **Prep can't starve a ramping pipeline.** A pipeline fills gradually (one launch
 per `BATCH_PERIOD`, over ~a weaken time), so a freshly-admitted target's reserved
@@ -412,14 +419,22 @@ entirely, along with its `recoverClock` state. The current behavior — drop to 
 clean re-prep via `classify`'s drift-grace logic — has no separate recovery code
 path at all.
 
-**The hack-% ramp used to gate on `needsPrep` being empty, not pool utilization.**
-An earlier version raised `rampLevel` only when `needsPrep` was empty, but a large
-rooted network almost always has a trickle of one server prepping, so the ramp
-never fired while 98% of the pool sat idle. It was replaced with the current
-pool-utilization signal (`1 − free/total`, which already counts prep's RAM): a
-one-server prep trickle barely moves utilization, so the ramp proceeds, while a
-fresh-save bootstrap (prep consuming the whole small pool) correctly reads as
-fully-used and suppresses it.
+**The hack-% ramp used to be a single global `rampLevel` floor.** The original
+absorber was a sticky global floor moved at most one `RAMP_STEP` per tick, gated on
+pool utilization (`1 − free/total`) with a `RAMP_UTIL_LOW..HIGH` deadband and a
+`RAMP_BUDGET_MIN` headroom check — `classify` then planned every target at
+`max(score-optimal f, rampLevel)`. Two problems killed it. (1) Applying the floor to
+*every* target in lockstep is the wrong objective under RAM pressure: it grows weak
+targets (little extra money) and inflates the admitted set's RAM, shoving the marginal
+target past the budget so it drops — a 1-tick limit cycle (ramp 40↔42%, batchers
+10↔8) that the budget-headroom gate only partly tamed. (2) The signals (utilization
+vs committed-but-unfilled budget) were hard to reconcile because pipelines fill
+gradually. The current per-target **waterfall** in `selectBatchers` replaces it
+entirely: it ramps the best target to `HACK_PCT_RAMP_MAX` first and spills excess down
+the rank order, computing each target's exact RAM footprint so it never overspends the
+budget, with the sticky `rampPlan` lock preventing tick-to-tick jitter. `RAMP_STEP`,
+`RAMP_UTIL_LOW`, `RAMP_UTIL_HIGH`, and `RAMP_BUDGET_MIN` were deleted; only
+`HACK_PCT_RAMP_MAX` (the per-target cap and share boundary) remains.
 
 **`CONCURRENCY_CAP` — a per-target pipeline-depth cap, removed.** Before the
 self-pacing scheduler existed, each target's pipeline depth was capped at a flat
@@ -461,3 +476,13 @@ save.
   keep from flapping at the margin. The global floor trades a little allocation
   optimality for simplicity and rock-solid stability — the right call for an
   opportunistic idle-RAM absorber.
+
+## Status bus (dashboard hook)
+
+Each tick, right after `renderStatus`, booster calls
+`publishStatus(ns, STATUS_PORT_CONTROLLER, buildSnapshot(...))` to broadcast its live
+state to the status bus (see `docs/scripts/status.md`). `buildSnapshot` reuses the same
+values the tail table already computes (`displayHealth`, `expectedIncome`, `poolFree`,
+the `pipelines` map, `topRampF`/`rampSaturated`, `shareThreads`) plus `tickGap`/`lastWorkMs` for the
+engine-lag indicator — no new NS calls. `dashboard.js` reads it to render the unified
+overlay. The tail render is kept as a fallback. (orbiter.js carries the identical hook.)

@@ -41,10 +41,6 @@ import {
     HACK_PCT_MAX,
     HACK_PCT_STEP,
     HACK_PCT_RAMP_MAX,
-    RAMP_STEP,
-    RAMP_UTIL_LOW,
-    RAMP_UTIL_HIGH,
-    RAMP_BUDGET_MIN,
     WORKER_RAM,
     WEAKEN_SEC,
     GROW_SEC,
@@ -71,8 +67,11 @@ import {
     HACKNET_MANAGER_RAM,
     PSERVER_PREFIX,
     HACKNET_GATE,
+    STATUS_PORT_CONTROLLER,
+    DASHBOARD,
 } from "/config/constants.js";
 import { readFlags, writeFlags } from "/lib/flags.js";
+import { publishStatus } from "/lib/status.js";
 
 /** HWGW worker paths that must exist on home and get copied to every rooted server. */
 const WORKERS = [HACK_WORKER, GROW_WORKER, WEAKEN_WORKER];
@@ -136,16 +135,27 @@ const pipelines = new Map();
 const activeBatching = new Set();
 
 /**
- * Locked Formulas plan per batching target: host -> bestHackPct result, stamped with
- * the hacking `level` and `ramp` it was computed at. Reused every tick while batching
- * and recomputed (Formulas-exact) ONLY when the level or ramp changes — see lockedPlan.
+ * Locked Formulas BASE plan per batching target: host -> score-optimal bestHackPct
+ * result, stamped with the hacking `level` it was computed at. Reused every tick while
+ * batching and recomputed (Formulas-exact) ONLY when the level changes — see lockedPlan.
  * Unlike booster's pre-Formulas lock this needs no drift grace: the recompute is exact
  * (growThreads), so a level-up just re-balances h/g in place with no re-prep. The lock
  * exists purely for COST — re-sweeping ~75 hack-% steps for every eligible server every
- * tick was ~100ms/tick of work; locking pins it to admission + level/ramp changes.
+ * tick was ~100ms/tick of work; locking pins it to admission + level changes.
  * Deleted when a target drifts out (classify) so re-admission recomputes fresh.
  */
 const batchPlan = new Map();
+
+/**
+ * Locked RAMPED plan per target: host -> the higher-f plan selectBatchers's waterfall
+ * gave this target to spend excess pool RAM (see selectBatchers Pass B). Kept STICKY so
+ * a running pipeline's f — and thus its RAM footprint — never jitters tick-to-tick as
+ * the excess pool wobbles (prep finishing, share starting); an incumbent reuses its
+ * locked ramped plan and only re-ramps on re-anchor (fresh admission) or a level-up
+ * (lockedPlan clears it when the base recomputes) or a budget collapse that no longer
+ * fits. host -> bestHackPct/maximizeHackPct result.
+ */
+const rampPlan = new Map();
 
 /** Hostnames admitted to batching last tick — drives selectBatchers hysteresis. */
 const wasBatching = new Set();
@@ -163,19 +173,18 @@ const wasBatching = new Set();
  */
 const unhealthySince = new Map();
 
-/**
- * Global hack-% ramp floor (idle-RAM absorber). Sticky across ticks; moves at
- * most one RAMP_STEP per tick under the controller in main(). Each batching plan
- * is computed at max(score-optimal f, rampLevel) capped at HACK_PCT_RAMP_MAX, so
- * raising it pulls low-% targets up to spend otherwise-idle pool RAM. 0 = off
- * (pure $/GB/s efficiency). See the "Hack-% ramp-up" block in constants.js.
- */
-let rampLevel = 0;
-
 /** Active share-worker thread count and manual-pause state, for the status line.
  *  Updated by sharePhase each tick. */
 let shareThreads = 0;
 let shareOff = false;
+
+/**
+ * Set by selectBatchers each tick: true once the per-target waterfall has pushed
+ * every admitted target to HACK_PCT_RAMP_MAX and still left budget unspent — i.e.
+ * all idle batch RAM is absorbed and the remainder is genuine surplus. sharePhase
+ * gates on this (was the old `rampLevel == HACK_PCT_RAMP_MAX` boundary).
+ */
+let rampSaturated = false;
 
 /** Diagnostic log buffer (flushed once per tick) and a monotonic tick counter so
  *  log lines from the same tick can be grouped. See BOOSTER_DEBUG in constants. */
@@ -217,7 +226,6 @@ const DISPLAY_WINDOW = 6;
 
 export async function main(ns) {
     ns.disableLog("ALL");
-    ns.ui.openTail();
 
     // Prerequisite: Formulas.exe must be owned — the entire targeting core depends
     // on the Formulas API. (booster is the pre-Formulas controller; this one only
@@ -235,6 +243,9 @@ export async function main(ns) {
         ns.tprint("orbiter does not create workers. Add them, then re-run.");
         return;
     }
+
+    // Open the unified dashboard if it isn't already running (replaces per-script tails).
+    if (ns.fileExists(DASHBOARD, "home") && !isRunning(ns, DASHBOARD)) ns.exec(DASHBOARD, "home");
 
     // Fresh diagnostic log per run (truncate). No-op cost when BOOSTER_DEBUG off.
     if (BOOSTER_DEBUG) {
@@ -285,7 +296,8 @@ export async function main(ns) {
         const poolTotal =
             servers.reduce((sum, s) => (s.hasRoot ? sum + s.maxRam : sum), 0) -
             HOME_SAFETY_BUFFER_GB;
-        const { batchers, reserved } = selectBatchers(ns, eligible, poolTotal, player);
+        const { batchers, reserved, rampSaturated: saturated } = selectBatchers(ns, eligible, poolTotal, player);
+        rampSaturated = saturated;
 
         // Per-tick summary: eligible vs admitted, so a drop is attributable to either
         // classify (host absent from `eligible`) or selectBatchers (in `eligible`,
@@ -300,7 +312,7 @@ export async function main(ns) {
             const slow = tickGap > 2 * LOOP_SLEEP ? " SLOW" : "";
             dbg(
                 `T${tickNo} elig=${eligible.length} batch=${batchers.length} ` +
-                `ramp=${Math.round(rampLevel * 100)}% ` +
+                `topF=${batchers.length ? Math.round(batchers[0].f * 100) : 0}%${rampSaturated ? " SAT" : ""} ` +
                 `reserved=${ns.format.ram(reserved)}/${ns.format.ram(poolTotal * BATCH_BUDGET_FRAC)} ` +
                 `poolFree=${ns.format.ram(poolFree(pool))} ` +
                 `gap=${tickGap}ms work=${lastWorkMs}ms (sleep=${LOOP_SLEEP}ms)${slow}`
@@ -324,35 +336,9 @@ export async function main(ns) {
         const prepFloor = Math.max(0, reserved - batchRunningRam);
         prepPhase(ns, needsPrep, pool, inFlight, player, prepFloor);
 
-        // Hack-% ramp controller (idle-RAM absorber). Move the global ramp floor
-        // at most one step/tick. Two signals must BOTH say "spend more" to ramp up:
-        //  - actual POOL UTILIZATION (1 − free/total) below RAMP_UTIL_LOW, and
-        //  - admission-BUDGET headroom (1 − reserved/budget) above RAMP_BUDGET_MIN.
-        // The budget signal is the key fix for the limit cycle: selectBatchers reserves
-        // the full pipeline RAM immediately, but pipelines fill gradually, so actual
-        // utilization lags far behind committed budget. Using utilization alone, the
-        // ramp read the not-yet-filled RAM as "idle" and kept pushing hack-% up even
-        // though the budget was 100% reserved — which can't add throughput, it just
-        // grows batches until the marginal target no longer fits and drops out
-        // (ramp 40↔42%, batchers 10↔8, every tick). Requiring real budget headroom
-        // makes it settle at the highest hack-% where the full admitted set still fits.
-        // Ramp DOWN when admission is starved (fewer targets than it could place) or
-        // the pool is genuinely near-full. The wide LOW..HIGH deadband and the budget
-        // gate together hold it steady. Plans pick up the new floor next tick (classify).
-        const poolUsedFrac = poolTotal > 0 ? 1 - poolFree(pool) / poolTotal : 1;
-        const budget = poolTotal * BATCH_BUDGET_FRAC;
-        const budgetHeadroom = budget > 0 ? 1 - reserved / budget : 0;
-        // "All batching" means admission placed as many targets as it possibly could
-        // given BOTH ceilings — the RAM budget AND MAX_BATCH_TARGETS.
-        const allBatching = batchers.length === Math.min(eligible.length, MAX_BATCH_TARGETS);
-        if (allBatching && poolUsedFrac < RAMP_UTIL_LOW && budgetHeadroom > RAMP_BUDGET_MIN) {
-            rampLevel = Math.min(HACK_PCT_RAMP_MAX, rampLevel + RAMP_STEP);
-        } else if (!allBatching || poolUsedFrac > RAMP_UTIL_HIGH) {
-            rampLevel = Math.max(0, rampLevel - RAMP_STEP);
-        }
-
-        // Share phase (idle-RAM → faction reputation). Once rampLevel is maxed and
-        // prep is clear, the free RAM still left over beyond the reserved
+        // Share phase (idle-RAM → faction reputation). Once the waterfall is
+        // saturated (rampSaturated, set by selectBatchers) and prep is clear, the
+        // free RAM still left over beyond the reserved
         // prep/jitter headroom is genuine surplus; sharePhase feeds a fraction of it
         // to ns.share(). Recomputed each tick so it yields the instant batch/prep
         // demand (or a ramp-down) reclaims the RAM. Runs after batch + prep so it
@@ -368,6 +354,8 @@ export async function main(ns) {
         // to re-prep and causing the admitted set to flap. See classify keep-test.
         updateDisplayStats(eligible);
         renderStatus(ns, servers, pool, batchers, needsPrep);
+        // Publish the same data to the status bus for dashboard.js (free port write).
+        publishStatus(ns, STATUS_PORT_CONTROLLER, buildSnapshot(ns, "orbiter", servers, pool, batchers, needsPrep, tickGap));
 
         // Remember this tick's admitted set for next tick's admission hysteresis.
         wasBatching.clear();
@@ -660,6 +648,7 @@ function classify(ns, servers, player) {
                 unhealthySince.delete(s.hostname);  // clear grace state
                 activeBatching.delete(s.hostname);
                 batchPlan.delete(s.hostname);  // recompute a fresh plan on re-admission
+                rampPlan.delete(s.hostname);   // drop the sticky ramp so re-admission re-ramps fresh
                 pipelines.delete(s.hostname);  // re-anchor the pipeline on re-admission
             }
         }
@@ -697,64 +686,101 @@ function isPrepped(s, sec, money) {
 }
 
 /**
- * Admission control + depth-first RAM allocation. Walks the prepped, eligible
- * targets in rank order and gives each, greedily, the RAM it can use before moving
- * to the next — so the best target is filled toward its full pipeline before a
- * lower-ranked one starts. The rest idle (prepped, zero RAM cost since un-hacked).
+ * Admission control + per-target WATERFALL ramp. Two passes over the prepped, eligible
+ * targets in rank order. Concurrency = full pipeline depth (weakenTime/BATCH_PERIOD),
+ * f-independent, so a "base pipeline cost" = concurrency × base ramPerBatch.
  *
- * Per target, given the `remaining` budget:
- *  - if a single *optimal* batch fits, use the locked optimal plan (`t`) — stable,
- *    the normal big-pool path;
- *  - else step the hack-% DOWN to the best batch that fits `remaining`
- *    (`bestHackPct(..., remaining)`), so a small early pool can still batch;
- *  - reserve `min(full pipeline, remaining)`. A stepped-down target therefore
- *    claims the *whole* remaining budget (the next target waits) and runs a shallow
- *    pipeline that batchPhase deepens automatically as free RAM grows. As the pool
- *    grows the hack-% climbs back to optimal, then depth fills, then the pipeline
- *    completes and the leftover budget overflows to the next-best target.
+ * Pass A — pack base load. Admit each target at its score-optimal (base) plan until the
+ * RAM budget or MAX_BATCH_TARGETS binds:
+ *  - if the full base pipeline fits `remaining`, admit at base — the normal big-pool path;
+ *  - else (the marginal target) step the hack-% DOWN to a single batch that fits
+ *    `remaining` (`bestHackPct(..., remaining)`), claim the whole rest of the budget,
+ *    and run a shallow pipeline that batchPhase deepens as RAM grows. This is the
+ *    small-pool path that lets a fresh save batch at all; it consumes the budget, so no
+ *    excess remains and Pass B is a no-op.
+ *
+ * Pass B — waterfall the excess. If Pass A left budget unspent (every admitted target's
+ * full base pipeline fit, with room over), spend it by pushing the BEST target's hack-%
+ * up to HACK_PCT_RAMP_MAX first (more money/batch at worse $/GB/s — fine, the GB are
+ * idle), then spill any remainder to the 2nd-best, and so on. Each target's capacity is
+ * its base cost + the running excess; maximizeHackPct finds the highest f that fits.
+ *
+ * STICKY: the ramped f is locked in rampPlan. A running incumbent reuses its locked
+ * ramped plan as long as it still fits the budget — it does NOT re-ramp tick-to-tick as
+ * the excess pool wobbles (that would change the pipeline's RAM footprint and desync the
+ * in-flight grid / flap the admission estimate, the very thing the lock prevents). A
+ * fresh/re-anchored target (not an incumbent, no in-flight grid to desync) takes its
+ * full computed ramp immediately; a level-up re-ramps via lockedPlan clearing rampPlan.
  *
  * Hysteresis: admission walks targets in score order, but an incumbent (last tick's
  * batcher) gets a SELECT_KEEP_BIAS score bonus for ordering only — so a marginally
- * higher newcomer can't evict a running pipeline, while a clearly higher one still
- * can. (An earlier two-pass "all incumbents first, then newcomers" rule let a
- * low-score squatter like n00dles, admitted early, hold a capped slot forever and
- * lock out higher-value servers — the set could never improve.) Two ceilings: the
- * RAM budget (early, RAM-limited) and MAX_BATCH_TARGETS (late, lag-limited);
- * whichever binds first wins.
+ * higher newcomer can't evict a running pipeline, while a clearly higher one still can.
+ * Two ceilings: the RAM budget (early, RAM-limited) and MAX_BATCH_TARGETS (late,
+ * lag-limited); whichever binds first wins.
+ *
+ * Returns `rampSaturated`: true once every admitted target is at HACK_PCT_RAMP_MAX and
+ * budget still remains — the signal sharePhase uses to spend genuine surplus on share().
  */
 function selectBatchers(ns, eligible, poolTotal, player) {
     const budget = poolTotal * BATCH_BUDGET_FRAC;
-    // Reserve the same full-pipeline depth batchPhase actually runs, so the estimate
-    // matches real usage (a mismatch here would over- or under-reserve the budget).
     const concurrency = (t) => Math.ceil(t.weakenTime / BATCH_PERIOD);
 
     // Order by score, giving incumbents a small bonus (anti-flap, anti-squat).
     const effScore = (t) => t.score * (wasBatching.has(t.hostname) ? 1 + SELECT_KEEP_BIAS : 1);
     const order = [...eligible].sort((a, b) => effScore(b) - effScore(a));
 
+    // Pass A — pack every target at its base (score-optimal) plan.
     const admitted = [];
     let used = 0;
     for (const t of order) {
         if (admitted.length >= MAX_BATCH_TARGETS) break;
         const remaining = budget - used;
-
-        let entry, ramPerBatch;
-        if (remaining >= t.ramPerBatch) {
-            entry = t; // optimal batch fits → use the locked optimal plan
-            ramPerBatch = t.ramPerBatch;
+        const baseCost = concurrency(t) * t.ramPerBatch;
+        if (remaining >= baseCost) {
+            admitted.push({ t, plan: t, baseCost }); // full base pipeline fits
+            used += baseCost;
         } else {
-            const fitted = bestHackPct(ns, t, player, remaining); // step down
+            // Marginal target: step the hack-% down to fit `remaining`, claim the rest.
+            const fitted = bestHackPct(ns, t, player, remaining);
             if (!fitted) continue; // not even the smallest batch fits → try the next
-            entry = { ...t, ...fitted, score: t.score }; // keep optimal score for rank
-            ramPerBatch = fitted.ramPerBatch;
+            admitted.push({ t, plan: { ...t, ...fitted, score: t.score }, baseCost: remaining, capped: true });
+            used += remaining;
         }
-
-        used += Math.min(concurrency(t) * ramPerBatch, remaining);
-        admitted.push(entry);
     }
 
-    admitted.sort((a, b) => b.score - a.score); // restore global rank order
-    return { batchers: admitted, reserved: used };
+    // Pass B — waterfall the leftover budget into the best targets (up-ramp only).
+    let excess = budget - used;
+    let saturated = false;
+    if (excess > 0) {
+        let allAtMax = true;
+        for (const a of admitted) {
+            if (excess <= 0 || a.capped) { allAtMax = false; break; }
+            const t = a.t;
+            const conc = concurrency(t);
+            const capacity = a.baseCost + excess;
+            // Sticky: an incumbent keeps its locked ramped plan while it still fits.
+            let ramped = rampPlan.get(t.hostname);
+            const fits = ramped && conc * ramped.ramPerBatch <= capacity + 1e-6;
+            if (!(wasBatching.has(t.hostname) && fits)) {
+                ramped = maximizeHackPct(ns, t, player, capacity / conc, t.f);
+                if (ramped) rampPlan.set(t.hostname, ramped);
+            }
+            if (!ramped) { allAtMax = false; break; }
+            a.plan = { ...t, ...ramped, score: t.score }; // keep base score for rank
+            const rampedCost = conc * ramped.ramPerBatch;
+            used += rampedCost - a.baseCost; // base already counted in Pass A
+            excess = capacity - rampedCost;
+            if (ramped.f < HACK_PCT_RAMP_MAX - 1e-9) allAtMax = false;
+        }
+        // Saturated only when every placeable target is admitted (none RAM-starved),
+        // all are at the cap, and budget still remains — then the rest is true surplus.
+        const allPlaced = admitted.length === Math.min(eligible.length, MAX_BATCH_TARGETS);
+        saturated = allAtMax && excess > 0 && allPlaced && admitted.length > 0;
+    }
+
+    const batchers = admitted.map((a) => a.plan);
+    batchers.sort((a, b) => b.score - a.score); // restore global rank order
+    return { batchers, reserved: used, rampSaturated: saturated };
 }
 
 // ── Batch phase (rolling HWGW grid scheduler) ───────────────────────────────
@@ -949,8 +975,8 @@ function placeThreads(ns, pool, script, ramPerThread, threads, target, delay) {
  * Feed genuinely-idle pool RAM to ns.share() for a faction-rep boost. Called after
  * batch + prep so it only sees what they left. Gated to spend ONLY true surplus:
  *  - paused if the manual SHARE_OFF_FLAG flag is set in the flag port;
- *  - otherwise only once the hack-% ramp is maxed AND prep is clear, i.e. every
- *    target is hacking as hard as we allow and the pool still has idle RAM.
+ *  - otherwise only once the waterfall is saturated AND prep is clear, i.e. every
+ *    admitted target is at HACK_PCT_RAMP_MAX and the pool still has idle RAM.
  * Spends SHARE_BUDGET_FRAC of the residual (free RAM beyond the reserved
  * prep/jitter headroom). Tops the share-thread count up to target each tick with
  * single-shot 10s workers; when demand returns it launches fewer and the running
@@ -965,7 +991,7 @@ function sharePhase(ns, pool, poolTotal, needsPrep, rootedHosts) {
     if (shareOff) { shareThreads = 0; return; }
 
     // Gate: only spend surplus that batching/prep provably don't want.
-    if (rampLevel < HACK_PCT_RAMP_MAX || needsPrep.length > 0) {
+    if (!rampSaturated || needsPrep.length > 0) {
         shareThreads = 0;
         return;
     }
@@ -1011,20 +1037,22 @@ function placeShare(ns, pool, threads) {
 // ── Scoring (Formulas-exact) ─────────────────────────────────────────────────
 
 /**
- * Return the locked plan for a target, recomputing it (Formulas-exact) only when the
- * hacking `level` or the global `rampLevel` differs from the stamp on the cached plan.
+ * Return the locked BASE plan (score-optimal, un-ramped) for a target, recomputing it
+ * (Formulas-exact) only when the hacking `level` differs from the cached plan's stamp.
  * This is the cost lock: between level-ups it returns the cached plan with zero NS
  * calls, instead of re-sweeping the hack-% table for every batcher every tick. The
  * recompute is exact, so a level change just re-balances h/g with no drift/re-prep.
+ * On a recompute the sticky ramp plan is dropped so the waterfall re-ramps from the
+ * fresh base next admission.
  */
 function lockedPlan(ns, s, player, level) {
     const cached = batchPlan.get(s.hostname);
-    if (cached && cached.level === level && cached.ramp === rampLevel) return cached;
-    const best = bestHackPct(ns, s, player, Infinity, rampLevel);
+    if (cached && cached.level === level) return cached;
+    const best = bestHackPct(ns, s, player);
     if (best) {
         best.level = level;
-        best.ramp = rampLevel;
         batchPlan.set(s.hostname, best);
+        rampPlan.delete(s.hostname); // base changed → waterfall re-ramps fresh
     }
     return best;
 }
@@ -1041,27 +1069,22 @@ function preppedSnapshot(ns, host) {
 }
 
 /**
- * Sweep hack fractions and return the row with the best score ($/GB/s) whose
- * single-batch RAM is ≤ `ramCap`. With the default (Infinity) this is the global
- * optimum. With a finite cap it's the best batch that *fits* — used to step the
- * hack-% down on a small pool so a target can still batch.
+ * Build a per-target plan factory. Resolves the f-independent Formulas baseline once
+ * (hack-per-thread, op-times, chance, maxMoney) from a prepped snapshot + the live
+ * Player, then returns `atF(f)` which costs a single HWGW batch at hack-fraction `f`.
+ * Both bestHackPct (sweep up for best $/GB/s) and maximizeHackPct (sweep down for the
+ * highest f that fits) share this so neither re-resolves the baseline per candidate.
  *
- * Formulas-exact: hack thread counts and op-times come from a prepped snapshot +
- * the live Player, so they are correct even when the live server is off baseline
- * and stay correct as the hacking level rises (recomputed every tick).
- *
- * Grow + the counter-weakens ARE still over-provisioned by THREAD_MARGIN. Although
- * growThreads is exact for a single batch starting at maxMoney*(1-f), a deep rolling
- * pipeline (depth = weakenTime/BATCH_PERIOD, hundreds on big servers) lands each grow
- * on the money the PREVIOUS grow left, not on a clean maxMoney*(1-f) — so any sub-thread
- * shortfall compounds geometrically and ratchets money down to the (1-f) hack floor
- * (observed: zb-def/4sigma pinned at ~0.25 while security stayed at min). The margin's
- * slight over-grow clamps harmlessly at max and breaks that ratchet. Hack threads stay
- * exact (never scaled). Returns null if hackPercent is 0 or no batch fits the cap.
- * The returned plan carries the op-times (weakenTime/growTime/hackTime) and
- * `chance` so batchPhase needs no further NS calls.
+ * Formulas-exact: thread counts and op-times are correct even when the live server is
+ * off baseline and stay correct as the hacking level rises. Grow + the counter-weakens
+ * are over-provisioned by ORBITER_THREAD_MARGIN: growThreads is exact for a single batch
+ * starting at maxMoney*(1-f), but a deep rolling pipeline (depth = weakenTime/BATCH_PERIOD,
+ * hundreds on big servers) lands each grow on the money the PREVIOUS grow left, so any
+ * sub-thread shortfall compounds geometrically and ratchets money down to the (1-f) hack
+ * floor (observed: zb-def/4sigma pinned at ~0.25). The slight over-grow clamps harmlessly
+ * at max and breaks that ratchet. Hack threads stay exact. Returns null if hackPercent is 0.
  */
-function bestHackPct(ns, server, player, ramCap = Infinity, floor = 0) {
+function buildPlanner(ns, server, player) {
     const snap = preppedSnapshot(ns, server.hostname);
     const fm = ns.formulas.hacking;
 
@@ -1074,31 +1097,58 @@ function bestHackPct(ns, server, player, ramCap = Infinity, floor = 0) {
     const hackTime = fm.hackTime(snap, player);
     const maxMoney = snap.moneyMax;
 
-    let best = null;
-    // The ramp floor raises the search's lower bound (spend idle RAM at higher
-    // hack-%); HACK_PCT_RAMP_MAX caps the upper bound so no target ever exceeds the
-    // share-residual boundary. ramCap (small-pool step-down) is applied per candidate.
-    const lo = Math.max(HACK_PCT_MIN, floor);
-    const hi = Math.min(HACK_PCT_MAX, HACK_PCT_RAMP_MAX);
-    for (let f = lo; f <= hi + 1e-9; f += HACK_PCT_STEP) {
+    const atF = (f) => {
         const h = Math.ceil(f / hackFrac);
         // Grow restores the f fraction the hack stole: start at maxMoney*(1−f), target
-        // maxMoney, both at min security (HWGW weakens before the grow lands). Over-
-        // provision by THREAD_MARGIN to break the deep-pipeline under-restore ratchet.
+        // maxMoney, both at min security (HWGW weakens before the grow lands).
         snap.moneyAvailable = maxMoney * (1 - f);
         const g = Math.ceil(fm.growThreads(snap, player, maxMoney) * ORBITER_THREAD_MARGIN);
         const w1 = Math.ceil((h * HACK_SEC) / WEAKEN_SEC * ORBITER_THREAD_MARGIN); // counter hack sec
         const w2 = Math.ceil((g * GROW_SEC) / WEAKEN_SEC * ORBITER_THREAD_MARGIN); // counter grow sec
         const ramPerBatch =
             h * WORKER_RAM.hackRam + g * WORKER_RAM.growRam + (w1 + w2) * WORKER_RAM.weakenRam;
-        if (ramPerBatch > ramCap) continue; // batch too big for the available RAM
         const moneyPerBatch = maxMoney * f * chance;
         const score = moneyPerBatch / (weakenTime * ramPerBatch);
-        if (!best || score > best.score) {
-            best = { f, h, g, w1, w2, ramPerBatch, weakenTime, growTime, hackTime, chance, score };
-        }
+        return { f, h, g, w1, w2, ramPerBatch, weakenTime, growTime, hackTime, chance, score };
+    };
+    return { atF };
+}
+
+/**
+ * Sweep hack fractions HACK_PCT_MIN..HACK_PCT_RAMP_MAX and return the score-optimal
+ * ($/GB/s) plan whose single-batch RAM is ≤ `ramCap`. With the default (Infinity) this
+ * is the global optimum (the base plan). With a finite cap it's the best batch that
+ * *fits* — used to step the hack-% down on a small pool so a target can still batch.
+ * Returns null if hackPercent is 0 or no batch fits the cap.
+ */
+function bestHackPct(ns, server, player, ramCap = Infinity) {
+    const p = buildPlanner(ns, server, player);
+    if (!p) return null;
+    let best = null;
+    const hi = Math.min(HACK_PCT_MAX, HACK_PCT_RAMP_MAX);
+    for (let f = HACK_PCT_MIN; f <= hi + 1e-9; f += HACK_PCT_STEP) {
+        const plan = p.atF(f);
+        if (plan.ramPerBatch > ramCap) continue; // batch too big for the available RAM
+        if (!best || plan.score > best.score) best = plan;
     }
     return best;
+}
+
+/**
+ * The waterfall's up-ramp: search from HACK_PCT_RAMP_MAX DOWN to `minF` (the target's
+ * base f) and return the HIGHEST f whose single-batch RAM is ≤ `ramCapPerBatch`. Since
+ * the caller's capacity always covers the base plan, this returns at least the base f.
+ * Top-down with early return keeps it cheap when RAM is plentiful (returns at the cap).
+ */
+function maximizeHackPct(ns, server, player, ramCapPerBatch, minF) {
+    const p = buildPlanner(ns, server, player);
+    if (!p) return null;
+    const hi = Math.min(HACK_PCT_MAX, HACK_PCT_RAMP_MAX);
+    for (let f = hi; f >= minF - 1e-9; f -= HACK_PCT_STEP) {
+        const plan = p.atF(f);
+        if (plan.ramPerBatch <= ramCapPerBatch) return plan;
+    }
+    return null;
 }
 
 // ── Status / helpers ────────────────────────────────────────────────────────
@@ -1146,6 +1196,56 @@ function expectedIncome(t) {
     return (t.maxMoney * t.f * t.chance) / (BATCH_PERIOD / 1000);
 }
 
+/**
+ * Build the status-bus snapshot for dashboard.js — the same numbers renderStatus
+ * prints, as a plain JSON-able object. Reuses pure helpers (displayHealth,
+ * expectedIncome, poolFree) and the module state (pipelines, rampSaturated, shareThreads),
+ * so it adds no NS calls beyond the cheap getHackingLevel already in the RAM budget.
+ * `stage` labels which controller is live; `tickGap` is the engine-lag signal.
+ */
+function buildSnapshot(ns, stage, servers, pool, eligible, needsPrep, tickGap) {
+    let inFlight = 0, depth = 0;
+    const targets = [];
+    for (const t of eligible) {
+        const { moneyFrac, secOver } = displayHealth(t);
+        const pipe = pipelines.get(t.hostname);
+        const committed = pipe ? pipe.committed.length : 0;
+        const tDepth = pipe ? pipe.depth : 0;
+        inFlight += committed;
+        depth += tDepth;
+        targets.push({
+            host: t.hostname,
+            moneyFrac,
+            secOver,
+            f: t.f,
+            committed,
+            depth: tDepth,
+            income: expectedIncome(t),
+            time: t.weakenTime, // full op/cycle time (the longest of the HWGW ops)
+        });
+    }
+    return {
+        stage,
+        ts: Date.now(),
+        level: ns.getHackingLevel(),
+        rooted: servers.filter((s) => s.hasRoot).length,
+        total: servers.length,
+        poolFree: poolFree(pool),
+        totalRam: servers.reduce((sum, s) => (s.hasRoot ? sum + s.maxRam : sum), 0),
+        topRampF: eligible.reduce((m, t) => Math.max(m, t.f), 0), // highest ramped hack-%
+        rampSaturated,
+        income: eligible.reduce((sum, t) => sum + expectedIncome(t), 0),
+        shareThreads,
+        shareOff,
+        inFlight,
+        depth,
+        tickGap,
+        lastWorkMs,
+        targets,
+        prep: needsPrep.slice(0, 12).map((t) => ({ host: t.hostname, moneyFrac: t.money / t.maxMoney, time: ns.getWeakenTime(t.hostname) })),
+    };
+}
+
 /** Render a refreshing status table to the tail window each tick. */
 function renderStatus(ns, servers, pool, eligible, needsPrep) {
     ns.clearLog();
@@ -1158,7 +1258,10 @@ function renderStatus(ns, servers, pool, eligible, needsPrep) {
     const W = 58;
     ns.print(`╔═ BOOSTER ═ ${new Date().toLocaleTimeString()} ${"═".repeat(Math.max(0, W - 24))}`);
     ns.print(`║ Hack Lv ${level}  |  Rooted ${rooted}/${servers.length}  |  Pool ${ns.format.ram(free)} free / ${ns.format.ram(totalRam)}`);
-    const ramp = rampLevel > 0 ? `  |  Ramp ${Math.round(rampLevel * 100)}%` : "";
+    // Top target's hack-% (the waterfall ramps the best target first); SAT = the
+    // waterfall is saturated (all admitted at HACK_PCT_RAMP_MAX, surplus is shareable).
+    const topF = eligible.reduce((m, t) => Math.max(m, t.f), 0);
+    const ramp = topF > 0 ? `  |  Ramp ${Math.round(topF * 100)}%${rampSaturated ? " SAT" : ""}` : "";
     // Pipeline fill meter: total in-flight batches vs total target depth across all
     // batchers, so how full the pipelines are running is visible at a glance.
     let inFlight = 0, depth = 0;

@@ -156,44 +156,19 @@ export const HACK_PCT_MAX = 0.99;
 // absolute income does: we can spend the idle RAM by pushing hack-% ABOVE the
 // per-target peak (more money per batch at worse $/GB/s — fine, the GB are idle).
 //
-// A single sticky global `rampLevel` acts as a hack-% FLOOR: each target plans at
-// max(score-optimal f, rampLevel), capped at HACK_PCT_RAMP_MAX. The level moves at
-// most one RAMP_STEP per tick, driven by actual POOL UTILIZATION (1 − free/total,
-// which already counts prep usage): raise it while every batch-worthy target has a
-// slot and the pool sits under RAMP_UTIL_LOW used; lower it once usage exceeds
-// RAMP_UTIL_HIGH or admission is RAM/lag-starved. The wide LOW..HIGH deadband keeps
-// routine mid-cycle oscillation from springing it up/down, and basing it on real
-// utilization (not "prep empty") means a steady-state prep trickle no longer blocks
-// the ramp while a fresh-save bootstrap — where prep eats the small pool — still
-// reads as fully-used and won't ramp.
+// selectBatchers does this per-target with a WATERFALL (no global floor): it packs
+// every admitted target at its score-optimal f, then spends the leftover budget by
+// ramping the SINGLE most lucrative target up to HACK_PCT_RAMP_MAX first, spilling
+// any remainder down the ranked list to the 2nd-best, and so on. This beats a flat
+// global floor under RAM pressure — a flat floor grows weak targets too (little
+// extra money) and shoves the marginal target past the budget, dropping it. The
+// ramped f is sticky (locked like the base plan, only raised on re-anchor), so a
+// running pipeline's RAM footprint never jitters tick-to-tick.
 
-/** Max effective hack-% the ramp may reach. Also the share-residual boundary:
- *  once rampLevel == this and prep is clear, free RAM beyond the reserve is
- *  shareable. Tune in-game. */
+/** Max effective hack-% the per-target waterfall may reach. Also the share-residual
+ *  boundary: once every admitted target sits at this cap and prep is clear, the
+ *  leftover budget is genuine surplus and becomes shareable. Tune in-game. */
 export const HACK_PCT_RAMP_MAX = 0.75;
-
-/** Per-tick step the ramp floor moves by. Small → smooth, no flap. */
-export const RAMP_STEP = 0.02;
-
-/** Ramp UP only when pool utilization (1 − free/total) is below this — i.e. there
- *  is genuine idle RAM after batch + prep. */
-export const RAMP_UTIL_LOW = 0.85;
-
-/** Ramp DOWN when pool utilization exceeds this (pool nearly full). The gap
- *  RAMP_UTIL_LOW..RAMP_UTIL_HIGH is the hold deadband. */
-export const RAMP_UTIL_HIGH = 0.97;
-
-/** Ramp UP also requires this much *admission-budget* headroom (1 − reserved/budget).
- *  selectBatchers reserves the full pipeline RAM immediately, but pipelines fill
- *  gradually, so actual pool utilization lags far behind committed budget. Without a
- *  budget-headroom gate the ramp reads the idle (not-yet-filled) RAM and keeps pushing
- *  hack-% up even though the budget is already fully reserved — which can't add
- *  throughput, it just makes batches bigger and shoves the marginal target past the
- *  budget, dropping it from the admitted set. That coupling produced a 1-tick limit
- *  cycle (ramp 40↔42%, batchers 10↔8). Gating ramp-up on real budget headroom (≳ one
- *  ramp step's worth) makes it settle at the highest hack-% where the full admitted
- *  set still fits. Tune in-game. */
-export const RAMP_BUDGET_MIN = 0.05;
 
 // ── Worker scripts ─────────────────────────────────────────────────────────
 
