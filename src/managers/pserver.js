@@ -113,7 +113,7 @@ function cheapestBuy(ns) {
     const ram = PSERVER_START_RAM;
     return {
         cost: ns.cloud.getServerCost(ram),
-        label: `buy ${nextName(ns)} @ ${ram}GB`,
+        label: `buy ${nextName(ns)} @ ${ns.format.ram(ram)}`,
         execute: () => ns.cloud.purchaseServer(nextName(ns), ram),
     };
 }
@@ -133,7 +133,7 @@ function cheapestUpgrade(ns, owned, maxRam) {
         if (!best || cost < best.cost) {
             best = {
                 cost,
-                label: `upgrade ${host} ${ram}→${nextRam}GB`,
+                label: `upgrade ${host} ${ns.format.ram(ram)}→${ns.format.ram(nextRam)}`,
                 execute: () => ns.cloud.upgradeServer(host, nextRam),
             };
         }
