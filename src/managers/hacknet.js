@@ -29,11 +29,12 @@ import {
     MANAGER_LOOP_SLEEP,
     MANAGER_MAX_BUYS_PER_TICK,
     BN_DURATIONS_JSON,
+    STATUS_PORT_HACKNET,
 } from "/config/constants.js";
+import { publishStatus } from "/lib/status.js";
 
 export async function main(ns) {
     ns.disableLog("ALL");
-    ns.ui.openTail();
 
     // Horizon is fixed for the whole run — compute it once (this also records the
     // previous run's duration into the history file, keyed off the aug-reset timestamp).
@@ -42,6 +43,16 @@ export async function main(ns) {
     while (true) {
         const status = step(ns, horizon);
         renderStatus(ns, status);
+        publishStatus(ns, STATUS_PORT_HACKNET, {
+            ts: Date.now(),
+            nodes: status.nodes,
+            maxNodes: status.maxNodes,
+            production: status.production,
+            horizonHrs: status.horizon.seconds / 3600,
+            nextCost: status.cost,
+            payback: status.payback,
+            action: `${status.label} — ${status.decision}`,
+        });
         if (status.decision === "done" || status.decision === "exhausted") {
             // Either everything is maxed, or nothing left pays back within the (fixed)
             // run horizon. The horizon won't improve mid-run, so stop looping and exit to
