@@ -368,6 +368,23 @@ export const SERVERS_JSON = "/data/servers.json";
  */
 export const FLAG_PORT = 1;
 
+// ── Status bus (see lib/status.js) ─────────────────────────────────────────
+//
+// Each long-running script publishes a small JSON snapshot of its state to its own
+// dedicated port at the end of every tick; dashboard.js peeks all of them and renders
+// one unified overlay. Ports are free RAM and persist across ticks, and each snapshot
+// carries a `ts` timestamp so the dashboard can flag a dead/stale publisher. Only one
+// controller (booster OR orbiter) runs at a time, so they share one port.
+
+/** Active HWGW controller (booster or orbiter) status snapshot. */
+export const STATUS_PORT_CONTROLLER = 2;
+/** contracts manager status snapshot. */
+export const STATUS_PORT_CONTRACTS = 3;
+/** pserver manager status snapshot. */
+export const STATUS_PORT_PSERVER = 4;
+/** hacknet manager status snapshot. */
+export const STATUS_PORT_HACKNET = 5;
+
 /** Recorded run (aug-reset) durations + last-seen aug-reset timestamp, for hacknet's
  *  ROI horizon. Survives aug installs (a soft reset keeps files); delete on a full
  *  BitNode reset to start the horizon history fresh. */
@@ -401,3 +418,11 @@ export const ORBITER = "/orbiter.js";
  *  +2 GB ns.getServer it lands at 7.85, slightly UNDER booster's 8.35. Re-measure and
  *  update after any change that adds/removes an NS call. */
 export const ORBITER_RAM_GB = 7.85;
+
+// ── Dashboard ──────────────────────────────────────────────────────────────
+
+/** Unified HTML/CSS overlay dashboard (reads the status-bus ports above). */
+export const DASHBOARD = "/dashboard.js";
+/** dashboard.js own RAM footprint, GB. Measure with `mem dashboard.js` and update
+ *  (port reads + ns.atExit are free, so this is essentially just the base cost). */
+export const DASHBOARD_RAM_GB = 1.6; // 1.60 base — keep the snapshot field names off NS-function names (e.g. `share`) or the analyzer phantom-charges +2.40
