@@ -25,15 +25,25 @@ import {
     PSERVER_BOOTSTRAP_RAM_GB,
     MANAGER_LOOP_SLEEP,
     MANAGER_MAX_BUYS_PER_TICK,
+    STATUS_PORT_PSERVER,
 } from "/config/constants.js";
+import { publishStatus } from "/lib/status.js";
 
 export async function main(ns) {
     ns.disableLog("ALL");
-    ns.ui.openTail();
 
     while (true) {
         const status = step(ns);
         renderStatus(ns, status);
+        publishStatus(ns, STATUS_PORT_PSERVER, {
+            ts: Date.now(),
+            count: status.count,
+            limit: status.limit,
+            fleetRam: status.fleetRam,
+            income: status.income,
+            nextCost: status.cost,
+            action: `${status.label} — ${status.decision}`,
+        });
         if (status.decision === "done") {
             // Fleet fully maxed — nothing left to buy. Exit to free our home RAM back to
             // the worker pool; booster won't relaunch us this run (in-memory suppression),
@@ -103,7 +113,7 @@ function cheapestBuy(ns) {
     const ram = PSERVER_START_RAM;
     return {
         cost: ns.cloud.getServerCost(ram),
-        label: `buy ${nextName(ns)} @ ${ram}GB`,
+        label: `buy ${nextName(ns)} @ ${ns.format.ram(ram)}`,
         execute: () => ns.cloud.purchaseServer(nextName(ns), ram),
     };
 }
@@ -123,7 +133,7 @@ function cheapestUpgrade(ns, owned, maxRam) {
         if (!best || cost < best.cost) {
             best = {
                 cost,
-                label: `upgrade ${host} ${ram}→${nextRam}GB`,
+                label: `upgrade ${host} ${ns.format.ram(ram)}→${ns.format.ram(nextRam)}`,
                 execute: () => ns.cloud.upgradeServer(host, nextRam),
             };
         }

@@ -18,11 +18,11 @@
  * type later = add one pure function and one SOLVERS entry.
  */
 
-import { SERVERS_JSON, MANAGER_LOOP_SLEEP } from "/config/constants.js";
+import { SERVERS_JSON, MANAGER_LOOP_SLEEP, STATUS_PORT_CONTRACTS } from "/config/constants.js";
+import { publishStatus } from "/lib/status.js";
 
 export async function main(ns) {
     ns.disableLog("ALL");
-    ns.ui.openTail();
 
     // Lifetime tallies + a small ring of recent activity lines for the status box.
     const totals = { solved: 0, failed: 0, skipped: 0 };
@@ -42,6 +42,13 @@ export async function main(ns) {
     while (true) {
         sweep(ns, totals, note, failedOnce);
         renderStatus(ns, totals, recent);
+        publishStatus(ns, STATUS_PORT_CONTRACTS, {
+            ts: Date.now(),
+            solved: totals.solved,
+            failed: totals.failed,
+            skipped: totals.skipped,
+            action: recent.length ? recent[recent.length - 1] : "(no contracts seen yet)",
+        });
         await ns.sleep(MANAGER_LOOP_SLEEP);
     }
 }

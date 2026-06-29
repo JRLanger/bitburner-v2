@@ -25,8 +25,8 @@ orbiter is a **fork of booster**. Everything except the planning core is carried
 over unchanged: `discoverAndRoot`/`tryRoot`/`provisionWorkers`, the RAM pool
 (`buildPool`/`placeThreads`), manager orchestration
 (`launchManagers`/`nextManagerReserve`), `sharePhase`, the self-pacing scheduler
-shell (`batchPhase`/`fireBatch`), `selectBatchers` admission, the ramp
-controller, and the status table. See [booster.md](booster.md) for those.
+shell (`batchPhase`/`fireBatch`), `selectBatchers` admission + the per-target
+waterfall ramp, and the status table. See [booster.md](booster.md) for those.
 
 The Formulas core is what differs:
 
@@ -35,20 +35,26 @@ The Formulas core is what differs:
   planning calculation runs against this *hypothetical baseline* server plus the
   live `ns.getPlayer()` (fetched once per tick), so the numbers are exact for the
   state a batch will actually act on — regardless of the server's current state.
-- **`bestHackPct`** sweeps hack fractions `f` and, per `f`, computes:
-  `h = ceil(f / formulas.hacking.hackPercent(snap, player))`; grow via
-  `formulas.hacking.growThreads(postHackSnap, player, moneyMax)` on a snapshot whose
-  money is set to `moneyMax*(1-f)`; op-times and `chance` from the matching
-  `formulas.hacking.*` calls. It returns the best-scoring row ($/GB/s), carrying the
-  plan's threads, op-times, and chance.
-- **`lockedPlan`** caches each batcher's plan in `batchPlan`, stamped with the
-  hacking `level` and `rampLevel` it was computed at, and only recomputes when one of
-  those changes. Because the recompute is Formulas-exact, a level-up just re-balances
-  `h`/`g` in place — no drift grace, no destructive re-prep.
+- **`buildPlanner` / `bestHackPct` / `maximizeHackPct`.** `buildPlanner` resolves the
+  f-independent baseline once (`hackPercent`, op-times, `chance`, `moneyMax` from the
+  prepped snapshot + live player) and returns `atF(f)`, which costs one HWGW batch at
+  fraction `f`: `h = ceil(f / hackPercent)`; grow via `growThreads` on a snapshot whose
+  money is `moneyMax*(1-f)`; counter-weakens scaled by `ORBITER_THREAD_MARGIN`.
+  `bestHackPct` sweeps `atF` upward and returns the best-scoring ($/GB/s) row (the base
+  plan); `maximizeHackPct` sweeps it **downward** from `HACK_PCT_RAMP_MAX` and returns
+  the highest `f` that fits a RAM cap (the waterfall's up-ramp). Both carry the plan's
+  threads, op-times, and chance, so `batchPhase` needs no further NS calls.
+- **`lockedPlan`** caches each batcher's **base** plan in `batchPlan`, stamped with the
+  hacking `level`, and only recomputes when the level changes (dropping the sticky
+  `rampPlan` so the waterfall re-ramps from the fresh base). Because the recompute is
+  Formulas-exact, a level-up just re-balances `h`/`g` in place — no drift grace, no
+  destructive re-prep.
 - **`classify`** keeps booster's strict-to-admit / loose-windowed-to-keep hysteresis,
-  but drops booster's pre-Formulas drift machinery (`unhealthySince`/`DRIFT_GRACE_MS`,
-  the `effF` staleness trace). A target drifts out only if its windowed baseline
-  leaves the keep-bounds, which should now be rare.
+  the `unhealthySince`/`DRIFT_GRACE_MS` drift grace (raised to **10 s**) and the
+  `BATCH_DROP_MIN_FILL` ramping guard, and — like booster — **kills a dropped target's
+  in-flight workers** (`killWorkersFor`) so re-prep starts clean instead of stacking
+  stale workers onto the re-admitted pipeline. A target drifts out only if its windowed
+  baseline stays outside the keep-bounds past the grace.
 - **`prepWave`** sizes grow with `formulas.hacking.growThreads` on the live server
   instead of `growthAnalyze`.
 
@@ -77,14 +83,29 @@ final design, both worth preserving:
    The drift was misdiagnosed first as grow under-provisioning, and `THREAD_MARGIN`
    was removed entirely ("growThreads is exact") then re-added at 1.01→1.02 — none of
    which fixed it, which is what pointed at scheduling. orbiter keeps a *small*
-   `ORBITER_THREAD_MARGIN` (1.01) on grow + counter-weakens as cheap insurance against
-   per-cycle rounding/jitter compounding over a deep pipeline (the over-grow clamps
-   harmlessly at max); hack threads stay exact.
+   `ORBITER_THREAD_MARGIN` (**1.025**, raised from 1.01 after deep, high-level servers
+   were seen to slowly ratchet money 100%→~40% over a fill — the 1% cushion couldn't
+   absorb per-cycle rounding + level-up creep on the in-flight backlog) on grow +
+   counter-weakens; the over-grow clamps harmlessly at max, hack threads stay exact.
 
 3. **Plans are LOCKED for cost, not correctness.** Recomputing every server's full
    hack-% sweep every tick cost ~100ms/tick (`getServer` + ~75 `growThreads` calls ×
-   ~60 servers), which itself added landing jitter. `lockedPlan` pins planning to
-   admission + level/ramp changes, dropping per-tick work back toward booster's ~40ms.
+   ~60 servers), which itself added landing jitter. `lockedPlan` pins base planning to
+   admission + level changes, and the waterfall's `rampPlan` is likewise sticky (an
+   incumbent reuses its ramped `f` rather than re-sweeping `maximizeHackPct` each tick),
+   dropping per-tick work back toward booster's ~40ms.
+
+4. **In-flight workers must match the plan, or `reserved` lies and the pool
+   oversubscribes.** This was the real root of the long "RAM spirals to 100% when big
+   servers flood in and force others to ramp down" failure. orbiter carries the full
+   shared fix (see booster.md, "In-flight workers must match the current plan"):
+   **kill-on-drop** (`killWorkersFor` when `classify` drops a target), an **instant-drain
+   re-anchor** in `batchPhase` when f drops past `REANCHOR_DROP_FRAC` (kill all workers,
+   refill at the new f so actual RAM matches `reserved` immediately), **`RAMP_HYSTERESIS_FRAC`**
+   to keep f piecewise-constant so re-anchors stay rare, and the hard **`REFILL_HEADROOM_FRAC`**
+   floor on prep/share. The deep-pipeline weakness here is the long weaken time: a stale
+   generation drains for ~8 minutes, so leaving workers un-killed stacked 3–4 generations
+   and 2–3×'d the RAM before the fix.
 
 ## Alternatives considered
 
@@ -99,3 +120,13 @@ final design, both worth preserving:
 - **Predict op-times at the level expected when ops land** (rather than at fire time).
   Not pursued — live times at fire time are sufficient and match the validated booster
   scheduler.
+
+## Status bus (dashboard hook)
+
+Each tick, right after `renderStatus`, orbiter calls
+`publishStatus(ns, STATUS_PORT_CONTROLLER, buildSnapshot(...))` to broadcast its live
+state to the status bus (see `docs/scripts/status.md`). `buildSnapshot` reuses the same
+values the tail table already computes (`displayHealth`, `expectedIncome`, `poolFree`,
+the `pipelines` map, `topRampF`/`rampSaturated`, `shareThreads`) plus `tickGap`/`lastWorkMs` for the
+engine-lag indicator — no new NS calls. `dashboard.js` reads it to render the unified
+overlay. The tail render is kept as a fallback. (booster.js carries the identical hook.)
