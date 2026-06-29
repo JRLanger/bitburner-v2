@@ -20,10 +20,15 @@ The panel shows, top to bottom:
 
 - **KPI strip** — total income ($/s), hacking level, hack-% ramp, share
   state; plus pool utilization and pipeline-fill bars (with rooted count).
-- **Targets table** — every batching target sorted by income: money %, security-over-min,
-  hack %, a pipeline-fill mini-bar (`committed/depth`), and $/s. Each row is colour-coded
-  by health (green healthy / amber draining-or-not-full / red starved).
-- **Prep queue** — targets being prepped, each with a money-% progress mini-bar.
+- **Targets table** — a single ranked list of the top ~20 servers, **already ordered and
+  tagged by the controller** (no client-side sorting). Columns: money %, security-over-min,
+  hack %, a pipeline-fill mini-bar (`committed/depth`), and a value column. Rows are
+  colour-coded by **state**: green = actively batching, blue = prepped but idle (lost the
+  RAM race this tick), red = prepping / needs prep. Idle and prepping rows show only
+  money/sec/time/value (hack-% and fill don't apply — nothing is in flight yet). The value
+  column **and its header adapt to the controller's ranking mode** (`rankByIncome`): `$/s`
+  when admission is ranking by absolute earning power (RAM-rich), or `$/GB·s` when ranking
+  by efficiency (RAM-limited) — so the row order always reads sensibly against the metric.
 - **Scripts row** — one chip per script (controller, contracts, pserver, hacknet, share)
   with a live/stale/done dot and its headline stat (fleet size, hacknet production, etc.).
 - **Alerts line** — engine lag, pool nearly full, share paused, or a manager that stopped

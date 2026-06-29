@@ -55,7 +55,7 @@ export async function main(ns) {
         // Live title: "Dashboard - <Controller> · <income>/s · <n> tgt".
         const c = snaps.ctrl;
         titleEl.textContent = c
-            ? `Dashboard - ${capitalize(c.stage || "controller")} · ${fmtMoney(c.income)}/s · ${c.targets ? c.targets.length : 0} tgt`
+            ? `Dashboard - ${capitalize(c.stage || "controller")} · ${fmtMoney(c.income)}/s · ${c.activeCount ?? 0} tgt`
             : "Dashboard - Offline";
         body.innerHTML = render(snaps);
         await ns.sleep(1000);
@@ -136,7 +136,6 @@ function render(snaps) {
 
     parts.push(renderKpis(c, now));
     parts.push(renderTargets(c));
-    parts.push(renderPrep(c));
     parts.push(renderScripts(snaps, now));
     parts.push(renderAlerts(snaps, now));
 
@@ -171,39 +170,56 @@ function renderKpis(c, now) {
     </div>`;
 }
 
+/**
+ * The target table: the best 20 servers by $/s in one ranked list, already ordered
+ * and tagged by the controller. Colour by state — green = batching, blue = prepped
+ * but idle (lost out on RAM this tick), red = prepping / needs prep. Idle and prepping
+ * rows show money/sec/time/$/s only; hack-% and pipeline fill don't apply since nothing
+ * is in flight for them yet.
+ */
 function renderTargets(c) {
     if (!c) return "";
-    const rows = (c.targets || []).slice().sort((a, b) => b.income - a.income);
-    if (rows.length === 0) return `<div class="bb-section bb-dim">No targets batching.</div>`;
+    const rows = c.targets || [];
+    if (rows.length === 0) return `<div class="bb-section bb-dim">No targets.</div>`;
+
+    // The controller already ordered the list by whichever metric selectBatchers used
+    // this tick. Mirror that in the value column + a badge so the order makes sense.
+    const byIncome = c.rankByIncome !== false; // default $/s for older snapshots
+    const metricHdr = byIncome ? "$/s" : "$/GB·s";
+    const metricLabel = byIncome ? "ranked by $/s · RAM-rich" : "ranked by $/GB·s · RAM-limited";
+    // score is $/(ms·GB); ×1000 → $/(s·GB) for a human-readable per-second figure.
+    const metricVal = (t) => byIncome ? fmtMoney(t.income) : fmtMoney((t.score || 0) * 1000);
+
     const body = rows.map((t) => {
-        const full = t.depth > 0 && t.committed >= t.depth;
-        const cls = t.moneyFrac < 0.85 ? "bb-row-red" : (!full || t.secOver > 1) ? "bb-row-amber" : "bb-row-green";
-        const fillFrac = t.depth > 0 ? t.committed / t.depth : 0;
+        let cls, hkCell, fillCell;
+        if (t.kind === "active") {
+            cls = "bb-row-green";
+            const fillFrac = t.depth > 0 ? t.committed / t.depth : 0;
+            hkCell = `<td class="bb-num">${Math.round(t.f * 100)}%</td>`;
+            fillCell = `<td class="bb-fill">${miniBar(fillFrac)}<span class="bb-filltxt">${fmtCount(t.committed)}/${fmtCount(t.depth)}</span></td>`;
+        } else {
+            cls = t.kind === "prepping" ? "bb-row-red" : "bb-row-blue";
+            hkCell = `<td class="bb-num bb-dim">—</td>`;
+            fillCell = `<td class="bb-fill bb-dim">—</td>`;
+        }
         return `<tr class="${cls}">
           <td class="bb-host">${t.host}</td>
           <td class="bb-num">${Math.round(t.moneyFrac * 100)}%</td>
           <td class="bb-num">+${t.secOver.toFixed(2)}</td>
-          <td class="bb-num">${Math.round(t.f * 100)}%</td>
+          ${hkCell}
           <td class="bb-num bb-dim">${fmtTime(t.time)}</td>
-          <td class="bb-fill">${miniBar(fillFrac)}<span class="bb-filltxt">${fmtCount(t.committed)}/${fmtCount(t.depth)}</span></td>
-          <td class="bb-num bb-green">${fmtMoney(t.income)}</td>
+          ${fillCell}
+          <td class="bb-num bb-green">${metricVal(t)}</td>
         </tr>`;
     }).join("");
     return `
     <div class="bb-section">
+      <div class="bb-label">TARGETS · ${metricLabel}</div>
       <table class="bb-table">
-        <thead><tr><th>TARGET</th><th>MON</th><th>SEC</th><th>HK</th><th>TIME</th><th>FILL</th><th>$/s</th></tr></thead>
+        <thead><tr><th>TARGET</th><th>MON</th><th>SEC</th><th>HK</th><th>TIME</th><th>FILL</th><th>${metricHdr}</th></tr></thead>
         <tbody>${body}</tbody>
       </table>
     </div>`;
-}
-
-function renderPrep(c) {
-    if (!c || !c.prep || c.prep.length === 0) return "";
-    const chips = c.prep.map((p) =>
-        `<span class="bb-chip bb-prepchip"><span class="bb-prepname">${p.host}</span>${miniBar(p.moneyFrac)}<span class="bb-filltxt">${Math.round(p.moneyFrac * 100)}%</span><span class="bb-preptime">${fmtTime(p.time)}</span></span>`
-    ).join("");
-    return `<div class="bb-section"><div class="bb-label">PREPPING (${c.prep.length})</div><div class="bb-chips">${chips}</div></div>`;
 }
 
 function renderScripts(snaps, now) {
@@ -410,23 +426,19 @@ function injectStyle(doc) {
 #${ROOT_ID} .bb-table { width: 100%; border-collapse: collapse; }
 #${ROOT_ID} .bb-table th { color: var(--bb-dim); font-size: 16px; text-align: right; padding: 4px 6px; letter-spacing: 0.5px; font-weight: 500; }
 #${ROOT_ID} .bb-table th:first-child { text-align: left; }
+#${ROOT_ID} .bb-table th:nth-child(6) { text-align: left; padding-left: 22px; } /* FILL */
+#${ROOT_ID} .bb-table td:nth-child(6) { padding-left: 22px; } /* FILL */
 #${ROOT_ID} .bb-table td { padding: 4px 6px; font-size: 16px; }
 #${ROOT_ID} .bb-host { color: var(--bb-fg); }
 #${ROOT_ID} .bb-num { text-align: right; font-variant-numeric: tabular-nums; }
-#${ROOT_ID} .bb-fill { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
+#${ROOT_ID} .bb-fill { display: flex; align-items: center; gap: 8px; justify-content: flex-start; }
 #${ROOT_ID} .bb-filltxt { color: var(--bb-dim); font-size: 17px; min-width: 52px; text-align: right; }
 #${ROOT_ID} .bb-row-green .bb-host { border-left: 3px solid var(--bb-green); padding-left: 7px; }
-#${ROOT_ID} .bb-row-amber .bb-host { border-left: 3px solid var(--bb-amber); padding-left: 7px; }
 #${ROOT_ID} .bb-row-red .bb-host { border-left: 3px solid var(--bb-red); padding-left: 7px; }
-#${ROOT_ID} .bb-row-red .bb-num:nth-child(2) { color: var(--bb-red); }
+#${ROOT_ID} .bb-row-blue .bb-host { border-left: 3px solid var(--bb-blue); padding-left: 7px; }
 
 #${ROOT_ID} .bb-minibar { display: inline-block; width: 72px; height: 8px; background: rgba(255,255,255,0.06); border-radius: 4px; overflow: hidden; }
 #${ROOT_ID} .bb-minifill { display: block; height: 100%; }
-
-#${ROOT_ID} .bb-chips { display: flex; flex-wrap: wrap; gap: 9px; }
-#${ROOT_ID} .bb-chip { display: inline-flex; align-items: center; gap: 7px; padding: 5px 12px; border-radius: 16px; background: rgba(255,255,255,0.04); font-size: 18px; }
-#${ROOT_ID} .bb-prepchip .bb-prepname { color: var(--bb-fg); }
-#${ROOT_ID} .bb-preptime { color: var(--bb-cyan); margin-left: 2px; }
 #${ROOT_ID} .bb-mgrlist { display: flex; flex-direction: column; gap: 6px; }
 #${ROOT_ID} .bb-mgrrow { padding: 6px 10px; border-radius: 8px; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06); }
 #${ROOT_ID} .bb-mgrhead { display: flex; align-items: baseline; gap: 8px; margin-bottom: 3px; }
