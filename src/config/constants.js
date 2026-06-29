@@ -76,7 +76,23 @@ export const BATCH_KEEP_SEC_FRAC = 0.10;
 // so a self-healing transient is ridden out, while a genuine sustained collapse is
 // still caught. Tune in-game.
 /** Re-prep a drifted batcher only after it stays unhealthy this long, ms. */
-export const DRIFT_GRACE_MS = 4000;
+export const DRIFT_GRACE_MS = 10000;
+
+// A pipeline still FILLING toward its depth (a cold start, or a target RAM-starved
+// while many newly-eligible servers flood in at once — e.g. just after bulk-buying
+// the port openers + Formulas.exe) has not reached the steady state the keep-test
+// above judges. Its low windowed money is the ramp, not genuine drift. Dropping it
+// to re-prep then destroys the partial pipeline while its already-exec'd HWGW
+// workers keep running for a full weaken time — untracked RAM-squatting "zombies"
+// that starve every other pipeline's refill, driving more targets unhealthy and
+// dropping them too: a self-sustaining churn the scheduler cannot climb out of (a
+// cold start, which never drops, fills cleanly — proving the steady-state design is
+// sound). So the keep-test only governs a target whose pipeline is at least this
+// fraction of depth; below it the target is protected from the drop and left to
+// fill. Inert in steady state (full pipelines sit at ~100% fill), so throughput is
+// unchanged.
+/** Only re-prep a drifted batcher once its pipeline has filled to ≥ this × depth. */
+export const BATCH_DROP_MIN_FILL = 0.9;
 
 // ── Batcher admission control ──────────────────────────────────────────────
 
@@ -87,7 +103,22 @@ export const DRIFT_GRACE_MS = 4000;
 // order only while their cumulative pipeline RAM stays under this fraction of the
 // TOTAL pool. The remainder is real headroom for prep, recovery, and jitter.
 /** Fraction of total pool RAM usable for batch pipelines. Tune in-game. */
-export const BATCH_BUDGET_FRAC = 0.80;
+export const BATCH_BUDGET_FRAC = 0.90;
+
+// Hard, untouchable free-RAM floor that BOTH prep and share must always leave
+// free, so batchPhase can always fit its per-tick refills and pipelines never
+// decay. BATCH_BUDGET_FRAC caps the batchers' *reservation* but does NOT guarantee
+// free RAM at the instant a refill needs it: as deep pipelines fill, prepFloor
+// (= reserved − batchRunningRam) shrinks toward 0 and prep is then free to drive
+// poolFree to ~0, so batchPhase can't fit even one batch (ramPerBatch > poolFree →
+// defer) → pipelines decay → money drifts → keep-test churn → 100%-RAM spiral
+// (observed after a flood of newly-rooted servers floods the prep queue at once).
+// This makes the 20% that BATCH_BUDGET_FRAC already conceptually reserves LITERAL
+// and untouchable — the same condition a cold restart (no pending prep) satisfies.
+// Keep equal to (1 − BATCH_BUDGET_FRAC); raise both in tandem only if testing shows
+// refills still defer under flood. Tune in-game.
+/** Fraction of total pool RAM kept free as a hard refill floor. Tune in-game. */
+export const REFILL_HEADROOM_FRAC = 1 - BATCH_BUDGET_FRAC; // 0.10
 
 // A starved target's launch clock can fall a full pipeline behind; without a cap
 // it dumps the entire backlog (hundreds of batches) in one tick, spiking RAM and
@@ -138,7 +169,7 @@ export const THREAD_MARGIN = 1.10;
 // than booster's pre-Formulas 1.10 suffices. Tune in-game: raise if big servers still
 // ratchet down, lower toward 1.0 while they hold at ~100%.
 /** Multiplier applied to orbiter's grow/weaken thread counts (Formulas-exact base). */
-export const ORBITER_THREAD_MARGIN = 1.01;
+export const ORBITER_THREAD_MARGIN = 1.025;
 
 // ── Hack-percentage table ──────────────────────────────────────────────────
 
@@ -169,6 +200,31 @@ export const HACK_PCT_MAX = 0.99;
  *  boundary: once every admitted target sits at this cap and prep is clear, the
  *  leftover budget is genuine surplus and becomes shareable. Tune in-game. */
 export const HACK_PCT_RAMP_MAX = 0.75;
+
+// ── f-stability: hysteresis + instant-drain re-anchor ──────────────────────
+//
+// A batcher's hack-% f sets its per-batch RAM, but the pipeline holds ~a weaken
+// time of in-flight workers all launched at WHATEVER f was current when each fired.
+// So if f wobbles (selectBatchers re-sizing marginal targets against fluctuating
+// leftover budget every tick), a pipeline whose plan now says "f=6%" is physically
+// full of old f=60% workers — real RAM 10× the plan, `reserved` undercounts, the pool
+// oversubscribes, and the batcher spiral returns. Two coupled guards fix it:
+//
+//   RAMP_HYSTERESIS_FRAC — an incumbent keeps its locked plan while its cost stays
+//   within ±this band of its allocated capacity; f is only re-planned when capacity
+//   moves OUTSIDE the band. This makes f piecewise-constant (no tick-to-tick wobble)
+//   instead of churning, so re-anchors (below) are rare and deliberate.
+//
+//   REANCHOR_DROP_FRAC — when f genuinely drops by more than this (relative), the
+//   pipeline is INSTANT-DRAINED: all its in-flight workers are killed and it refills
+//   from empty at the new (smaller) f, so actual RAM snaps down to match `reserved`
+//   immediately instead of staying bloated for a weaken time. (f-UP needs no kill —
+//   old small + new big drains safely and `reserved` over-counts.) Set ≥ the
+//   hysteresis band so we never re-anchor on noise. Both tunable in-game.
+/** Deadband (fraction of capacity) before an incumbent's locked f is re-planned. */
+export const RAMP_HYSTERESIS_FRAC = 0.15;
+/** Minimum relative f drop that triggers a kill-all + refill re-anchor. */
+export const REANCHOR_DROP_FRAC = 0.15;
 
 // ── Worker scripts ─────────────────────────────────────────────────────────
 
@@ -367,17 +423,22 @@ export const BN_DURATIONS_JSON = "/data/bn-durations.json";
 
 // ── Diagnostics ────────────────────────────────────────────────────────────
 
-/** When true, booster appends per-tick diagnostics to BOOSTER_DEBUG_LOG (write is
- *  free RAM, so this costs booster nothing). Captures: per-tick admission summary;
- *  which targets drop and whether classify (drift keep-test) or selectBatchers
- *  (budget/cap) dropped them; hacking-LEVEL changes; per-target drift TRACE lines
- *  (raw + windowed money/security, locked f vs current effective hack fraction, and
- *  locked vs live weaken time — to pin drift on plan-staleness as the level rises);
- *  and batch DEFER lines (pipeline couldn't refill because the pool was full). Trace
- *  lines are gated to the windowed-drift case plus a sparse heartbeat, so a healthy
- *  fleet stays quiet. Set false to silence. */
-export const BOOSTER_DEBUG = true;
+/** When true, the active controller (booster OR orbiter) appends per-tick
+ *  diagnostics to its own debug log — booster → BOOSTER_DEBUG_LOG, orbiter →
+ *  ORBITER_DEBUG_LOG (separate files so the booster→orbiter handoff can't clobber
+ *  or interleave the two). Write is free RAM, so this costs the controller nothing.
+ *  Captures: per-tick admission summary; which targets drop and whether classify
+ *  (drift keep-test) or selectBatchers (budget/cap) dropped them; hacking-LEVEL
+ *  changes; per-target drift TRACE lines (raw + windowed money/security, locked f
+ *  vs current effective hack fraction, and locked vs live weaken time — to pin
+ *  drift on plan-staleness as the level rises); and batch DEFER lines (pipeline
+ *  couldn't refill because the pool was full). Trace lines are gated to the
+ *  windowed-drift case plus a sparse heartbeat, so a healthy fleet stays quiet. One
+ *  shared flag: booster and orbiter run at different stages, so it only ever drives
+ *  whichever is live. Set false to silence. */
+export const CONTROLLER_DEBUG = true;
 export const BOOSTER_DEBUG_LOG = "/data/booster-debug.txt";
+export const ORBITER_DEBUG_LOG = "/data/orbiter-debug.txt";
 
 // ── Detection / handoff ────────────────────────────────────────────────────
 

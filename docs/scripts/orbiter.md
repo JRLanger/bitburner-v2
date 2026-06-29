@@ -50,9 +50,11 @@ The Formulas core is what differs:
   Formulas-exact, a level-up just re-balances `h`/`g` in place — no drift grace, no
   destructive re-prep.
 - **`classify`** keeps booster's strict-to-admit / loose-windowed-to-keep hysteresis,
-  but drops booster's pre-Formulas drift machinery (`unhealthySince`/`DRIFT_GRACE_MS`,
-  the `effF` staleness trace). A target drifts out only if its windowed baseline
-  leaves the keep-bounds, which should now be rare.
+  the `unhealthySince`/`DRIFT_GRACE_MS` drift grace (raised to **10 s**) and the
+  `BATCH_DROP_MIN_FILL` ramping guard, and — like booster — **kills a dropped target's
+  in-flight workers** (`killWorkersFor`) so re-prep starts clean instead of stacking
+  stale workers onto the re-admitted pipeline. A target drifts out only if its windowed
+  baseline stays outside the keep-bounds past the grace.
 - **`prepWave`** sizes grow with `formulas.hacking.growThreads` on the live server
   instead of `growthAnalyze`.
 
@@ -81,9 +83,10 @@ final design, both worth preserving:
    The drift was misdiagnosed first as grow under-provisioning, and `THREAD_MARGIN`
    was removed entirely ("growThreads is exact") then re-added at 1.01→1.02 — none of
    which fixed it, which is what pointed at scheduling. orbiter keeps a *small*
-   `ORBITER_THREAD_MARGIN` (1.01) on grow + counter-weakens as cheap insurance against
-   per-cycle rounding/jitter compounding over a deep pipeline (the over-grow clamps
-   harmlessly at max); hack threads stay exact.
+   `ORBITER_THREAD_MARGIN` (**1.025**, raised from 1.01 after deep, high-level servers
+   were seen to slowly ratchet money 100%→~40% over a fill — the 1% cushion couldn't
+   absorb per-cycle rounding + level-up creep on the in-flight backlog) on grow +
+   counter-weakens; the over-grow clamps harmlessly at max, hack threads stay exact.
 
 3. **Plans are LOCKED for cost, not correctness.** Recomputing every server's full
    hack-% sweep every tick cost ~100ms/tick (`getServer` + ~75 `growThreads` calls ×
@@ -91,6 +94,18 @@ final design, both worth preserving:
    admission + level changes, and the waterfall's `rampPlan` is likewise sticky (an
    incumbent reuses its ramped `f` rather than re-sweeping `maximizeHackPct` each tick),
    dropping per-tick work back toward booster's ~40ms.
+
+4. **In-flight workers must match the plan, or `reserved` lies and the pool
+   oversubscribes.** This was the real root of the long "RAM spirals to 100% when big
+   servers flood in and force others to ramp down" failure. orbiter carries the full
+   shared fix (see booster.md, "In-flight workers must match the current plan"):
+   **kill-on-drop** (`killWorkersFor` when `classify` drops a target), an **instant-drain
+   re-anchor** in `batchPhase` when f drops past `REANCHOR_DROP_FRAC` (kill all workers,
+   refill at the new f so actual RAM matches `reserved` immediately), **`RAMP_HYSTERESIS_FRAC`**
+   to keep f piecewise-constant so re-anchors stay rare, and the hard **`REFILL_HEADROOM_FRAC`**
+   floor on prep/share. The deep-pipeline weakness here is the long weaken time: a stale
+   generation drains for ~8 minutes, so leaving workers un-killed stacked 3–4 generations
+   and 2–3×'d the RAM before the fix.
 
 ## Alternatives considered
 

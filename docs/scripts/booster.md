@@ -56,10 +56,19 @@ The main loop (`main`) each tick:
    already catches — and the raw `chance` read dips on the same mid-cycle spike.
    `needsPrep` is sorted **easiest-earner first** (ascending `maxMoney`).
 5. `selectBatchers` — **admission control + per-target waterfall ramp.** Two passes
-   over the score-sorted `eligible` list in rank order (incumbents from `wasBatching`
-   get a small `SELECT_KEEP_BIAS` so the set doesn't flap). A target's *base pipeline
-   cost* is `concurrency × base ramPerBatch`, where `concurrency = ceil(weakenTime /
-   BATCH_PERIOD)` (f-independent).
+   over the `eligible` list in rank order (incumbents from `wasBatching` get a small
+   `SELECT_KEEP_BIAS` so the set doesn't flap). A target's *base pipeline cost* is
+   `concurrency × base ramPerBatch`, where `concurrency = ceil(weakenTime / BATCH_PERIOD)`
+   (f-independent).
+   - **Ranking metric tracks the binding constraint.** If the top-`MAX_BATCH_TARGETS`
+     *earners* (by `potential = maxMoney × chance`, a target's absolute $/s once ramped)
+     all fit their base pipelines in the budget, RAM is **not** the bottleneck — the count
+     cap is — so admission ranks by `potential`, giving the slots to the biggest earners.
+     Otherwise RAM is scarce and admission ranks by `$/GB/s` `score` (most income per
+     limited GB). The mode (`ramAbundantMode`) is **sticky with a 5% hysteresis band** so a
+     pool wobble at the boundary can't flap the metric and churn deep pipelines. This fixes
+     the case where, under the count cap with idle RAM, a fast low-money server (great
+     `$/GB/s`, poor `$/s`) would take a slot from a far bigger earner with a longer cycle.
    - **Pass A — pack base load.** Admit each target at its score-optimal (base) plan
      until the budget (`BATCH_BUDGET_FRAC` of the *total* pool) or `MAX_BATCH_TARGETS`
      binds. If a target's full base pipeline doesn't fit `remaining`, it's the marginal
@@ -213,7 +222,12 @@ never undermines the bootstrap fix. `PREP_LOOKAHEAD` keeps prep breadth aligned
 with the cap so prep doesn't sprawl onto servers that won't earn a slot. Tradeoff:
 with the cap active, a freed slot can briefly go to an easy modest server before a
 big earner finishes prepping — this self-corrects as `selectBatchers` retains the
-highest-score targets and drops weaker ones (hysteresis permitting).
+top-ranked targets and drops weaker ones (hysteresis permitting). Crucially, the
+**rank metric itself adapts to which ceiling binds**: in the lag-limited (cap-bound,
+RAM-rich) regime it ranks by absolute earning power (`maxMoney × chance`) so the
+limited slots hold the biggest *earners*; only in the RAM-limited regime does it
+rank by `$/GB/s` efficiency. Ranking by efficiency under the count cap would waste
+slots on fast low-money servers while a 10×-bigger earner sat idle.
 
 **Admission control is the core correctness mechanism.** Each batching target
 independently tries to maintain a full pipeline of `ceil(weakenTime/BATCH_PERIOD)`
@@ -231,8 +245,9 @@ in a 10-hour run:
   prep (the `prepping` count oscillated), then slowly healed and were re-admitted.
 
 `selectBatchers` fixes the root cause by matching aggregate batch demand to pool
-capacity. `BATCH_BUDGET_FRAC = 0.80` leaves ~20% of the *total* pool as genuine
-headroom for prep, recovery waves, and per-tick jitter — a proportional reserve,
+capacity. `BATCH_BUDGET_FRAC` (currently **0.90**) leaves the complementary
+`REFILL_HEADROOM_FRAC` (~10%) of the *total* pool as genuine, hard-reserved
+headroom for prep, refills, and per-tick jitter — a proportional reserve,
 not a flat constant that becomes meaningless as the pool grows. Un-admitted prepped
 targets simply idle: since they aren't hacked, they stay at max money at zero RAM
 cost and are admitted instantly when budget frees.
@@ -253,6 +268,47 @@ keep running for a full weaken time while re-admission fires fresh batches on to
 worker accumulation collapses the pool to near-zero, starving everything and
 causing the very drift the system is trying to avoid. The plan is deleted when a
 target drifts out (so it re-optimises fresh on the next admission).
+
+**In-flight workers must match the current plan — kill them when they can't (the
+flood-churn fix).** The worker-accumulation collapse described just above was the root
+of a long, recurring "RAM spirals to 100%, everything churns" failure that appeared
+whenever a flood of newly-prepped big servers entered the set and forced others to ramp
+down. The invariant the whole batcher depends on: **`reserved` (admission's RAM model,
+`depth × ramPerBatch`) must equal the actual in-flight worker RAM.** It silently breaks
+whenever a pipeline's live workers stop matching its plan, and three sources were found
+and fixed:
+
+- **Drop → re-admit.** `classify` dropping a target left its HWGW workers running for a
+  full weaken time; the target was usually re-admitted within seconds, so those stale
+  workers stacked on the fresh pipeline (3–4 generations → 2–3× the plan's RAM, hidden
+  in the *batch* bucket because the host was re-admitted). Fix: `killWorkersFor` kills
+  **all** of a target's in-flight workers at the moment `classify` drops it, so re-prep
+  starts clean — exactly the state a cold restart enjoys.
+- **f-change on a live pipeline.** When `selectBatchers` lowered a target's hack-% (its
+  share of leftover budget shrank), the pipeline stayed full of the old, *larger*-f
+  workers while `reserved` was computed on the new, smaller f — real RAM 5–10× the
+  plan. Fix: `batchPhase` detects a meaningful f-**drop** (> `REANCHOR_DROP_FRAC`) and
+  **instant-drains** the pipeline (kills all its workers, refills from empty at the new
+  f), so actual RAM snaps down to match `reserved` that tick. f-**up** needs no kill
+  (old small + new big drains safely; `reserved` over-counts → conservative).
+- **f churn.** The above re-anchor would thrash if f wobbled tick-to-tick, so the
+  ramp/marginal plan is now **hysteretic** (`RAMP_HYSTERESIS_FRAC`): an incumbent keeps
+  its locked plan while its cost stays within a band of its allocated capacity, making f
+  piecewise-constant so re-anchors are rare and deliberate.
+
+Together these keep `reserved ≡ actual`, so the pool can never silently oversubscribe.
+(A fourth source — a server *evicted* from the top-`MAX_BATCH_TARGETS` leaving its
+workers draining as untracked "orphan" RAM — is understood but left for later, as it
+was small once the above were fixed; a debounced kill-on-sustained-eviction is the
+planned remedy if it ever grows.)
+
+**A protected refill headroom (`REFILL_HEADROOM_FRAC`).** Prep and share must always
+leave a hard slice of free RAM (`poolTotal × REFILL_HEADROOM_FRAC`, the complement of
+`BATCH_BUDGET_FRAC`) untouched, so `batchPhase` can always fire each pipeline's per-tick
+refills and no pipeline decays. Before this, `prepFloor` only shielded the batchers'
+*unclaimed* reservation, which collapsed to ~0 once pipelines filled — letting prep
+drive free RAM to zero and starve refills. It is defence-in-depth (not the primary cure,
+which is the worker-matching above) but a correct, cheap invariant.
 
 **Batch landing times use fresh op-times, never the locked plan's.** `batchPhase`
 schedules each batch's four landings from `ns.getWeakenTime/getGrowTime/getHackTime`

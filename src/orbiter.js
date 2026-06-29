@@ -36,6 +36,7 @@ import {
     MONEY_EPSILON,
     BATCH_KEEP_MONEY_FRAC,
     BATCH_KEEP_SEC_FRAC,
+    BATCH_DROP_MIN_FILL,
     DRIFT_GRACE_MS,
     HACK_PCT_MIN,
     HACK_PCT_MAX,
@@ -50,6 +51,9 @@ import {
     HOME_SAFETY_BUFFER_GB,
     FORMULAS_EXE,
     BATCH_BUDGET_FRAC,
+    REFILL_HEADROOM_FRAC,
+    RAMP_HYSTERESIS_FRAC,
+    REANCHOR_DROP_FRAC,
     MAX_FIRES_PER_TICK,
     MAX_BATCH_TARGETS,
     SELECT_KEEP_BIAS,
@@ -57,8 +61,8 @@ import {
     D_GAP,
     BATCH_PERIOD,
     BATCH_SAFETY_MS,
-    BOOSTER_DEBUG,
-    BOOSTER_DEBUG_LOG,
+    CONTROLLER_DEBUG,
+    ORBITER_DEBUG_LOG,
     CONTRACTS_MANAGER,
     PSERVER_MANAGER,
     HACKNET_MANAGER,
@@ -186,8 +190,18 @@ let shareOff = false;
  */
 let rampSaturated = false;
 
+/**
+ * Sticky admission-ranking mode (see selectBatchers). false = rank by $/GB/s `score`
+ * (RAM is the binding constraint — pack income per scarce GB); true = rank by absolute
+ * earning power (the MAX_BATCH_TARGETS count cap is binding while RAM is plentiful — fill
+ * the slots with the biggest earners). Sticky with a hysteresis band so a pool wobble at
+ * the boundary can't flap the mode (which would reshuffle the admitted set and churn deep
+ * pipelines).
+ */
+let ramAbundantMode = false;
+
 /** Diagnostic log buffer (flushed once per tick) and a monotonic tick counter so
- *  log lines from the same tick can be grouped. See BOOSTER_DEBUG in constants. */
+ *  log lines from the same tick can be grouped. See CONTROLLER_DEBUG in constants. */
 let debugBuf = [];
 let tickNo = 0;
 /** Last hacking level seen, to log level-ups (a prime drift suspect: the locked
@@ -201,14 +215,14 @@ let lastHackLevel = 0;
  *  tick's body duration (top → just before sleep). */
 let lastTickStart = 0;
 let lastWorkMs = 0;
-/** Buffer one diagnostic line for this tick (no-op unless BOOSTER_DEBUG). */
+/** Buffer one diagnostic line for this tick (no-op unless CONTROLLER_DEBUG). */
 function dbg(line) {
-    if (BOOSTER_DEBUG) debugBuf.push(line);
+    if (CONTROLLER_DEBUG) debugBuf.push(line);
 }
 /** Append this tick's buffered diagnostic lines to the log file and clear. */
 function flushDebug(ns) {
-    if (BOOSTER_DEBUG && debugBuf.length > 0) {
-        ns.write(BOOSTER_DEBUG_LOG, debugBuf.join("\n") + "\n", "a");
+    if (CONTROLLER_DEBUG && debugBuf.length > 0) {
+        ns.write(ORBITER_DEBUG_LOG, debugBuf.join("\n") + "\n", "a");
     }
     debugBuf = [];
 }
@@ -247,9 +261,9 @@ export async function main(ns) {
     // Open the unified dashboard if it isn't already running (replaces per-script tails).
     if (ns.fileExists(DASHBOARD, "home") && !isRunning(ns, DASHBOARD)) ns.exec(DASHBOARD, "home");
 
-    // Fresh diagnostic log per run (truncate). No-op cost when BOOSTER_DEBUG off.
-    if (BOOSTER_DEBUG) {
-        ns.write(BOOSTER_DEBUG_LOG, `# orbiter debug log — ${new Date().toISOString()}\n`, "w");
+    // Fresh diagnostic log per run (truncate). No-op cost when CONTROLLER_DEBUG off.
+    if (CONTROLLER_DEBUG) {
+        ns.write(ORBITER_DEBUG_LOG, `# orbiter debug log — ${new Date().toISOString()}\n`, "w");
     }
 
     // Main control loop. Runs while Formulas.exe is owned (effectively forever once
@@ -267,7 +281,7 @@ export async function main(ns) {
         // plan locked at admission now hacks MORE than its f while its grow still
         // restores only the old f — a leading drift suspect. Correlate trace lines
         // (classify) against these to see drift onset track level-ups.
-        if (BOOSTER_DEBUG) {
+        if (CONTROLLER_DEBUG) {
             const lvl = ns.getHackingLevel();
             if (lvl !== lastHackLevel) {
                 dbg(`T${tickNo} LEVEL ${lastHackLevel} -> ${lvl}`);
@@ -302,7 +316,7 @@ export async function main(ns) {
         // Per-tick summary: eligible vs admitted, so a drop is attributable to either
         // classify (host absent from `eligible`) or selectBatchers (in `eligible`,
         // absent from `batchers` → budget/cap). dropEligible/dropAdmit logged inside.
-        if (BOOSTER_DEBUG) {
+        if (CONTROLLER_DEBUG) {
             const elig = eligible.map((t) => t.hostname);
             const batched = new Set(batchers.map((t) => t.hostname));
             const notAdmitted = elig.filter((h) => !batched.has(h));
@@ -310,19 +324,56 @@ export async function main(ns) {
             // gap over twice LOOP_SLEEP so lag ticks are greppable and can be lined up
             // against the correlated security spikes in the trace lines.
             const slow = tickGap > 2 * LOOP_SLEEP ? " SLOW" : "";
+            const free = poolFree(pool);
+            const headroom = poolTotal * REFILL_HEADROOM_FRAC;
             dbg(
                 `T${tickNo} elig=${eligible.length} batch=${batchers.length} ` +
+                `rooted=${rootedHosts.length} lvl=${lastHackLevel} ` +
                 `topF=${batchers.length ? Math.round(batchers[0].f * 100) : 0}%${rampSaturated ? " SAT" : ""} ` +
                 `reserved=${ns.format.ram(reserved)}/${ns.format.ram(poolTotal * BATCH_BUDGET_FRAC)} ` +
-                `poolFree=${ns.format.ram(poolFree(pool))} ` +
+                `poolFree=${ns.format.ram(free)}/${ns.format.ram(headroom)}floor ` +
                 `gap=${tickGap}ms work=${lastWorkMs}ms (sleep=${LOOP_SLEEP}ms)${slow}`
             );
+            // RAM attribution: where the USED RAM actually is. If poolFree sits at/below
+            // the headroom floor, this line names the bucket eating it — orphan>0 means
+            // zombie workers from dropped targets are squatting RAM (the churn fingerprint).
+            const batchSet = new Set(batchers.map((t) => t.hostname));
+            const prepSet = new Set(needsPrep.map((t) => t.hostname));
+            const att = ramAttribution(ns, rootedHosts, batchSet, prepSet);
+            const used = poolTotal - free;
+            const other = used - att.batch - att.prep - att.share - att.orphan; // managers + controller
+            dbg(
+                `  RAM used=${ns.format.ram(used)} batch=${ns.format.ram(att.batch)} ` +
+                `prep=${ns.format.ram(att.prep)} share=${ns.format.ram(att.share)} ` +
+                `orphan=${ns.format.ram(att.orphan)} other=${ns.format.ram(other)}`
+            );
+            if (att.orphan > 0) {
+                const top = [...att.orphanHosts.entries()]
+                    .sort((a, b) => b[1] - a[1]).slice(0, 6)
+                    .map(([h, r]) => `${h}=${ns.format.ram(r)}`).join(" ");
+                dbg(`  RAM orphans: ${top}`);
+            }
+            // Near-saturation per-batcher detail (only when free is within 1.25× the floor,
+            // i.e. when the problem manifests): fill vs depth and actual vs planned RAM, to
+            // separate under-fill (RAM-starved refills) from over-fill (plan/RAM mismatch).
+            if (free <= headroom * 1.25) {
+                for (const t of batchers) {
+                    const pipe = pipelines.get(t.hostname);
+                    const fill = pipe ? `${pipe.committed.length}/${pipe.depth}` : "-/-";
+                    const actualRam = att.byTarget.get(t.hostname) ?? 0;
+                    const planRam = Math.ceil(t.weakenTime / BATCH_PERIOD) * t.ramPerBatch;
+                    dbg(
+                        `    bat ${t.hostname} f=${Math.round(t.f * 100)}% fill=${fill} ` +
+                        `ram=${ns.format.ram(actualRam)}/${ns.format.ram(planRam)}plan`
+                    );
+                }
+            }
             if (notAdmitted.length > 0) dbg(`  selectBatchers excluded: ${notAdmitted.join(", ")}`);
         }
 
         // Batch the admitted targets first (consumes RAM by rank), then spend
         // whatever's left prepping the next-best targets.
-        batchPhase(ns, batchers, pool);
+        batchPhase(ns, batchers, pool, rootedHosts);
 
         // Reserve the batchers' *unclaimed* pipeline RAM from prep, so a target
         // ramping toward its full pipeline (which fills gradually over a weaken
@@ -334,7 +385,10 @@ export async function main(ns) {
             batchRunningRam += (inFlight.get(t.hostname) ?? 0) * WORKER_RAM.weakenRam;
         }
         const prepFloor = Math.max(0, reserved - batchRunningRam);
-        prepPhase(ns, needsPrep, pool, inFlight, player, prepFloor);
+        // Hard refill floor: free RAM prep/share may never cross, so batchPhase can
+        // always fire its per-tick refills and pipelines never decay (see prepPhase).
+        const refillHeadroom = poolTotal * REFILL_HEADROOM_FRAC;
+        prepPhase(ns, needsPrep, pool, inFlight, player, prepFloor, refillHeadroom);
 
         // Share phase (idle-RAM → faction reputation). Once the waterfall is
         // saturated (rampSaturated, set by selectBatchers) and prep is clear, the
@@ -355,7 +409,9 @@ export async function main(ns) {
         updateDisplayStats(eligible);
         renderStatus(ns, servers, pool, batchers, needsPrep);
         // Publish the same data to the status bus for dashboard.js (free port write).
-        publishStatus(ns, STATUS_PORT_CONTROLLER, buildSnapshot(ns, "orbiter", servers, pool, batchers, needsPrep, tickGap));
+        // Pass the FULL eligible set (not just batchers) so the dashboard can show
+        // prepped-but-idle targets too (those that lost out on RAM this tick).
+        publishStatus(ns, STATUS_PORT_CONTROLLER, buildSnapshot(ns, "orbiter", servers, pool, eligible, batchers, needsPrep, player, tickGap));
 
         // Remember this tick's admitted set for next tick's admission hysteresis.
         wasBatching.clear();
@@ -490,6 +546,69 @@ function inFlightByTarget(ns, rootedHosts) {
     return map;
 }
 
+/**
+ * Kill every in-flight HWGW worker targeting `target` across the pool. Called when a
+ * target is DROPPED to re-prep: without this, the dropped pipeline's workers keep
+ * draining for a full weaken time (~minutes). Because the host is usually re-admitted
+ * within seconds, those stale workers stack on top of the fresh pipeline's workers —
+ * 3-4 overlapping generations inflate the host's real RAM to 2-3× its plan, eat the
+ * pool headroom, starve refills, and over-steal money to ~0, snowballing into the
+ * 100%-RAM churn. Killing them makes a drop start clean, exactly like a cold restart.
+ * Mirrors inFlightByTarget's matching (WORKER_FILES + args[0]); ns.ps/ns.kill are
+ * already in the script's RAM footprint, and drops are rare, so the cost is negligible.
+ */
+function killWorkersFor(ns, rootedHosts, target) {
+    let killed = 0;
+    for (const host of rootedHosts) {
+        for (const proc of ns.ps(host)) {
+            if (!WORKER_FILES.has(stripSlash(proc.filename))) continue;
+            if (proc.args[0] !== target) continue;
+            if (ns.kill(proc.pid)) killed += proc.threads;
+        }
+    }
+    return killed;
+}
+
+/**
+ * DEBUG-ONLY. Attribute every live worker's RAM across the pool into four buckets so
+ * a saturated pool reveals WHO is holding the RAM the log otherwise can't name:
+ *   batch  — workers on a current batcher (the legitimate pipeline load),
+ *   prep   — workers on a current needs-prep target,
+ *   share  — ns.share workers,
+ *   orphan — workers on a host that is NEITHER a batcher nor a prep target, i.e.
+ *            zombies from a target that was dropped/de-eligible but whose in-flight
+ *            HWGW workers keep draining and squatting RAM. A large/persistent orphan
+ *            bucket is the direct fingerprint of the drop-churn → refill-starvation loop.
+ * `byTarget` maps each hack target to its live worker RAM (for the per-batcher detail).
+ * No new NS-RAM cost (ns.ps is already in the script footprint); CPU only, debug-gated.
+ */
+function ramAttribution(ns, rootedHosts, batchSet, prepSet) {
+    const hackFile = stripSlash(HACK_WORKER);
+    const growFile = stripSlash(GROW_WORKER);
+    const weakenFile = stripSlash(WEAKEN_WORKER);
+    const shareFile = stripSlash(SHARE_WORKER);
+    let batch = 0, prep = 0, share = 0, orphan = 0;
+    const byTarget = new Map();
+    const orphanHosts = new Map();
+    for (const host of rootedHosts) {
+        for (const proc of ns.ps(host)) {
+            const file = stripSlash(proc.filename);
+            let ram;
+            if (file === hackFile) ram = proc.threads * WORKER_RAM.hackRam;
+            else if (file === growFile) ram = proc.threads * WORKER_RAM.growRam;
+            else if (file === weakenFile) ram = proc.threads * WORKER_RAM.weakenRam;
+            else if (file === shareFile) { share += proc.threads * SHARE_RAM; continue; }
+            else continue;
+            const target = proc.args[0];
+            byTarget.set(target, (byTarget.get(target) ?? 0) + ram);
+            if (batchSet.has(target)) batch += ram;
+            else if (prepSet.has(target)) prep += ram;
+            else { orphan += ram; orphanHosts.set(target, (orphanHosts.get(target) ?? 0) + ram); }
+        }
+    }
+    return { batch, prep, share, orphan, byTarget, orphanHosts };
+}
+
 // ── Manager orchestration ───────────────────────────────────────────────────
 
 /**
@@ -596,6 +715,9 @@ function classify(ns, servers, player) {
     const now = Date.now();
     const eligible = [];
     const needsPrep = [];
+    // Rooted hosts run the workers; used to kill a dropped target's stale in-flight
+    // workers so re-prep starts clean (see killWorkersFor at the DROP branch below).
+    const rootedHosts = servers.filter((s) => s.hasRoot).map((s) => s.hostname);
 
     for (const s of servers) {
         if (!s.hasRoot || s.maxMoney <= 0 || s.hackLevelReq > level) continue;
@@ -619,12 +741,25 @@ function classify(ns, servers, player) {
             const healthy =
                 moneyFrac >= BATCH_KEEP_MONEY_FRAC &&
                 secOver <= s.minSecurity * BATCH_KEEP_SEC_FRAC;
+            // A pipeline still FILLING toward depth (RAM-starved while a flood of newly-
+            // eligible servers contends for the pool — e.g. just after bulk-buying the port
+            // openers) hasn't reached the steady state this keep-test judges; its low
+            // windowed money is the ramp, not drift. Dropping it destroys the partial
+            // pipeline and orphans its in-flight HWGW workers as RAM-squatting zombies that
+            // starve every other pipeline's refill, snowballing into a churn the scheduler
+            // can't climb out of. So protect a ramping pipeline from the drop; the keep-test
+            // only governs FULL pipelines (≥ BATCH_DROP_MIN_FILL × depth). Inert in steady
+            // state (full pipelines sit at ~100% fill), so throughput is unchanged.
+            const pipe = pipelines.get(s.hostname);
+            const ramping = pipe
+                ? pipe.committed.length < pipe.depth * BATCH_DROP_MIN_FILL
+                : true;
             // Drift grace: keep batching through a brief unhealthy blip (a SLOW engine
             // tick or a level-up momentarily desyncs the windowed baseline); only drop
             // once unhealthy continuously past DRIFT_GRACE_MS. Critical for deep targets
             // whose multi-minute weaken time makes a needless drop very expensive.
-            let keep = healthy;
-            if (healthy) {
+            let keep = healthy || ramping;
+            if (healthy || ramping) {
                 unhealthySince.delete(s.hostname);
             } else {
                 const since = unhealthySince.get(s.hostname) ?? now;
@@ -639,11 +774,15 @@ function classify(ns, servers, player) {
                 }
             } else {
                 // Genuinely drifted (unhealthy past the grace window) → drop to re-prep.
+                // Kill the stale pipeline's in-flight workers FIRST so they can't keep
+                // draining for a weaken time and stack on the re-admitted generation.
+                const killed = killWorkersFor(ns, rootedHosts, s.hostname);
                 dbg(
                     `  classify DROP ${s.hostname}: moneyFrac=${moneyFrac.toFixed(3)} ` +
                     `(keep≥${BATCH_KEEP_MONEY_FRAC}) secOver=${secOver.toFixed(2)} ` +
                     `(keep≤${(s.minSecurity * BATCH_KEEP_SEC_FRAC).toFixed(2)}) ` +
-                    `graceMs=${now - (unhealthySince.get(s.hostname) ?? now)}`
+                    `fill=${pipe ? pipe.committed.length + "/" + pipe.depth : "-/-"} ramping=${ramping} ` +
+                    `killed=${killed} graceMs=${now - (unhealthySince.get(s.hostname) ?? now)}`
                 );
                 unhealthySince.delete(s.hostname);  // clear grace state
                 activeBatching.delete(s.hostname);
@@ -663,7 +802,11 @@ function classify(ns, servers, player) {
         if (best) {
             activeBatching.add(s.hostname);
             eligible.push({ ...s, sec, money, ...best });
-            dbg(`  classify ADMIT-NEW ${s.hostname} (was re-prepped or fresh)`);
+            dbg(
+                `  classify ADMIT-NEW ${s.hostname} (was re-prepped or fresh): ` +
+                `money=${((money / s.maxMoney) * 100).toFixed(1)}% sec=+${(sec - s.minSecurity).toFixed(2)} ` +
+                `(min=${s.minSecurity.toFixed(2)})`
+            );
         }
     }
 
@@ -712,11 +855,17 @@ function isPrepped(s, sec, money) {
  * fresh/re-anchored target (not an incumbent, no in-flight grid to desync) takes its
  * full computed ramp immediately; a level-up re-ramps via lockedPlan clearing rampPlan.
  *
- * Hysteresis: admission walks targets in score order, but an incumbent (last tick's
- * batcher) gets a SELECT_KEEP_BIAS score bonus for ordering only — so a marginally
- * higher newcomer can't evict a running pipeline, while a clearly higher one still can.
- * Two ceilings: the RAM budget (early, RAM-limited) and MAX_BATCH_TARGETS (late,
- * lag-limited); whichever binds first wins.
+ * Ranking metric depends on the BINDING constraint (see the ramAbundant block). When RAM
+ * is scarce, rank by $/GB/s `score` (most income per limited GB). When the MAX_BATCH_TARGETS
+ * count cap binds while RAM is plentiful, rank by absolute earning power so the slots go to
+ * the biggest earners, not the most RAM-efficient ones (a fast low-money server has a great
+ * $/GB/s but a poor $/s — pointless to prefer it when GB are idle).
+ *
+ * Hysteresis: admission walks targets in that rank order, but an incumbent (last tick's
+ * batcher) gets a SELECT_KEEP_BIAS bonus for ordering only — so a marginally higher
+ * newcomer can't evict a running pipeline, while a clearly higher one still can. Two
+ * ceilings: the RAM budget (early, RAM-limited) and MAX_BATCH_TARGETS (late, lag-limited);
+ * whichever binds first wins.
  *
  * Returns `rampSaturated`: true once every admitted target is at HACK_PCT_RAMP_MAX and
  * budget still remains — the signal sharePhase uses to spend genuine surplus on share().
@@ -725,8 +874,23 @@ function selectBatchers(ns, eligible, poolTotal, player) {
     const budget = poolTotal * BATCH_BUDGET_FRAC;
     const concurrency = (t) => Math.ceil(t.weakenTime / BATCH_PERIOD);
 
-    // Order by score, giving incumbents a small bonus (anti-flap, anti-squat).
-    const effScore = (t) => t.score * (wasBatching.has(t.hostname) ? 1 + SELECT_KEEP_BIAS : 1);
+    // Pick the ranking metric by the BINDING constraint. `potential` = maxMoney × chance,
+    // a target's absolute earning power once it ramps to max hack-% (∝ its steady $/s). If
+    // the top-MAX_BATCH_TARGETS earners' full base pipelines ALL fit the budget, RAM is not
+    // the bottleneck — the count cap is — so rank by potential (biggest earners win the
+    // slots). Otherwise RAM is scarce, so $/GB/s `score` (more income per limited GB) wins.
+    // The mode is sticky with a 5% hysteresis band (ramAbundantMode) so a pool wobble at the
+    // boundary can't flap the metric and churn deep pipelines.
+    const potential = (t) => t.maxMoney * t.chance;
+    const topByIncomeCost = [...eligible]
+        .sort((a, b) => potential(b) - potential(a))
+        .slice(0, MAX_BATCH_TARGETS)
+        .reduce((sum, t) => sum + concurrency(t) * t.ramPerBatch, 0);
+    ramAbundantMode = topByIncomeCost <= budget * (ramAbundantMode ? 1.05 : 1.0);
+    const rankKey = ramAbundantMode ? potential : (t) => t.score;
+
+    // Order by the chosen metric, giving incumbents a small bonus (anti-flap, anti-squat).
+    const effScore = (t) => rankKey(t) * (wasBatching.has(t.hostname) ? 1 + SELECT_KEEP_BIAS : 1);
     const order = [...eligible].sort((a, b) => effScore(b) - effScore(a));
 
     // Pass A — pack every target at its base (score-optimal) plan.
@@ -758,10 +922,21 @@ function selectBatchers(ns, eligible, poolTotal, player) {
             const t = a.t;
             const conc = concurrency(t);
             const capacity = a.baseCost + excess;
-            // Sticky: an incumbent keeps its locked ramped plan while it still fits.
+            // Sticky + HYSTERESIS: an incumbent keeps its locked ramped plan while its
+            // cost stays within ±RAMP_HYSTERESIS_FRAC of the allocated capacity, so f
+            // stays piecewise-constant instead of churning tick-to-tick as the leftover
+            // budget wobbles (the churn that left pipelines full of mismatched-f workers
+            // and oversubscribed the pool). Re-plan only when capacity moves OUTSIDE the
+            // band: well above → ramp up; well below → ramp down (which batchPhase then
+            // instant-drains, see REANCHOR_DROP_FRAC). Keeping a plan slightly over
+            // capacity is fine — `reserved` reflects it (matches the live pipeline) and
+            // the small overcommit is absorbed by the refill headroom.
             let ramped = rampPlan.get(t.hostname);
-            const fits = ramped && conc * ramped.ramPerBatch <= capacity + 1e-6;
-            if (!(wasBatching.has(t.hostname) && fits)) {
+            const lockedCost = ramped ? conc * ramped.ramPerBatch : 0;
+            const withinBand = ramped &&
+                lockedCost <= capacity * (1 + RAMP_HYSTERESIS_FRAC) &&
+                lockedCost >= capacity * (1 - RAMP_HYSTERESIS_FRAC);
+            if (!(wasBatching.has(t.hostname) && withinBand)) {
                 ramped = maximizeHackPct(ns, t, player, capacity / conc, t.f);
                 if (ramped) rampPlan.set(t.hostname, ramped);
             }
@@ -779,7 +954,7 @@ function selectBatchers(ns, eligible, poolTotal, player) {
     }
 
     const batchers = admitted.map((a) => a.plan);
-    batchers.sort((a, b) => b.score - a.score); // restore global rank order
+    batchers.sort((a, b) => rankKey(b) - rankKey(a)); // restore global rank order (same metric)
     return { batchers, reserved: used, rampSaturated: saturated };
 }
 
@@ -805,7 +980,7 @@ function selectBatchers(ns, eligible, poolTotal, player) {
  * batch-rig.js, Mode C on iron-gym at full depth): +0.00 security, ~2ms landing
  * error, ~full throughput indefinitely.
  */
-function batchPhase(ns, eligible, pool) {
+function batchPhase(ns, eligible, pool, rootedHosts) {
     const now = Date.now();
 
     for (const t of eligible) {
@@ -831,10 +1006,27 @@ function batchPhase(ns, eligible, pool) {
 
         let pipe = pipelines.get(target);
         if (!pipe) {
-            pipe = { committed: [], lastLand: 0, depth };
+            pipe = { committed: [], lastLand: 0, depth, f: t.f };
             pipelines.set(target, pipe);
         }
         pipe.depth = depth;
+
+        // Instant-drain re-anchor on a meaningful f-DOWN. The pipeline is full of
+        // workers launched at the OLD (larger) f; firing smaller batches into it would
+        // leave it mismatched (real RAM far above the new plan → pool oversubscribes).
+        // So when f drops past REANCHOR_DROP_FRAC, kill ALL its in-flight workers and
+        // rebuild from empty at the new f — actual RAM snaps down to match `reserved`
+        // this tick. f-UP needs no kill (old small + new big drains safely). Rare,
+        // because RAMP_HYSTERESIS_FRAC keeps f from wobbling.
+        if (pipe.committed.length > 0 && t.f < pipe.f * (1 - REANCHOR_DROP_FRAC)) {
+            const killed = killWorkersFor(ns, rootedHosts, target);
+            if (CONTROLLER_DEBUG) {
+                dbg(`  batch ${target} REANCHOR f ${Math.round(pipe.f * 100)}%->${Math.round(t.f * 100)}% killed=${killed}`);
+            }
+            pipe.committed = [];
+            pipe.lastLand = 0;
+        }
+        pipe.f = t.f;
 
         // Drop landings that have already passed; what remains is the live depth.
         pipe.committed = pipe.committed.filter((land) => land > now);
@@ -858,7 +1050,7 @@ function batchPhase(ns, eligible, pool) {
         // money can drift down even though the locked plan is balanced. Logging the
         // defer + the resulting under-fill separates this RAM-starvation drift cause
         // from the plan-staleness one the classify trace captures.
-        if (BOOSTER_DEBUG && deferred) {
+        if (CONTROLLER_DEBUG && deferred) {
             dbg(
                 `  batch ${target} DEFER: ramPerBatch=${ns.format.ram(ramPerBatch)} > ` +
                 `poolFree=${ns.format.ram(poolFree(pool))} fill=${pipe.committed.length}/${depth} fired=${k}`
@@ -894,7 +1086,7 @@ function fireBatch(ns, pool, t, base, now, hackTime, growTime, weakenTime) {
  * valuable first, one corrective wave per target at a time (skip targets that
  * already have workers in flight).
  */
-function prepPhase(ns, needsPrep, pool, inFlight, player, prepFloor = 0) {
+function prepPhase(ns, needsPrep, pool, inFlight, player, prepFloor = 0, refillHeadroom = 0) {
     // Breadth guard: when the batch cap is active, don't prep more servers than
     // could earn a slot soon (cap + lookahead). needsPrep is easiest-first, so
     // this preps the cheapest candidates. Inert when MAX_BATCH_TARGETS is large.
@@ -903,11 +1095,15 @@ function prepPhase(ns, needsPrep, pool, inFlight, player, prepFloor = 0) {
     for (const t of needsPrep) {
         if (considered >= prepBudget) break;
         considered++;
-        // Stop once free RAM hits the batchers' reserved-but-unclaimed floor —
-        // that RAM belongs to ramping pipelines, not prep.
-        if (poolFree(pool) <= prepFloor) break;
+        // Stop once free RAM hits the higher of (a) the batchers' reserved-but-
+        // unclaimed floor — RAM that belongs to ramping pipelines — and (b) the hard
+        // refill headroom that batchPhase needs to keep every pipeline topped up. The
+        // headroom is the binding floor once pipelines are full (prepFloor → 0); it is
+        // what prevents prep from draining poolFree to zero and starving refills.
+        const prepStop = Math.max(prepFloor, refillHeadroom);
+        if (poolFree(pool) <= prepStop) break;
         if ((inFlight.get(t.hostname) ?? 0) > 0) continue; // wave already running
-        prepWave(ns, t, pool, player, poolFree(pool) - prepFloor);
+        prepWave(ns, t, pool, player, poolFree(pool) - prepStop);
     }
 }
 
@@ -996,7 +1192,7 @@ function sharePhase(ns, pool, poolTotal, needsPrep, rootedHosts) {
         return;
     }
 
-    const residual = poolFree(pool) - poolTotal * (1 - BATCH_BUDGET_FRAC);
+    const residual = poolFree(pool) - poolTotal * REFILL_HEADROOM_FRAC;
     const current = countShareThreads(ns, rootedHosts);
     if (residual <= 0) { shareThreads = current; return; }
 
@@ -1099,9 +1295,16 @@ function buildPlanner(ns, server, player) {
 
     const atF = (f) => {
         const h = Math.ceil(f / hackFrac);
-        // Grow restores the f fraction the hack stole: start at maxMoney*(1−f), target
-        // maxMoney, both at min security (HWGW weakens before the grow lands).
-        snap.moneyAvailable = maxMoney * (1 - f);
+        // h is rounded UP, so the batch actually steals h*hackFrac, which can exceed the
+        // requested f — negligibly on big servers (tiny per-thread hackFrac) but badly on a
+        // small/high-level server where one thread steals a large chunk (e.g. f=0.75 but
+        // h*hackFrac≈0.80). Size the grow to the ACTUAL post-hack money, not maxMoney*(1−f):
+        // sizing it to f under-restores by the rounding gap, and the rolling pipeline lands
+        // each grow on what the last left, pinning money at a fixed point below max
+        // (foodnstuff at ~0.815) that trips the keep-test into an endless drop/re-prep churn.
+        // Cap the steal at the full-drain floor (one thread can steal ≥100%).
+        const actualF = Math.min(h * hackFrac, 1 - 1 / maxMoney);
+        snap.moneyAvailable = maxMoney * (1 - actualF);
         const g = Math.ceil(fm.growThreads(snap, player, maxMoney) * ORBITER_THREAD_MARGIN);
         const w1 = Math.ceil((h * HACK_SEC) / WEAKEN_SEC * ORBITER_THREAD_MARGIN); // counter hack sec
         const w2 = Math.ceil((g * GROW_SEC) / WEAKEN_SEC * ORBITER_THREAD_MARGIN); // counter grow sec
@@ -1198,32 +1401,76 @@ function expectedIncome(t) {
 
 /**
  * Build the status-bus snapshot for dashboard.js — the same numbers renderStatus
- * prints, as a plain JSON-able object. Reuses pure helpers (displayHealth,
- * expectedIncome, poolFree) and the module state (pipelines, rampSaturated, shareThreads),
- * so it adds no NS calls beyond the cheap getHackingLevel already in the RAM budget.
- * `stage` labels which controller is live; `tickGap` is the engine-lag signal.
+ * prints, plus the fuller target list the dashboard needs, as a plain JSON-able
+ * object. `allEligible` is classify's full ranked list (batching AND prepped-but-
+ * idle targets that lost out on RAM this tick); `batchers` is the admitted subset
+ * actually running. Each target is tagged `isBatching` so the dashboard can colour
+ * idle (blue) rows differently from active ones (green/amber). Reuses pure helpers
+ * (displayHealth, expectedIncome, poolFree) and module state (pipelines,
+ * rampSaturated, shareThreads), so it adds no NS calls beyond the cheap
+ * getHackingLevel already in the RAM budget. `stage` labels which controller is
+ * live; `tickGap` is the engine-lag signal.
  */
-function buildSnapshot(ns, stage, servers, pool, eligible, needsPrep, tickGap) {
+function buildSnapshot(ns, stage, servers, pool, allEligible, batchers, needsPrep, player, tickGap) {
+    // Index the ramped plans by host: a batching target's displayed hack-% (and the
+    // income/score derived from it) must come from its RAMPED batcher plan, not from the
+    // base allEligible entry (which carries the score-optimal f the waterfall ramps UP
+    // from). Using allEligible's f here published the un-ramped 4–8% to the dashboard
+    // while the pipeline actually ran at the 75% cap.
+    const batchingSet = new Set(batchers.map((b) => b.hostname));
+    const batcherByHost = new Map(batchers.map((b) => [b.hostname, b]));
     let inFlight = 0, depth = 0;
-    const targets = [];
-    for (const t of eligible) {
+    const rows = [];
+
+    // Prepped servers (batching = green, prepped-but-idle = blue). For batching rows the
+    // ramped plan is the source of f/income/score; idle rows fall back to the base plan.
+    // Only batchers contribute to the pipeline totals.
+    for (const t of allEligible) {
         const { moneyFrac, secOver } = displayHealth(t);
+        const isBatching = batchingSet.has(t.hostname);
+        const plan = batcherByHost.get(t.hostname) ?? t; // ramped plan when batching
         const pipe = pipelines.get(t.hostname);
         const committed = pipe ? pipe.committed.length : 0;
-        const tDepth = pipe ? pipe.depth : 0;
-        inFlight += committed;
-        depth += tDepth;
-        targets.push({
-            host: t.hostname,
-            moneyFrac,
-            secOver,
-            f: t.f,
-            committed,
-            depth: tDepth,
-            income: expectedIncome(t),
-            time: t.weakenTime, // full op/cycle time (the longest of the HWGW ops)
+        // Idle targets never get a pipeline entry, so derive the depth they WOULD run
+        // at from the plan's weaken time, purely for display.
+        const tDepth = pipe ? pipe.depth : Math.ceil(t.weakenTime / BATCH_PERIOD);
+        if (isBatching) { inFlight += committed; depth += tDepth; }
+        rows.push({
+            host: t.hostname, moneyFrac, secOver, f: plan.f, committed, depth: tDepth,
+            income: expectedIncome(plan), score: plan.score, time: t.weakenTime,
+            kind: isBatching ? "active" : "idle",
         });
     }
+
+    // Prep/needs-prep servers (red). To keep the whole list ONE ranked-by-$/s table we
+    // need each prep target's potential income, which needs a plan sweep — so cap the
+    // work: take the highest-maxMoney prep candidates (free proxy; a server outside the
+    // top-20 by maxMoney won't out-earn one inside it) and preview only those. The
+    // preview plan is THROWAWAY — bestHackPct never writes batchPlan/rampPlan, so the
+    // real admission caches are untouched.
+    const prepRanked = [...needsPrep].sort((a, b) => b.maxMoney - a.maxMoney).slice(0, 20);
+    for (const t of prepRanked) {
+        const preview = bestHackPct(ns, t, player);
+        rows.push({
+            host: t.hostname, moneyFrac: t.money / t.maxMoney, secOver: t.sec - t.minSecurity,
+            f: 0, committed: 0, depth: 0,
+            income: preview ? expectedIncome({ ...t, ...preview }) : 0,
+            score: preview ? preview.score : 0,
+            time: ns.getWeakenTime(t.hostname), // live weaken time ≈ time left to finish prep
+            kind: "prepping",
+        });
+    }
+
+    // Grouped list: attacking (active) first, then prepping, then prepped-but-idle —
+    // each group internally ordered by the SAME metric selectBatchers used this tick
+    // (ramAbundantMode → absolute $/s, else $/GB/s score). Capped at 20 rows total.
+    const metricSort = (a, b) => (ramAbundantMode ? b.income - a.income : b.score - a.score);
+    const grouped = [
+        ...rows.filter((r) => r.kind === "active").sort(metricSort),
+        ...rows.filter((r) => r.kind === "prepping").sort(metricSort),
+        ...rows.filter((r) => r.kind === "idle").sort(metricSort),
+    ];
+
     return {
         stage,
         ts: Date.now(),
@@ -1232,17 +1479,18 @@ function buildSnapshot(ns, stage, servers, pool, eligible, needsPrep, tickGap) {
         total: servers.length,
         poolFree: poolFree(pool),
         totalRam: servers.reduce((sum, s) => (s.hasRoot ? sum + s.maxRam : sum), 0),
-        topRampF: eligible.reduce((m, t) => Math.max(m, t.f), 0), // highest ramped hack-%
+        topRampF: batchers.reduce((m, t) => Math.max(m, t.f), 0), // highest ramped hack-%
         rampSaturated,
-        income: eligible.reduce((sum, t) => sum + expectedIncome(t), 0),
+        rankByIncome: ramAbundantMode, // which metric admission/the list is ranked by
+        activeCount: batchers.length, // servers actually being attacked (green rows)
+        income: batchers.reduce((sum, t) => sum + expectedIncome(t), 0), // only actively-batching $/s counts
         shareThreads,
         shareOff,
         inFlight,
         depth,
         tickGap,
         lastWorkMs,
-        targets,
-        prep: needsPrep.slice(0, 12).map((t) => ({ host: t.hostname, moneyFrac: t.money / t.maxMoney, time: ns.getWeakenTime(t.hostname) })),
+        targets: grouped.slice(0, 20),
     };
 }
 
