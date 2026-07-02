@@ -351,10 +351,10 @@ export async function main(ns) {
             const prepSet = new Set(needsPrep.map((t) => t.hostname));
             const att = ramAttribution(ns, rootedHosts, batchSet, prepSet);
             const used = poolTotal - free;
-            const other = used - att.batch - att.prep - att.share - att.orphan; // managers + controller
+            const other = used - att.batch - att.prep - att.shareUse - att.orphan; // managers + controller
             dbg(
                 `  RAM used=${ns.format.ram(used)} batch=${ns.format.ram(att.batch)} ` +
-                `prep=${ns.format.ram(att.prep)} share=${ns.format.ram(att.share)} ` +
+                `prep=${ns.format.ram(att.prep)} share=${ns.format.ram(att.shareUse)} ` +
                 `orphan=${ns.format.ram(att.orphan)} other=${ns.format.ram(other)}`
             );
             if (att.orphan > 0) {
@@ -597,7 +597,9 @@ function ramAttribution(ns, rootedHosts, batchSet, prepSet) {
     const growFile = stripSlash(GROW_WORKER);
     const weakenFile = stripSlash(WEAKEN_WORKER);
     const shareFile = stripSlash(SHARE_WORKER);
-    let batch = 0, prep = 0, share = 0, orphan = 0;
+    // NOTE: the share bucket is named shareUse, NOT `share` — a property named after
+    // an NS function (ns.share) gets phantom-charged by the RAM analyzer (+2.40 GB).
+    let batch = 0, prep = 0, shareUse = 0, orphan = 0;
     const byTarget = new Map();
     const orphanHosts = new Map();
     for (const host of rootedHosts) {
@@ -607,7 +609,7 @@ function ramAttribution(ns, rootedHosts, batchSet, prepSet) {
             if (file === hackFile) ram = proc.threads * WORKER_RAM.hackRam;
             else if (file === growFile) ram = proc.threads * WORKER_RAM.growRam;
             else if (file === weakenFile) ram = proc.threads * WORKER_RAM.weakenRam;
-            else if (file === shareFile) { share += proc.threads * SHARE_RAM; continue; }
+            else if (file === shareFile) { shareUse += proc.threads * SHARE_RAM; continue; }
             else continue;
             const target = proc.args[0];
             byTarget.set(target, (byTarget.get(target) ?? 0) + ram);
@@ -616,7 +618,7 @@ function ramAttribution(ns, rootedHosts, batchSet, prepSet) {
             else { orphan += ram; orphanHosts.set(target, (orphanHosts.get(target) ?? 0) + ram); }
         }
     }
-    return { batch, prep, share, orphan, byTarget, orphanHosts };
+    return { batch, prep, shareUse, orphan, byTarget, orphanHosts };
 }
 
 // ── Manager orchestration ───────────────────────────────────────────────────
