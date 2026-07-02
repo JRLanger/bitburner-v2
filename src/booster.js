@@ -65,7 +65,7 @@ import {
     DASHBOARD,
     DASHBOARD_MIN_HOME_RAM_GB,
 } from "/config/constants.js";
-import { readFlags, writeFlags, setFlag } from "/lib/flags.js";
+import { readFlags, writeFlags } from "/lib/flags.js";
 import { publishStatus } from "/lib/status.js";
 import { renderTail } from "/lib/tail-ui.js";
 
@@ -233,14 +233,6 @@ export async function main(ns) {
         ns.tprint("booster does not create workers. Add them, then re-run.");
         return;
     }
-
-    // A controller (re)start is a fresh run for manager suppression: clear managersSeen
-    // so managers the user killed along with the previous controller relaunch. The flag
-    // port survives a script restart (it only wipes on game reload / aug reset), so
-    // without this a killall + booster restart left e.g. pserver permanently
-    // "SUPPRESSED (seen running earlier this run, now gone)". Within-run suppression
-    // still works: the set repopulates from whatever is actually running each tick.
-    setFlag(ns, MANAGERS_SEEN_FLAG, []);
 
     // Open the unified dashboard if home is roomy enough and it isn't already running;
     // on a small early home, open this controller's own tail window instead (0 GB).
