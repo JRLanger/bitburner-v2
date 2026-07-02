@@ -14,10 +14,13 @@ which booster cannot use.
 
 It only runs once **Formulas.exe is owned** (it errors out and exits otherwise),
 and loops `while (ns.fileExists(FORMULAS_EXE, "home"))` so the condition leaves a
-clean seam for a future station/SF4 handoff. Measured footprint: **7.85 GB**
-(`ORBITER_RAM_GB`) — slightly under booster's 8.35, because Formulas functions
-cost 0 GB (only owning the program is required) even though `ns.getServer` adds
-2 GB.
+clean seam for a future station/SF4 handoff. Measured footprint: **8.35 GB**
+(`ORBITER_RAM_GB`) — under booster's 8.85, because Formulas functions cost 0 GB
+(only owning the program is required) even though `ns.getServer` adds 2 GB and
+`ns.getPlayer` 0.5 GB. Caution from a real incident: the RAM analyzer
+phantom-charges any **property** named after an NS function — `ramAttribution`'s
+debug bucket was briefly named `share` (`att.share`) and inflated the footprint to
+10.75 GB (+2.40 for `ns.share` never called); it is now `shareUse`.
 
 ## How it works
 
@@ -54,9 +57,15 @@ The Formulas core is what differs:
   `BATCH_DROP_MIN_FILL` ramping guard, and — like booster — **kills a dropped target's
   in-flight workers** (`killWorkersFor`) so re-prep starts clean instead of stacking
   stale workers onto the re-admitted pipeline. A target drifts out only if its windowed
-  baseline stays outside the keep-bounds past the grace.
-- **`prepWave`** sizes grow with `formulas.hacking.growThreads` on the live server
-  instead of `growthAnalyze`.
+  baseline stays outside the keep-bounds past the grace. A **null plan** from
+  `lockedPlan` (hackPercent 0 — rare) is treated exactly like a drift-out and runs the
+  same drop cleanup; before this it fell through to the not-batching path with the
+  target still in `activeBatching` and a live pipeline of zombie workers no one killed.
+- **`prepWave`** fires booster's combined overlapped wave (W1 → G → W2 via
+  `additionalMsec`, one weakenTime per prep — see booster.md) but sizes the grow
+  **Formulas-exact for where it lands**: `formulas.hacking.growThreads` against the
+  live snapshot with `hackDifficulty` forced to `minDifficulty` when this wave's
+  weaken flies ahead of the grow.
 
 ## Why it's built this way
 
@@ -123,10 +132,12 @@ final design, both worth preserving:
 
 ## Status bus (dashboard hook)
 
-Each tick, right after `renderStatus`, orbiter calls
-`publishStatus(ns, STATUS_PORT_CONTROLLER, buildSnapshot(...))` to broadcast its live
-state to the status bus (see `docs/scripts/status.md`). `buildSnapshot` reuses the same
-values the tail table already computes (`displayHealth`, `expectedIncome`, `poolFree`,
-the `pipelines` map, `topRampF`/`rampSaturated`, `shareThreads`) plus `tickGap`/`lastWorkMs` for the
-engine-lag indicator — no new NS calls. `dashboard.js` reads it to render the unified
-overlay. The tail render is kept as a fallback. (booster.js carries the identical hook.)
+Each tick orbiter builds ONE snapshot (`buildSnapshot`) and feeds it to both views:
+`renderTail` (shared `lib/tail-ui.js`) draws the tail window from it, then
+`publishStatus(ns, STATUS_PORT_CONTROLLER, snap)` broadcasts the same object to the
+status bus (see `docs/scripts/status.md`) for `dashboard.js`. The snapshot reuses
+values already computed for the tick — no new NS calls. The old per-controller
+`renderStatus` was deleted when `lib/tail-ui.js` gave the tail full information
+parity with the dashboard; the dashboard overlay itself is only auto-opened when
+home has ≥ `DASHBOARD_MIN_HOME_RAM_GB` (256 GB), with `ns.ui.openTail()` as the
+small-home fallback. (booster.js carries the identical hook.)
