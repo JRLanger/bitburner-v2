@@ -544,6 +544,19 @@ function poolFree(pool) {
 }
 
 /**
+ * Worker threads of `ramPerThread` that can ACTUALLY be placed across the pool —
+ * whole threads per host. poolFree's raw sum counts sub-thread slivers (e.g. 1.0 GB
+ * free on 30 hosts = 30 GB "free" where no 1.75 GB thread fits), so gating a batch
+ * on poolFree alone could half-fire it: hack threads placed, grow threads not,
+ * silently unbalancing the batch. Gate on this instead.
+ */
+function placeableThreads(pool, ramPerThread) {
+    let n = 0;
+    for (const s of pool) n += Math.floor(s.free / ramPerThread);
+    return n;
+}
+
+/**
  * Scan ns.ps() across all rooted hosts and tally worker threads per target.
  * Returns Map<target, totalThreads> — used to avoid double-firing prep waves.
  */
@@ -1061,8 +1074,13 @@ function batchPhase(ns, eligible, pool, rootedHosts) {
         // full pool just defers the rest to a later tick (no skipped slots).
         let k = 0;
         let deferred = false;
+        // Gate each fire on PLACEABLE threads (whole threads per host), not raw free
+        // RAM: fragmented slivers below one thread inflate poolFree and would let a
+        // batch half-fire. Sized at weakenRam (1.75) for all four ops — hack threads
+        // are 1.70, so this is marginally conservative, never optimistic.
+        const threadsPerBatch = t.h + t.g + t.w1 + t.w2;
         while (pipe.committed.length < depth && k < MAX_FIRES_PER_TICK) {
-            if (ramPerBatch > poolFree(pool)) { deferred = true; break; }
+            if (placeableThreads(pool, WORKER_RAM.weakenRam) < threadsPerBatch) { deferred = true; break; }
             const land = Math.max(now + weakenTime + BATCH_SAFETY_MS, pipe.lastLand + BATCH_PERIOD);
             fireBatch(ns, pool, t, land, now, hackTime, growTime, weakenTime);
             pipe.committed.push(land);
@@ -1098,10 +1116,18 @@ function fireBatch(ns, pool, t, base, now, hackTime, growTime, weakenTime) {
     const addG = Math.max(0, base + D_GAP - now - growTime);
     const addW2 = Math.max(0, base + 2 * D_GAP - now - weakenTime);
 
-    placeThreads(ns, pool, HACK_WORKER, WORKER_RAM.hackRam, t.h, target, addH);
-    placeThreads(ns, pool, WEAKEN_WORKER, WORKER_RAM.weakenRam, t.w1, target, addW1);
-    placeThreads(ns, pool, GROW_WORKER, WORKER_RAM.growRam, t.g, target, addG);
-    placeThreads(ns, pool, WEAKEN_WORKER, WORKER_RAM.weakenRam, t.w2, target, addW2);
+    const ph = placeThreads(ns, pool, HACK_WORKER, WORKER_RAM.hackRam, t.h, target, addH);
+    const pw1 = placeThreads(ns, pool, WEAKEN_WORKER, WORKER_RAM.weakenRam, t.w1, target, addW1);
+    const pg = placeThreads(ns, pool, GROW_WORKER, WORKER_RAM.growRam, t.g, target, addG);
+    const pw2 = placeThreads(ns, pool, WEAKEN_WORKER, WORKER_RAM.weakenRam, t.w2, target, addW2);
+    // The placeableThreads gate should make a shortfall impossible; if one ever shows
+    // up here it means the gate math and reality disagree — worth a debug line.
+    if (CONTROLLER_DEBUG && (ph < t.h || pg < t.g || pw1 < t.w1 || pw2 < t.w2)) {
+        dbg(
+            `  batch ${target} HALF-FIRE h=${ph}/${t.h} w1=${pw1}/${t.w1} ` +
+            `g=${pg}/${t.g} w2=${pw2}/${t.w2}`
+        );
+    }
 }
 
 // ── Prep phase ──────────────────────────────────────────────────────────────
