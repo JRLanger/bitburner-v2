@@ -787,7 +787,13 @@ function classify(ns, servers, player) {
                     eligible.push({ ...s, sec, money, ...best });
                     continue;
                 }
-            } else {
+                // No plan (hackPercent 0 — rare) → the pipeline cannot continue; fall
+                // into the drop cleanup below. Without this the target stayed in
+                // activeBatching with a live pipeline while classify pushed it to
+                // needsPrep, leaving zombie workers no one ever killed.
+                keep = false;
+            }
+            {
                 // Genuinely drifted (unhealthy past the grace window) → drop to re-prep.
                 // Kill the stale pipeline's in-flight workers FIRST so they can't keep
                 // draining for a weaken time and stack on the re-admitted generation.
@@ -959,7 +965,11 @@ function selectBatchers(ns, eligible, poolTotal, player) {
             a.plan = { ...t, ...ramped, score: t.score }; // keep base score for rank
             const rampedCost = conc * ramped.ramPerBatch;
             used += rampedCost - a.baseCost; // base already counted in Pass A
-            excess = capacity - rampedCost;
+            // Clamp at 0: a locked incumbent plan may sit up to +RAMP_HYSTERESIS_FRAC
+            // above its capacity (allowed — the headroom absorbs it), but letting the
+            // negative propagate would silently shrink the NEXT target's capacity below
+            // its base cost and break its ramp for no reason.
+            excess = Math.max(0, capacity - rampedCost);
             if (ramped.f < HACK_PCT_RAMP_MAX - 1e-9) allAtMax = false;
         }
         // Saturated only when every placeable target is admitted (none RAM-starved),
