@@ -77,6 +77,7 @@ import {
 } from "/config/constants.js";
 import { readFlags, writeFlags } from "/lib/flags.js";
 import { publishStatus } from "/lib/status.js";
+import { renderTail } from "/lib/tail-ui.js";
 
 /** HWGW worker paths that must exist on home and get copied to every rooted server. */
 const WORKERS = [HACK_WORKER, GROW_WORKER, WEAKEN_WORKER];
@@ -316,7 +317,7 @@ export async function main(ns) {
 
         // Admission control: cap the actively-batched set to what the pool can
         // sustain (full pipelines), leaving real headroom for prep. Total pool
-        // RAM mirrors renderStatus's tally; no extra NS calls.
+        // RAM mirrors buildSnapshot's tally; no extra NS calls.
         const poolTotal =
             servers.reduce((sum, s) => (s.hasRoot ? sum + s.maxRam : sum), 0) -
             HOME_SAFETY_BUFFER_GB;
@@ -417,11 +418,13 @@ export async function main(ns) {
         // trough read (low money / spiked security at high ramp), false-dropping them
         // to re-prep and causing the admitted set to flap. See classify keep-test.
         updateDisplayStats(eligible);
-        renderStatus(ns, servers, pool, batchers, needsPrep);
-        // Publish the same data to the status bus for dashboard.js (free port write).
-        // Pass the FULL eligible set (not just batchers) so the dashboard can show
-        // prepped-but-idle targets too (those that lost out on RAM this tick).
-        publishStatus(ns, STATUS_PORT_CONTROLLER, buildSnapshot(ns, "orbiter", servers, pool, eligible, batchers, needsPrep, player, tickGap));
+        // One snapshot feeds both views: the tail window (lib/tail-ui.js) and the
+        // status bus for dashboard.js — same numbers, one source of truth. The FULL
+        // eligible set (not just batchers) is included so prepped-but-idle targets
+        // (those that lost out on RAM this tick) show up too.
+        const snap = buildSnapshot(ns, "orbiter", servers, pool, eligible, batchers, needsPrep, player, tickGap);
+        renderTail(ns, snap);
+        publishStatus(ns, STATUS_PORT_CONTROLLER, snap);
 
         // Remember this tick's admitted set for next tick's admission hysteresis.
         wasBatching.clear();
@@ -1412,8 +1415,8 @@ function expectedIncome(t) {
 }
 
 /**
- * Build the status-bus snapshot for dashboard.js — the same numbers renderStatus
- * prints, plus the fuller target list the dashboard needs, as a plain JSON-able
+ * Build the status snapshot consumed by BOTH views — the tail window (via
+ * lib/tail-ui.js) and dashboard.js (via the status bus) — as a plain JSON-able
  * object. `allEligible` is classify's full ranked list (batching AND prepped-but-
  * idle targets that lost out on RAM this tick); `batchers` is the admitted subset
  * actually running. Each target is tagged `isBatching` so the dashboard can colour
@@ -1495,6 +1498,7 @@ function buildSnapshot(ns, stage, servers, pool, allEligible, batchers, needsPre
         rampSaturated,
         rankByIncome: ramAbundantMode, // which metric admission/the list is ranked by
         activeCount: batchers.length, // servers actually being attacked (green rows)
+        prepCount: needsPrep.length, // total servers still needing prep (tail header)
         income: batchers.reduce((sum, t) => sum + expectedIncome(t), 0), // only actively-batching $/s counts
         shareThreads,
         shareOff,
@@ -1504,73 +1508,6 @@ function buildSnapshot(ns, stage, servers, pool, allEligible, batchers, needsPre
         lastWorkMs,
         targets: grouped.slice(0, 20),
     };
-}
-
-/** Render a refreshing status table to the tail window each tick. */
-function renderStatus(ns, servers, pool, eligible, needsPrep) {
-    ns.clearLog();
-    const level = ns.getHackingLevel();
-    const rooted = servers.filter((s) => s.hasRoot).length;
-    const totalRam = servers.reduce((sum, s) => (s.hasRoot ? sum + s.maxRam : sum), 0);
-    const free = poolFree(pool);
-    const income = eligible.reduce((sum, t) => sum + expectedIncome(t), 0);
-
-    const W = 58;
-    ns.print(`╔═ ORBITER ═ ${new Date().toLocaleTimeString()} ${"═".repeat(Math.max(0, W - 24))}`);
-    ns.print(`║ Hack Lv ${level}  |  Rooted ${rooted}/${servers.length}  |  Pool ${ns.format.ram(free)} free / ${ns.format.ram(totalRam)}`);
-    // Top target's hack-% (the waterfall ramps the best target first); SAT = the
-    // waterfall is saturated (all admitted at HACK_PCT_RAMP_MAX, surplus is shareable).
-    const topF = eligible.reduce((m, t) => Math.max(m, t.f), 0);
-    const ramp = topF > 0 ? `  |  Ramp ${Math.round(topF * 100)}%${rampSaturated ? " SAT" : ""}` : "";
-    // Pipeline fill meter: total in-flight batches vs total target depth across all
-    // batchers, so how full the pipelines are running is visible at a glance.
-    let inFlight = 0, depth = 0;
-    for (const t of eligible) {
-        const pipe = pipelines.get(t.hostname);
-        if (pipe) { inFlight += pipe.committed.length; depth += pipe.depth; }
-    }
-    const fillPct = depth > 0 ? (inFlight / depth) * 100 : 0;
-    const fill = `  |  Pipeline ${inFlight}/${depth} (${fillPct.toFixed(0)}%)`;
-    ns.print(`║ Batching ${eligible.length}  |  Prepping ${needsPrep.length}${ramp}${fill}  |  Est income $${ns.format.number(income)}/s`);
-    if (shareOff) {
-        ns.print("║ Share: OFF (manual stop — run /utils/share-on.js to resume)");
-    } else if (shareThreads > 0) {
-        ns.print(`║ Share: ${shareThreads} threads (${ns.format.ram(shareThreads * SHARE_RAM)})`);
-    }
-    ns.print(`╠${"═".repeat(W)}`);
-    ns.print(
-        "║ " +
-        "TARGET".padEnd(16) +
-        "MON%".padStart(5) +
-        "SEC".padStart(7) +
-        "HK%".padStart(5) +
-        "FILL".padStart(7) +
-        "$/s".padStart(11)
-    );
-    for (const t of eligible) {
-        const { moneyFrac, secOver: secOverNum } = displayHealth(t);
-        const monPct = Math.round(moneyFrac * 100);
-        const secOver = secOverNum.toFixed(2);
-        const pipe = pipelines.get(t.hostname);
-        const fillCol = pipe ? `${pipe.committed.length}/${pipe.depth}` : "-";
-        ns.print(
-            "║ " +
-            t.hostname.padEnd(16) +
-            `${monPct}%`.padStart(5) +
-            `+${secOver}`.padStart(7) +
-            `${(t.f * 100).toFixed(0)}%`.padStart(5) +
-            fillCol.padStart(7) +
-            ns.format.number(expectedIncome(t)).padStart(11)
-        );
-    }
-    if (needsPrep.length > 0) {
-        ns.print(`╠═ Prepping ${"═".repeat(W - 11)}`);
-        const items = needsPrep
-            .slice(0, 8)
-            .map((t) => `${t.hostname}(${Math.round((t.money / t.maxMoney) * 100)}%)`);
-        ns.print("║ " + items.join("  "));
-    }
-    ns.print(`╚${"═".repeat(W)}`);
 }
 
 /** Strip a leading slash so script paths compare consistently. */
