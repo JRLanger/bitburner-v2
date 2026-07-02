@@ -459,6 +459,10 @@ export const ORBITER_RAM_GB = 7.85;
 
 /** Unified HTML/CSS overlay dashboard (reads the status-bus ports above). */
 export const DASHBOARD = "/dashboard.js";
+/** Only auto-open the dashboard once home has at least this much RAM, GB. Below it
+ *  the controller opens its own tail window instead (ns.ui.openTail, 0 GB) — early
+ *  home RAM is too scarce to spend on an overlay. */
+export const DASHBOARD_MIN_HOME_RAM_GB = 256;
 /** dashboard.js own RAM footprint, GB. Measure with `mem dashboard.js` and update
  *  (port reads + ns.atExit are free, so this is essentially just the base cost). */
 export const DASHBOARD_RAM_GB = 1.6; // 1.60 base — keep the snapshot field names off NS-function names (e.g. `share`) or the analyzer phantom-charges +2.40

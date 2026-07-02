@@ -63,6 +63,7 @@ import {
     HACKNET_GATE,
     STATUS_PORT_CONTROLLER,
     DASHBOARD,
+    DASHBOARD_MIN_HOME_RAM_GB,
 } from "/config/constants.js";
 import { readFlags, writeFlags } from "/lib/flags.js";
 import { publishStatus } from "/lib/status.js";
@@ -85,16 +86,20 @@ const PLACED_WORKERS = [...WORKERS, SHARE_WORKER];
  * a later one until every earlier one is already running (see launchManagers).
  * `ramGB` (hardcoded in constants) is reserved on home so the exec always fits.
  *
- *  1. contracts — solves coding contracts for free money/rep; trivial cost, no
- *     prerequisites (network is rooted), so it leads the order. Gate always true.
- *  2. pserver — grows the RAM pool; launch immediately (it waits internally to
- *     afford). Highest compounding ROI: purchased servers feed the batch pool.
+ *  1. pserver — grows the RAM pool; launch immediately (it waits internally to
+ *     afford). Highest compounding ROI: purchased servers feed the batch pool that
+ *     everything else runs on — and it's the cheapest manager (5.85 GB), so it fits
+ *     a small early home where contracts (16.8 GB) wouldn't (launchManagers only
+ *     considers the FIRST pending manager, so a too-big one at the front would
+ *     block the whole chain).
+ *  2. contracts — solves coding contracts for free money/rep; no prerequisites
+ *     (network is rooted). Gate always true.
  *  3. hacknet — weak ROI; deferred until the pserver fleet is fully built (counted
  *     from topology data booster already has — no extra NS call).
  */
 const MANAGERS = [
-    { file: CONTRACTS_MANAGER, ramGB: CONTRACTS_MANAGER_RAM, gate: () => true },
     { file: PSERVER_MANAGER, ramGB: PSERVER_MANAGER_RAM, gate: () => true },
+    { file: CONTRACTS_MANAGER, ramGB: CONTRACTS_MANAGER_RAM, gate: () => true },
     { file: HACKNET_MANAGER, ramGB: HACKNET_MANAGER_RAM, gate: pserverFleetBuilt },
 ];
 
@@ -228,8 +233,13 @@ export async function main(ns) {
         return;
     }
 
-    // Open the unified dashboard if it isn't already running (replaces per-script tails).
-    if (ns.fileExists(DASHBOARD, "home") && !isRunning(ns, DASHBOARD)) ns.exec(DASHBOARD, "home");
+    // Open the unified dashboard if home is roomy enough and it isn't already running;
+    // on a small early home, open this controller's own tail window instead (0 GB).
+    if (ns.getServerMaxRam("home") >= DASHBOARD_MIN_HOME_RAM_GB) {
+        if (ns.fileExists(DASHBOARD, "home") && !isRunning(ns, DASHBOARD)) ns.exec(DASHBOARD, "home");
+    } else {
+        ns.ui.openTail();
+    }
 
     // Fresh diagnostic log per run (truncate). No-op cost when CONTROLLER_DEBUG off.
     if (CONTROLLER_DEBUG) {
