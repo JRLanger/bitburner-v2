@@ -1159,39 +1159,60 @@ function prepPhase(ns, needsPrep, pool, inFlight, player, prepFloor = 0, refillH
 }
 
 /**
- * Fire one corrective wave for a target:
- *  - if security is above min, weaken it down;
- *  - else grow money toward max, plus weaken to counter grow's security rise
- *    (grow lands at growTime, the counter-weaken at the longer weakenTime, so
- *    the weaken naturally lands after the grow it offsets).
+ * Fire one COMBINED corrective wave for a target — weaken and grow overlapped via
+ * additionalMsec (the same landing-order technique fireBatch uses):
+ *  - W1 (delay 0) lands first at weakenTime, taking security to min;
+ *  - G  (delay weakenTime − growTime + D_GAP) lands D_GAP after W1, growing at the
+ *    just-restored min security;
+ *  - W2 (delay 2·D_GAP) lands D_GAP after G, countering grow's security rise.
+ * The old serial version fired the weaken, waited the full weaken time for it to
+ * drain (prepPhase skips targets with workers in flight), and only then fired the
+ * grow — ~2× weakenTime per prep. The combined wave drains in one weakenTime.
+ * Grow threads are Formulas-exact for where the grow LANDS: computed against the
+ * live snapshot with security forced to min when a weaken flies ahead of it,
+ * over-provisioned by ORBITER_THREAD_MARGIN (same cushion as batching).
  *
  * `ramBudget` caps the RAM this single wave may consume so one large grow can't
- * blow past the prep floor (and into the batchers' reserved RAM). A wave that
- * doesn't fully fit just makes partial progress and finishes on later ticks.
+ * blow past the prep floor (and into the batchers' reserved RAM). If the weaken
+ * doesn't fully fit, the grow is NOT fired (it would land on still-elevated
+ * security); the wave makes partial progress and finishes on later ticks.
  */
 function prepWave(ns, t, pool, player, ramBudget = Infinity) {
     const target = t.hostname;
+    let remaining = ramBudget;
 
+    let weakenPlaced = 0;
     if (t.sec > t.minSecurity * (1 + SEC_MARGIN)) {
-        let need = Math.ceil((t.sec - t.minSecurity) / WEAKEN_SEC * ORBITER_THREAD_MARGIN);
-        need = Math.min(need, Math.floor(ramBudget / WORKER_RAM.weakenRam));
-        const placed = placeThreads(ns, pool, WEAKEN_WORKER, WORKER_RAM.weakenRam, need, target, 0);
-        // Only count this wave as handled if weaken threads actually landed; if
-        // the pool was momentarily empty, fall through / retry next tick rather
-        // than falsely signalling progress.
-        if (placed > 0) return;
+        const need = Math.ceil((t.sec - t.minSecurity) / WEAKEN_SEC * ORBITER_THREAD_MARGIN);
+        const capped = Math.min(need, Math.floor(remaining / WORKER_RAM.weakenRam));
+        weakenPlaced = placeThreads(ns, pool, WEAKEN_WORKER, WORKER_RAM.weakenRam, capped, target, 0);
+        // Partial weaken (budget/pool bound): stop here — a grow landing on
+        // still-elevated security wastes threads; retry the rest next tick.
+        if (weakenPlaced < need) return;
+        remaining -= weakenPlaced * WORKER_RAM.weakenRam;
     }
 
-    // Security is fine; restore money via Formulas-exact growThreads on the live state,
-    // over-provisioned by THREAD_MARGIN (same anti-under-restore cushion as batching).
-    // Cap grow to the budget, leaving a little for the counter-weaken.
+    if (t.money >= t.maxMoney * (1 - MONEY_EPSILON)) return; // money already full
+
+    // Overlap: when a weaken was just fired, delay the grow to land D_GAP after it
+    // (at min security) and the counter-weaken D_GAP after the grow. With no weaken
+    // in this wave both fire undelayed, exactly like the old money-only wave.
+    const growDelay = weakenPlaced > 0
+        ? Math.max(0, ns.getWeakenTime(target) - ns.getGrowTime(target) + D_GAP)
+        : 0;
+    const w2Delay = weakenPlaced > 0 ? 2 * D_GAP : 0;
+
+    // Formulas-exact growThreads for the state the grow lands on: live money, and min
+    // security when this wave's weaken lands first. Cap grow to the remaining budget,
+    // leaving a little for the counter-weaken.
     const snap = ns.getServer(target); // live money/security
+    if (weakenPlaced > 0) snap.hackDifficulty = snap.minDifficulty;
     let growNeed = Math.ceil(ns.formulas.hacking.growThreads(snap, player, t.maxMoney) * ORBITER_THREAD_MARGIN);
-    growNeed = Math.min(growNeed, Math.floor((ramBudget * 0.9) / WORKER_RAM.growRam));
-    const placed = placeThreads(ns, pool, GROW_WORKER, WORKER_RAM.growRam, growNeed, target, 0);
+    growNeed = Math.min(growNeed, Math.floor((remaining * 0.9) / WORKER_RAM.growRam));
+    const placed = placeThreads(ns, pool, GROW_WORKER, WORKER_RAM.growRam, growNeed, target, growDelay);
     if (placed > 0) {
         const counter = Math.ceil((placed * GROW_SEC) / WEAKEN_SEC * ORBITER_THREAD_MARGIN);
-        placeThreads(ns, pool, WEAKEN_WORKER, WORKER_RAM.weakenRam, counter, target, 0);
+        placeThreads(ns, pool, WEAKEN_WORKER, WORKER_RAM.weakenRam, counter, target, w2Delay);
     }
 }
 
