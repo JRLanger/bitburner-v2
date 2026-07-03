@@ -130,6 +130,11 @@ const MANAGERS_SEEN_FLAG = "managersSeen";
 /** Monotonic id appended to every worker exec so concurrent workers are unique. */
 let batchSeq = 0;
 
+/** Hosts this controller PROCESS has already scp'd the workers to. Forces one
+ *  overwrite-scp per host per controller run, so worker-code updates propagate
+ *  on restart (file presence alone can't detect a stale worker). */
+const provisionedThisRun = new Set();
+
 /**
  * Landing-telemetry state (drift diagnosis, CONTROLLER_DEBUG only — see the
  * TELEMETRY_* constants). Every TELEMETRY_SAMPLE-th batch is tagged so its four
@@ -487,14 +492,15 @@ function discoverAndRoot(ns) {
         }
 
         const rooted = ns.hasRootAccess(host) || tryRoot(ns, host);
-        // Self-healing provisioning: scp the workers whenever the host is missing them,
-        // rather than tracking a "done" set in memory. An aug/soft reset wipes copied
-        // scripts from non-home servers, so checking file presence (free — fileExists is
-        // already in the RAM budget) re-provisions automatically after a reset without any
-        // cache to clear. scp copies all PLACED_WORKERS together, so HACK_WORKER's presence
-        // is a sufficient proxy for the whole set.
-        if (rooted && !ns.fileExists(HACK_WORKER, host)) {
+        // Self-healing provisioning: scp the workers when the host is missing them
+        // (an aug/soft reset wipes copied scripts — file presence re-provisions with
+        // no cache to clear) OR once per controller run (provisionedThisRun): file
+        // presence alone can't tell an up-to-date worker from a STALE one, so a
+        // worker-code change would never reach already-provisioned hosts. The
+        // once-per-run scp overwrites them on every controller (re)start instead.
+        if (rooted && (!ns.fileExists(HACK_WORKER, host) || !provisionedThisRun.has(host))) {
             provisionWorkers(ns, host);
+            provisionedThisRun.add(host);
         }
 
         result.push(gatherInfo(ns, host, rooted));
