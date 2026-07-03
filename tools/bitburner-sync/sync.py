@@ -29,6 +29,13 @@ HEARTBEAT     = 5.0                         # s entre pings (detecta conexão mo
 SERVER        = "home"                      # servidor de destino no jogo
 WS_GUID       = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"  # RFC 6455
 
+# PULL (jogo -> disco): arquivos lidos do jogo via getFile e espelhados em
+# game-logs/ na raiz do projeto, para inspecionar logs de debug sem abrir o jogo.
+# Mão contrária do push e fora de src/, então nunca colide com a sincronização.
+PULL_FILES    = ("data/booster-debug.txt", "data/orbiter-debug.txt", "data/servers.json")
+PULL_DIR      = Path(__file__).resolve().parents[2] / "game-logs"
+PULL_INTERVAL = 2.0                         # s entre leituras do jogo
+
 def log(msg):
     print(f"{time.strftime('%H:%M:%S')}  {msg}", flush=True)
 
@@ -118,13 +125,30 @@ def handle(conn):
     sel = selectors.DefaultSelector()
     sel.register(conn, selectors.EVENT_READ)
     idc = 0
-    state = {}   # rel -> hash já enviado nesta sessão
+    state = {}     # rel -> hash já enviado nesta sessão
+    pending = {}   # id de getFile em voo -> nome do arquivo pedido
+    pulled = {}    # nome -> último conteúdo gravado (evita reescrever igual)
 
     def send(method, params):
         nonlocal idc
         idc += 1
         msg = json.dumps({"jsonrpc": "2.0", "id": idc, "method": method, "params": params})
         ws_send(conn, msg.encode("utf-8"))
+        return idc
+
+    def pull_once():
+        """Pede ao jogo os arquivos de PULL_FILES (respostas chegam async)."""
+        for name in PULL_FILES:
+            pending[send("getFile", {"filename": name, "server": SERVER})] = name
+
+    def pull_store(name, content):
+        """Grava uma resposta de getFile em game-logs/, se mudou."""
+        if not isinstance(content, str) or pulled.get(name) == content:
+            return
+        dest = PULL_DIR / name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(content, encoding="utf-8")
+        pulled[name] = content
 
     def sync_once():
         nonlocal state
@@ -139,6 +163,7 @@ def handle(conn):
         state = {rel: h for rel, (_, h) in current.items()}
 
     last_ping = time.monotonic()
+    last_pull = 0.0
     try:
         sync_once()  # full push imediato
         while True:
@@ -153,8 +178,14 @@ def handle(conn):
                 elif opcode == 0x1:          # resposta
                     try:
                         r = json.loads(payload.decode("utf-8"))
+                        name = pending.pop(r.get("id"), None)
                         if r.get("error"):
-                            log(f"⚠️  erro do jogo: {r['error']}")
+                            # getFile de arquivo inexistente é esperado (ex.: log do
+                            # orbiter antes do orbiter rodar) — só loga erros de push.
+                            if name is None:
+                                log(f"⚠️  erro do jogo: {r['error']}")
+                        elif name is not None:
+                            pull_store(name, r.get("result"))
                     except Exception:
                         pass
                 # opcode 0xA (pong) -> ignora
@@ -167,6 +198,9 @@ def handle(conn):
             if now - last_ping >= HEARTBEAT:
                 ws_send(conn, b"", 0x9)      # ping
                 last_ping = now
+            if now - last_pull >= PULL_INTERVAL:
+                pull_once()                  # espelha logs do jogo em game-logs/
+                last_pull = now
     except (ConnectionError, OSError, BrokenPipeError):
         pass
     finally:
