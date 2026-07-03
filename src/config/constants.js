@@ -469,7 +469,7 @@ export const TELEMETRY_ERR_WARN_MS = 50;
  *  shared flag: booster and orbiter run at different stages, so it only ever drives
  *  whichever is live. Default false since the stage-9 drift diagnosis closed; set
  *  true to re-arm the full logging + landing-telemetry toolkit. */
-export const CONTROLLER_DEBUG = false;
+export const CONTROLLER_DEBUG = true; // re-armed: diagnosing stalled 0/N pipelines (stage 10)
 export const BOOSTER_DEBUG_LOG = "/data/booster-debug.txt";
 export const ORBITER_DEBUG_LOG = "/data/orbiter-debug.txt";
 
