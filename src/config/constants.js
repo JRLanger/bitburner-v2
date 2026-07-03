@@ -278,8 +278,8 @@ export const SHARE_OFF_FLAG = "shareOff";
 // ── RAM reservation ────────────────────────────────────────────────────────
 
 /** booster's own RAM footprint, GB (its function budget — see devlog). Measured
- *  with `mem booster.js` (8.35 at Stage 5; sharePhase added no NS calls). */
-export const BOOSTER_RAM_GB = 8.35;
+ *  with `mem booster.js` (8.85 at Stage 8: +0.50 kill from killWorkersFor). */
+export const BOOSTER_RAM_GB = 8.85;
 /** Extra home RAM left free as a safety buffer, GB. */
 export const HOME_SAFETY_BUFFER_GB = 2;
 
@@ -450,15 +450,20 @@ export const FORMULAS_EXE = "Formulas.exe";
 export const ORBITER = "/orbiter.js";
 
 /** orbiter's own RAM footprint, GB (measured: `mem orbiter.js`). The Formulas API
- *  functions are free (0 GB) — only owning Formulas.exe is required — so despite the
- *  +2 GB ns.getServer it lands at 7.85, slightly UNDER booster's 8.35. Re-measure and
- *  update after any change that adds/removes an NS call. */
-export const ORBITER_RAM_GB = 7.85;
+ *  functions are free (0 GB) — only owning Formulas.exe is required. 8.35 = booster's
+ *  8.85 − 1GB hackAnalyze − 1GB hackAnalyzeChance − 1GB growthAnalyze + 2GB getServer
+ *  + 0.5GB getPlayer. Re-measure with `mem orbiter.js` after any NS-call change (a
+ *  phantom `share` property once inflated this to 10.75 — see ramAttribution note). */
+export const ORBITER_RAM_GB = 8.35;
 
 // ── Dashboard ──────────────────────────────────────────────────────────────
 
 /** Unified HTML/CSS overlay dashboard (reads the status-bus ports above). */
 export const DASHBOARD = "/dashboard.js";
+/** Only auto-open the dashboard once home has at least this much RAM, GB. Below it
+ *  the controller opens its own tail window instead (ns.ui.openTail, 0 GB) — early
+ *  home RAM is too scarce to spend on an overlay. */
+export const DASHBOARD_MIN_HOME_RAM_GB = 256;
 /** dashboard.js own RAM footprint, GB. Measure with `mem dashboard.js` and update
  *  (port reads + ns.atExit are free, so this is essentially just the base cost). */
 export const DASHBOARD_RAM_GB = 1.6; // 1.60 base — keep the snapshot field names off NS-function names (e.g. `share`) or the analyzer phantom-charges +2.40

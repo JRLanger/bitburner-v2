@@ -16,11 +16,14 @@ extraction via HWGW batching:
   whole fleet is engaged and pool RAM still sits idle, trading efficiency for
   absolute income.
 
-- **Manager orchestration** launches the contracts/pserver/hacknet managers on
+- **Manager orchestration** launches the pserver/contracts/hacknet managers on
   home, in a fixed dependency order, once each one's gate passes.
 
 It also writes `/data/servers.json` (topology for managers) and refreshes a live
-status table in the tail window each tick.
+status view each tick: the tail window (rendered by `lib/tail-ui.js`) always, plus
+the HTML dashboard overlay when home has at least `DASHBOARD_MIN_HOME_RAM_GB`
+(256 GB) — below that only `ns.ui.openTail()` (0 GB) is used, since early home RAM
+is too scarce to spend on the overlay.
 
 ## How it works
 
@@ -30,8 +33,12 @@ The main loop (`main`) each tick:
    rooted hosts once. **home is included as a rooted pool host** (it already holds
    the worker scripts, being the copy source) with `maxMoney 0` so `classify` never
    targets it for hacking — only its RAM is used.
-2. `launchManagers` — exec's the first not-yet-running manager (contracts →
-   pserver → hacknet, fixed order) on home, if its gate passes. `nextManagerReserve`
+2. `launchManagers` — exec's the first not-yet-running manager (pserver →
+   contracts → hacknet, fixed order) on home, if its gate passes. pserver leads
+   because it buys the RAM everything else runs on, and — since only the FIRST
+   pending manager is ever considered — its small footprint (5.85 GB) can't block
+   the chain on a tiny early home the way contracts (16.8 GB) could when it led
+   the order. `nextManagerReserve`
    (called just before this) returns the RAM the *next* pending manager needs, fed
    into `buildPool` below so that headroom is walled off from workers before they
    can claim it.
@@ -81,7 +88,11 @@ The main loop (`main`) each tick:
      hack-% up to `HACK_PCT_RAMP_MAX` first (more money/batch at worse $/GB/s — fine, the
      GB are idle), then spilling any remainder to the 2nd-best, and so on.
      `maximizeHackPct` finds the highest f that fits each target's capacity (base cost +
-     running excess). The ramped f is **sticky** (locked in `rampPlan`): a running
+     running excess). The running excess is **clamped at 0** after each target: a locked
+     incumbent plan may sit up to `RAMP_HYSTERESIS_FRAC` above its capacity (absorbed by
+     the refill headroom), and propagating that negative would silently shrink the next
+     target's capacity below its base cost and break its ramp.
+     The ramped f is **sticky** (locked in `rampPlan`): a running
      incumbent reuses its locked ramp and does **not** re-ramp tick-to-tick as the excess
      pool wobbles — only a fresh/re-anchored target (no in-flight grid to desync) takes a
      new ramp immediately, and a level-up re-ramps via `classify` clearing `rampPlan`.
@@ -100,10 +111,22 @@ The main loop (`main`) each tick:
    fire gate, no skipped slots, and no recovery wave** (see "Why it's built this
    way" and [History](#history) below). The pipeline
    fills gradually (≤ `MAX_FIRES_PER_TICK` per tick) so RAM use ramps over ~a weaken
-   time; a momentarily full pool just defers the rest to a later tick.
+   time; a momentarily full pool just defers the rest to a later tick. Each fire is
+   gated on `placeableThreads` — whole worker threads that actually fit per host —
+   not on raw `poolFree`, whose sum counts sub-thread slivers (1.0 GB free on 30
+   hosts reads as 30 GB "free" where no 1.75 GB thread fits) and could let a batch
+   **half-fire** under fragmentation: hack placed, grow not, silently unbalancing
+   the batch. `fireBatch` additionally verifies placement and logs a `HALF-FIRE`
+   debug line if the gate and reality ever disagree.
 7. `prepPhase` — spends remaining RAM driving `needsPrep` targets to baseline, one
-   corrective wave per target (`prepWave`), skipping any with workers already in
-   flight; prepares at most `MAX_BATCH_TARGETS + PREP_LOOKAHEAD` servers at once.
+   **combined overlapped wave** per target (`prepWave`): W1 fires undelayed and
+   lands first (security → min), the grow fires in the same tick with
+   `additionalMsec = weakenTime − growTime + D_GAP` so it lands `D_GAP` after W1
+   (full growth multiplier at min security), and the counter-weaken lands `D_GAP`
+   after the grow — the same landing-order technique as `fireBatch`. A full prep
+   thus drains in **one** weakenTime instead of the two the old serial version took
+   (weaken, wait for it to drain, then grow). Targets with workers already in
+   flight are skipped; at most `MAX_BATCH_TARGETS + PREP_LOOKAHEAD` servers prep at once.
    Stops at a `prepFloor` = the batchers' reserved-but-unclaimed RAM, and each
    `prepWave` is capped to that headroom — so prep can't starve a pipeline that is
    still ramping toward full depth.
@@ -119,14 +142,21 @@ The main loop (`main`) each tick:
    share-thread count (`countShareThreads`) up to that target with **single-shot 10 s
    share workers** (`placeShare`). When batch/prep demand returns, the residual
    shrinks, booster launches fewer, and the running workers free their RAM within
-   ~10 s — so it yields without any `ns.kill` (keeps booster at 8.2 GB).
-9. `updateDisplayStats` / `renderStatus` — refresh the tail-window status table.
+   ~10 s — so it yields without needing a share-specific kill (footprint currently
+8.85 GB, `BOOSTER_RAM_GB`).
+9. `updateDisplayStats` / `buildSnapshot` / `renderTail` — refresh the status
+   views. `buildSnapshot` assembles ONE plain-JSON snapshot per tick; `renderTail`
+   (shared `lib/tail-ui.js`) renders the tail window from it, and `publishStatus`
+   ships the same object to the status bus for `dashboard.js` — one source of
+   truth, two views with full information parity (pool usage, pipeline fill, the
+   ranked target table tagged ATK/PRE/IDL, ranking mode, share state, manager
+   status lines read from their status ports, and lag/pool alerts).
    Raw money/security reads land at a random phase of each target's batch grid, so
    they oscillate (e.g. money flips between 100% and `100% − hack%`). For display
    only, `updateDisplayStats` keeps a short rolling window per batcher and
    `displayHealth` reports the window's **peak money / floor security** — the
    grid-aligned baseline (~100% / +0.00 when healthy), while a sustained drift still
-   pulls the reported value off. This affects the tail table only, never batching
+   pulls the reported value off. This affects the display only, never batching
    decisions.
 
 Thread placement (`placeThreads`) greedily bin-packs across the pool and returns
@@ -356,9 +386,13 @@ in a single tick, spiking RAM and re-starving the
 pool. The cap refills a pipeline gradually; steady state only needs about one
 launch every couple of ticks.
 
-**`prepWave` only counts a weaken wave as handled when threads actually land**
-(`placed > 0`) — otherwise a momentarily empty pool would falsely mark a target
-done instead of retrying.
+**`prepWave` only overlaps the grow when its weaken fully fit.** If the weaken
+threads don't all place (budget/pool bound), the grow is NOT fired that tick — it
+would land on still-elevated security and waste threads — and the wave finishes on
+later ticks. Grow threads are sized at CURRENT (elevated) security, where
+`growthAnalyze` reports weaker per-thread growth than the min security the grow
+actually lands on: a deliberate over-provision (on top of `THREAD_MARGIN`) that
+clamps harmlessly at max money.
 
 **RAM share is opt-out, single-shot, and self-yielding (Stage 5).** `sharePhase`
 feeds the residual `poolFree − poolTotal × (1 − BATCH_BUDGET_FRAC)` to `ns.share()`
@@ -535,10 +569,12 @@ save.
 
 ## Status bus (dashboard hook)
 
-Each tick, right after `renderStatus`, booster calls
-`publishStatus(ns, STATUS_PORT_CONTROLLER, buildSnapshot(...))` to broadcast its live
-state to the status bus (see `docs/scripts/status.md`). `buildSnapshot` reuses the same
-values the tail table already computes (`displayHealth`, `expectedIncome`, `poolFree`,
-the `pipelines` map, `topRampF`/`rampSaturated`, `shareThreads`) plus `tickGap`/`lastWorkMs` for the
-engine-lag indicator — no new NS calls. `dashboard.js` reads it to render the unified
-overlay. The tail render is kept as a fallback. (orbiter.js carries the identical hook.)
+Each tick booster builds ONE snapshot (`buildSnapshot`) and feeds it to both views:
+`renderTail` (shared `lib/tail-ui.js`) draws the tail window from it, then
+`publishStatus(ns, STATUS_PORT_CONTROLLER, snap)` broadcasts the same object to the
+status bus (see `docs/scripts/status.md`) for `dashboard.js`. The snapshot reuses
+values already computed for the tick (`displayHealth`, `expectedIncome`, `poolFree`,
+the `pipelines` map, `topRampF`/`rampSaturated`, `shareThreads`, `prepCount`) plus
+`tickGap`/`lastWorkMs` for the engine-lag indicator — no new NS calls. The old
+per-controller `renderStatus` was deleted when `lib/tail-ui.js` gave the tail full
+information parity with the dashboard. (orbiter.js carries the identical hook.)
