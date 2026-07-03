@@ -614,19 +614,15 @@ function drainTelemetry(ns) {
             dbg(`  tele ${target} ${op} OFF-SLOT err=${Math.round(err)}ms thr=${threads} ret=${typeof ret === "number" ? ret.toFixed(3) : ret}`);
         }
         if (op === "G" && typeof ret === "number" && ret < s.growMin) s.growMin = ret;
-        // A weaken whose actual reduction fell well short of 0.05×threads was CLAMPED
-        // by the min-security floor: it landed with security ~at min, i.e. the grow it
-        // was scheduled to counter had NOT landed yet — direct order-inversion evidence.
-        // (A small clamp is normal: weakens are over-provisioned by THREAD_MARGIN.)
+        // A weaken that reduced almost NOTHING landed with security already at ~min,
+        // i.e. BEFORE the grow it was scheduled to counter — order-inversion evidence.
+        // Only the near-total clamp counts: PARTIAL clamping is normal by design
+        // (weakens are over-provisioned by THREAD_MARGIN, so in a healthy grid the
+        // W2 always reduces less than its full 0.05×threads capacity — validated
+        // in-game: ~half of sampled weakens partially clamp while the grid holds
+        // winS=0.00 and money at 100%). Counter only, no per-event log.
         if ((op === "W1" || op === "W2") && typeof ret === "number" && threads > 0) {
-            const expectedSec = WEAKEN_SEC * threads;
-            if (ret < expectedSec * 0.9) {
-                s.wClamp++;
-                dbg(
-                    `  tele ${target} ${op} W-CLAMP reduced=${ret.toFixed(3)} ` +
-                    `expected=${expectedSec.toFixed(3)} (landed at ~min sec → its G had not landed)`
-                );
-            }
+            if (ret < WEAKEN_SEC * threads * 0.25) s.wClamp++;
         }
         if (op === "H" && typeof ret === "number") {
             if (ret === 0) {

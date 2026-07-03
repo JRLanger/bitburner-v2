@@ -470,6 +470,59 @@ to 200 ms appeared to reduce drift, but that was a misdiagnosis: 200 ms only bou
 more staleness headroom before the order flipped. With the stale-time bug fixed,
 `D_GAP` returned to 100 ms for the throughput.
 
+**The security limit cycle and its four coupled fixes (stage 9).** Long after every
+other drift source was fixed, batchers on low-`minSecurity` starter servers
+(foodnstuff, sigma-cosmetics) still drifted and dropped to re-prep — with a static
+hacking level and shallow pipelines, ruling out plan staleness and lag. Worker
+**landing telemetry** (below) showed landings precise to ≤ 18 ms and money always
+restored, but security swinging `+0.3 ↔ +12.9` on alternating ticks while `depth`
+and `reserved` flapped tick-to-tick. Three interacting mechanisms, four fixes:
+
+- **Baseline mint gate.** `hackAnalyze`/`getWeakenTime`/`growthAnalyze` read the
+  *current* security, so a plan (re)minted during the grid's ~100 ms post-grow "hot"
+  window carries oversized `h` and an inflated `weakenTime` — skewed threads in
+  flight, and a flapping depth/reserved as hot- and cold-minted ramp plans alternate.
+  `classify`'s level-recompute and Pass B's re-ramp now only mint on a tick that
+  reads the target at min security, reusing the locked plan meanwhile (the cold
+  phase comes every `BATCH_PERIOD`, so the deferral lasts a tick or two). A deferred
+  level-recompute keeps the old `level` stamp so it retries. Money is deliberately
+  NOT gated — no mint input depends on it, and raw money legitimately sits at
+  `(1−f)` most of the cycle.
+- **Base-plan depth.** `batchPhase` derives `depth` from the BASE locked plan's
+  `weakenTime` (`batchPlan`), never the batcher entry's — which may carry a ramped
+  plan whose `weakenTime` was minted at a different security.
+- **Security-phase fire deferral — the central fix.** An op's *duration* is fixed
+  when the WORKER calls `ns.hack/grow/weaken`, about one engine tick AFTER the
+  controller's `exec` — but the landing delays are computed from op-times read at
+  exec. If security changes in that gap (the hot window again), the real duration
+  differs from the estimate by *seconds* (op times scale with security), the ops
+  land off-slot, create larger hot windows, and the error self-sustains as a limit
+  cycle. `batchPhase` now never fires while the target reads above
+  `minSecurity × (1 + SEC_MARGIN)`: it defers to the next tick (`FIRE-HOT` debug
+  line). This is NOT the old Mode-A baseline fire gate — the landing clock
+  (`lastLand`) keeps advancing, only the exec moment shifts, so no slot is lost and
+  the pipeline stays full. Validated: 0 drops over 122 ticks, fills at ~100%,
+  `FIRE-HOT` on ~11% of refill attempts with no starvation.
+- **De-aliased loop + absolute keep floor.** At exactly `BATCH_PERIOD/2` the tick
+  phase-locked to two fixed points of the landing grid (observed: `gap=205ms` every
+  tick), so fires and health samples deterministically hit the same grid phases —
+  if one was the hot window, every fire was bad. `LOOP_SLEEP` is now
+  `BATCH_PERIOD/2 + 30` so the phase rotates. And the keep-bound gained an absolute
+  floor (`BATCH_KEEP_SEC_ABS = 1.0`): the purely relative `min × 0.10` was a +0.30
+  hair-trigger on `minSecurity = 3` servers — exactly where the drops clustered.
+
+**Landing telemetry (drift diagnosis).** Every `TELEMETRY_SAMPLE`-th batch is tagged
+so its four workers report `[opTag, target, expectedLand, actualLand, opReturn,
+threads]` on `TELEMETRY_PORT` right after the op resolves (`writePort` is 0 GB, so
+per-thread worker RAM is unchanged; the port number is hardcoded in the workers
+because they are scp'd standalone). `drainTelemetry` aggregates per-target rolling
+stats — landing error (`OFF-SLOT` past `TELEMETRY_ERR_WARN_MS`), failed hacks (`h0`),
+successful hacks stealing below the plan's full-server `steal` (`HACK-LOW` — the
+under-restore fingerprint), near-totally clamped weakens (`wCl` — a weaken reducing
+< 25% of its capacity landed *before* the grow it counters; partial clamping is
+normal, the margin over-provisions weakens by design) — and the `DROP`/trace lines
+carry the summary. Debug-gated: with `CONTROLLER_DEBUG` off no batch is ever tagged.
+
 ## History
 
 Design decisions whose original code no longer exists in the script — kept for
