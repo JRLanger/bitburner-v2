@@ -116,6 +116,23 @@ final design, both worth preserving:
    generation drains for ~8 minutes, so leaving workers un-killed stacked 3–4 generations
    and 2–3×'d the RAM before the fix.
 
+5. **Security-phase fire deferral + landing telemetry (stage 9, shared with
+   booster).** An op's duration is fixed when the WORKER calls it (~1 engine tick
+   after the controller's exec), but landing delays are computed from op-times read
+   at exec; security changing in that gap (the grid's ~100 ms post-grow hot window)
+   desyncs landings by seconds and self-sustains as a limit cycle. `batchPhase`
+   therefore never fires while the target reads above `minSecurity × (1 +
+   SEC_MARGIN)` — it defers to the next tick (`FIRE-HOT` debug line); the landing
+   clock keeps advancing, so no slot is lost. The keep-bound also gained the
+   `BATCH_KEEP_SEC_ABS` absolute floor, and orbiter carries the same
+   worker-landing telemetry (`TELEMETRY_*` / `drainTelemetry` / `teleSummary`;
+   dormant while `CONTROLLER_DEBUG` is false, the post-stage-9 default) —
+   see booster.md, "The security limit cycle and its four coupled fixes", for the
+   full diagnosis. One difference: orbiter needs **no baseline mint gate** —
+   `buildPlanner` computes everything against the prepped snapshot, so a plan
+   minted during a hot window is identical to one minted cold (the booster-only
+   skew simply cannot happen here).
+
 ## Alternatives considered
 
 - **Extract shared infra into lib modules** instead of forking. Rejected for now: a

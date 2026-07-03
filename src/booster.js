@@ -25,6 +25,7 @@ import {
     MONEY_EPSILON,
     BATCH_KEEP_MONEY_FRAC,
     BATCH_KEEP_SEC_FRAC,
+    BATCH_KEEP_SEC_ABS,
     BATCH_DROP_MIN_FILL,
     DRIFT_GRACE_MS,
     HACK_PCT_MIN,
@@ -64,6 +65,9 @@ import {
     STATUS_PORT_CONTROLLER,
     DASHBOARD,
     DASHBOARD_MIN_HOME_RAM_GB,
+    TELEMETRY_PORT,
+    TELEMETRY_SAMPLE,
+    TELEMETRY_ERR_WARN_MS,
 } from "/config/constants.js";
 import { readFlags, writeFlags } from "/lib/flags.js";
 import { publishStatus } from "/lib/status.js";
@@ -116,6 +120,32 @@ const MANAGERS_SEEN_FLAG = "managersSeen";
 
 /** Monotonic id appended to every worker exec so concurrent workers are unique. */
 let batchSeq = 0;
+
+/** Hosts this controller PROCESS has already scp'd the workers to. Forces one
+ *  overwrite-scp per host per controller run, so worker-code updates propagate
+ *  on restart (file presence alone can't detect a stale worker). */
+const provisionedThisRun = new Set();
+
+/**
+ * Landing-telemetry state (drift diagnosis, CONTROLLER_DEBUG only — see the
+ * TELEMETRY_* constants). Every TELEMETRY_SAMPLE-th batch is tagged so its four
+ * workers report [opTag, target, expLand, actualLand, ret, threads] on
+ * TELEMETRY_PORT; drainTelemetry aggregates per-target rolling stats since
+ * admission (cleared on drop):
+ *   n        — landings reported;
+ *   offSlot  — landings whose |actual − expected| exceeded TELEMETRY_ERR_WARN_MS
+ *              (order-at-risk: past ~D_GAP the H→W1→G→W2 interleave can flip);
+ *   maxErr   — worst signed landing error seen, ms;
+ *   hackZero — failed hacks (chance < 100%; a miss steals nothing — benign);
+ *   hackLow  — SUCCESSFUL hacks that stole meaningfully less than the plan's
+ *              expected steal from a FULL server → money was NOT at max when the
+ *              hack landed → the previous cycle under-restored (the plan-balance
+ *              drift fingerprint);
+ *   growMin  — smallest grow multiplier seen (clamped grows read low — context only).
+ */
+const telemetry = new Map();
+/** Batches fired since start; drives the every-Nth telemetry sampling. */
+let telemetrySeq = 0;
 
 /**
  * Per-target HWGW pipeline state: target -> { committed, lastLand, depth }.
@@ -304,6 +334,10 @@ export async function main(ns) {
         const pool = buildPool(ns, rootedHosts, homeReserveExtra);
         const inFlight = inFlightByTarget(ns, rootedHosts);
 
+        // Drain worker landing telemetry BEFORE classify, so this tick's DROP/trace
+        // lines can include up-to-date per-target landing stats.
+        drainTelemetry(ns);
+
         const { eligible, needsPrep } = classify(ns, servers);
 
         // Admission control: cap the actively-batched set to what the pool can
@@ -421,14 +455,15 @@ function discoverAndRoot(ns) {
         }
 
         const rooted = ns.hasRootAccess(host) || tryRoot(ns, host);
-        // Self-healing provisioning: scp the workers whenever the host is missing them,
-        // rather than tracking a "done" set in memory. An aug/soft reset wipes copied
-        // scripts from non-home servers, so checking file presence (free — fileExists is
-        // already in the RAM budget) re-provisions automatically after a reset without any
-        // cache to clear. scp copies all PLACED_WORKERS together, so HACK_WORKER's presence
-        // is a sufficient proxy for the whole set.
-        if (rooted && !ns.fileExists(HACK_WORKER, host)) {
+        // Self-healing provisioning: scp the workers when the host is missing them
+        // (an aug/soft reset wipes copied scripts — file presence re-provisions with
+        // no cache to clear) OR once per controller run (provisionedThisRun): file
+        // presence alone can't tell an up-to-date worker from a STALE one, so a
+        // worker-code change would never reach already-provisioned hosts. The
+        // once-per-run scp overwrites them on every controller (re)start instead.
+        if (rooted && (!ns.fileExists(HACK_WORKER, host) || !provisionedThisRun.has(host))) {
             provisionWorkers(ns, host);
+            provisionedThisRun.add(host);
         }
 
         result.push(gatherInfo(ns, host, rooted));
@@ -547,6 +582,72 @@ function killWorkersFor(ns, rootedHosts, target) {
         }
     }
     return killed;
+}
+
+// ── Landing telemetry (drift diagnosis) ─────────────────────────────────────
+
+/**
+ * Drain TELEMETRY_PORT and fold each record into the per-target rolling stats
+ * (see the `telemetry` map doc). Logs a dbg line for each anomalous landing:
+ *   off-slot — |actual − expected| > TELEMETRY_ERR_WARN_MS (landing-order risk);
+ *   hackLow  — a successful hack stole < 95% of the plan's expected steal from a
+ *              FULL server, i.e. money was already below max when it landed.
+ * All port ops are 0 GB; runs every tick but the port only ever holds data when
+ * CONTROLLER_DEBUG sampling is on (fireBatch tags no batches otherwise).
+ */
+function drainTelemetry(ns) {
+    while (true) {
+        const rec = ns.readPort(TELEMETRY_PORT);
+        if (rec === "NULL PORT DATA") break;
+        if (!Array.isArray(rec) || rec.length < 6) continue;
+        const [op, target, expLand, actLand, ret, threads] = rec;
+        let s = telemetry.get(target);
+        if (!s) {
+            s = { n: 0, offSlot: 0, maxErr: 0, hackZero: 0, hackLow: 0, growMin: Infinity, wClamp: 0 };
+            telemetry.set(target, s);
+        }
+        s.n++;
+        const err = actLand - expLand;
+        if (Math.abs(err) > Math.abs(s.maxErr)) s.maxErr = err;
+        if (Math.abs(err) > TELEMETRY_ERR_WARN_MS) {
+            s.offSlot++;
+            dbg(`  tele ${target} ${op} OFF-SLOT err=${Math.round(err)}ms thr=${threads} ret=${typeof ret === "number" ? ret.toFixed(3) : ret}`);
+        }
+        if (op === "G" && typeof ret === "number" && ret < s.growMin) s.growMin = ret;
+        // A weaken that reduced almost NOTHING landed with security already at ~min,
+        // i.e. BEFORE the grow it was scheduled to counter — order-inversion evidence.
+        // Only the near-total clamp counts: PARTIAL clamping is normal by design
+        // (weakens are over-provisioned by THREAD_MARGIN, so in a healthy grid the
+        // W2 always reduces less than its full 0.05×threads capacity — validated
+        // in-game: ~half of sampled weakens partially clamp while the grid holds
+        // winS=0.00 and money at 100%). Counter only, no per-event log.
+        if ((op === "W1" || op === "W2") && typeof ret === "number" && threads > 0) {
+            if (ret < WEAKEN_SEC * threads * 0.25) s.wClamp++;
+        }
+        if (op === "H" && typeof ret === "number") {
+            if (ret === 0) {
+                s.hackZero++;
+            } else {
+                const plan = batchPlan.get(target);
+                if (plan && plan.steal && ret < plan.steal * 0.95) {
+                    s.hackLow++;
+                    dbg(
+                        `  tele ${target} H HACK-LOW stole=${ns.format.number(ret)} ` +
+                        `expected=${ns.format.number(plan.steal)} (money below max at landing)`
+                    );
+                }
+            }
+        }
+    }
+}
+
+/** One-line summary of a target's telemetry stats for DROP/trace log lines. */
+function teleSummary(target) {
+    const s = telemetry.get(target);
+    if (!s) return "tele=none";
+    const gm = s.growMin === Infinity ? "-" : s.growMin.toFixed(2);
+    return `tele n=${s.n} off=${s.offSlot} maxErr=${Math.round(s.maxErr)}ms ` +
+        `hLow=${s.hackLow} h0=${s.hackZero} wCl=${s.wClamp} gMin=${gm}`;
 }
 
 // ── Manager orchestration ───────────────────────────────────────────────────
@@ -679,9 +780,15 @@ function classify(ns, servers) {
                 sec,
                 minSecurity: s.minSecurity,
             });
+            // Security keep-bound: relative (scales with the target) with an ABSOLUTE
+            // floor — min×0.10 is a hair-trigger on low-minSecurity servers (min=3 →
+            // only +0.30 tolerated), which is exactly where the observed drift-drops
+            // (foodnstuff/sigma-cosmetics) clustered. 1.0 of security ≈ one large
+            // batch's grow bump, so the floor tolerates a real transient without
+            // letting genuine sustained drift through.
             const healthy =
                 moneyFrac >= BATCH_KEEP_MONEY_FRAC &&
-                secOver <= s.minSecurity * BATCH_KEEP_SEC_FRAC;
+                secOver <= Math.max(s.minSecurity * BATCH_KEEP_SEC_FRAC, BATCH_KEEP_SEC_ABS);
             // A pipeline still filling toward depth (cold start, or RAM-starved by a
             // flood of newly-eligible servers) hasn't reached the steady state the
             // keep-test judges — its low windowed money is the ramp, not drift.
@@ -718,12 +825,29 @@ function classify(ns, servers) {
                 const locked = batchPlan.get(s.hostname);
                 let best = locked && locked.level === level ? locked : null;
                 if (!best) {
-                    best = bestHackPct(ns, s, chance);
-                    if (best) rampPlan.delete(s.hostname); // base changed → waterfall re-ramps fresh
+                    // BASELINE MINT GATE: hackAnalyze/getWeakenTime read the CURRENT
+                    // security, so a plan minted during the grid's hot phase (the
+                    // 100ms G→W2 window, where security is momentarily elevated)
+                    // carries oversized h and an inflated weakenTime — skewed threads
+                    // in flight and a flapping depth/reserved. Only re-mint on a tick
+                    // that reads the target at min security; until then keep running
+                    // the previous locked plan (the cold phase comes every
+                    // BATCH_PERIOD, so the deferral lasts a tick or two). Money is
+                    // deliberately NOT gated: none of the mint inputs depend on it.
+                    if (sec <= s.minSecurity * (1 + SEC_MARGIN)) {
+                        best = bestHackPct(ns, s, chance);
+                        if (best) {
+                            rampPlan.delete(s.hostname); // base changed → waterfall re-ramps fresh
+                            // Stamp ONLY the fresh mint. The deferred path below must
+                            // keep the OLD level so the re-mint retries next tick.
+                            best.level = level;
+                            batchPlan.set(s.hostname, best);
+                        }
+                    } else {
+                        best = locked; // hot phase → defer the re-mint, reuse the old plan
+                    }
                 }
                 if (best) {
-                    best.level = level;
-                    batchPlan.set(s.hostname, best);
                     eligible.push({ ...s, chance, sec, money, ...best });
                     // Drift trajectory trace. Logged when the WINDOWED baseline shows
                     // genuine drift (not the normal per-cycle oscillation, which the
@@ -751,7 +875,8 @@ function classify(ns, servers) {
                             `f=${best.f.toFixed(2)} effF=${effF.toFixed(3)} h=${best.h} g=${best.g} ` +
                             `fill=${fill} ` +
                             `lockWt=${(best.weakenTime / 1000).toFixed(1)}s liveWt=${(liveWt / 1000).toFixed(1)}s ` +
-                            `grace=${unhealthySince.has(s.hostname) ? now - unhealthySince.get(s.hostname) : 0}`
+                            `grace=${unhealthySince.has(s.hostname) ? now - unhealthySince.get(s.hostname) : 0} ` +
+                            teleSummary(s.hostname)
                         );
                     }
                     continue;
@@ -764,14 +889,16 @@ function classify(ns, servers) {
             dbg(
                 `  classify DROP ${s.hostname}: moneyFrac=${moneyFrac.toFixed(3)} ` +
                 `(keep≥${BATCH_KEEP_MONEY_FRAC}) secOver=${secOver.toFixed(2)} ` +
-                `(keep≤${(s.minSecurity * BATCH_KEEP_SEC_FRAC).toFixed(2)}) ` +
-                `killed=${killed} graceMs=${now - (unhealthySince.get(s.hostname) ?? now)}`
+                `(keep≤${Math.max(s.minSecurity * BATCH_KEEP_SEC_FRAC, BATCH_KEEP_SEC_ABS).toFixed(2)}) ` +
+                `killed=${killed} graceMs=${now - (unhealthySince.get(s.hostname) ?? now)} ` +
+                teleSummary(s.hostname)
             );
             unhealthySince.delete(s.hostname); // clear grace state
             activeBatching.delete(s.hostname);
             batchPlan.delete(s.hostname); // recompute a fresh plan on re-admission
             rampPlan.delete(s.hostname); // drop the sticky ramp so re-admission re-ramps fresh
             pipelines.delete(s.hostname); // re-anchor the pipeline on re-admission
+            telemetry.delete(s.hostname); // stats belong to the dropped generation
         }
 
         // Not batching: STRICT prepped check to start (ensures table accuracy).
@@ -787,10 +914,18 @@ function classify(ns, servers) {
             batchPlan.set(s.hostname, best); // lock the base plan (+ level) for this run
             rampPlan.delete(s.hostname); // fresh admission → waterfall re-ramps fresh
             eligible.push({ ...s, chance, sec, money, ...best });
+            // Log the FULL minted plan, including the exact security it was computed
+            // at: hackAnalyze depends on current security, so a plan minted anywhere
+            // above min oversizes h relative to g — the prime plan-balance drift
+            // suspect. steal = expected $ per hack from a FULL server (the telemetry
+            // HACK-LOW reference); growMult = the restore multiplier g was sized for.
             dbg(
                 `  classify ADMIT-NEW ${s.hostname} (was re-prepped or fresh): ` +
                 `money=${((money / s.maxMoney) * 100).toFixed(1)}% sec=+${(sec - s.minSecurity).toFixed(2)} ` +
-                `(min=${s.minSecurity.toFixed(2)})`
+                `(min=${s.minSecurity.toFixed(2)}) plan f=${best.f.toFixed(2)} h=${best.h} g=${best.g} ` +
+                `w1=${best.w1} w2=${best.w2} chance=${(chance * 100).toFixed(0)}% ` +
+                `steal=${ns.format.number(best.steal)} growMult=${best.growMult.toFixed(3)} ` +
+                `wt=${(best.weakenTime / 1000).toFixed(1)}s`
             );
         }
     }
@@ -921,8 +1056,19 @@ function selectBatchers(ns, eligible, poolTotal) {
                 lockedCost <= capacity * (1 + RAMP_HYSTERESIS_FRAC) &&
                 lockedCost >= capacity * (1 - RAMP_HYSTERESIS_FRAC);
             if (!(wasBatching.has(t.hostname) && withinBand)) {
-                ramped = maximizeHackPct(ns, t, t.chance, capacity / conc, t.f);
-                if (ramped) rampPlan.set(t.hostname, ramped);
+                // BASELINE MINT GATE (same as classify's): maximizeHackPct reads live
+                // security via buildPlanner, so re-ramping during the grid's hot phase
+                // mints a plan with inflated weakenTime and skewed h/g — the observed
+                // tick-to-tick depth/reserved flap. On a hot tick keep the existing
+                // locked ramp unchanged (or run at base if none exists yet) and
+                // re-ramp on the next cold tick.
+                if (t.sec <= t.minSecurity * (1 + SEC_MARGIN)) {
+                    ramped = maximizeHackPct(ns, t, t.chance, capacity / conc, t.f);
+                    if (ramped) rampPlan.set(t.hostname, ramped);
+                } else if (!ramped) {
+                    allAtMax = false;
+                    continue; // hot phase, no locked ramp yet → base plan this tick
+                }
             }
             if (!ramped) { allAtMax = false; break; }
             a.plan = { ...t, ...ramped, score: t.score }; // keep base score for rank
@@ -962,9 +1108,8 @@ function selectBatchers(ns, eligible, poolTotal) {
  * at exactly N in flight; using the live (security-inflated) weaken time here would
  * grow the target on a transient bump and overfill. Landing *times*, however, use
  * FRESH op-times (current security) so each op lands exactly on its slot regardless
- * of security — see fireBatch. Validated in the isolated rig (src/test/batch-rig.js,
- * Mode C on iron-gym at full depth): +0.00 security, ~2ms landing error, ~full
- * throughput indefinitely.
+ * of security — see fireBatch. Validated in an isolated rig at full depth:
+ * +0.00 security, ~2ms landing error, ~full throughput indefinitely.
  */
 function batchPhase(ns, eligible, pool, rootedHosts) {
     const now = Date.now();
@@ -973,10 +1118,26 @@ function batchPhase(ns, eligible, pool, rootedHosts) {
         const target = t.hostname;
         const ramPerBatch = t.ramPerBatch;
 
-        // In-flight depth = a full pipeline at BATCH_PERIOD spacing, from the stable
-        // plan weaken time (constant depth, no overfill on a transient security bump).
-        // Lag is governed by MAX_BATCH_TARGETS (number of targets), not per-target depth.
-        const depth = Math.ceil(t.weakenTime / BATCH_PERIOD);
+        // In-flight depth = a full pipeline at BATCH_PERIOD spacing, from the BASE
+        // locked plan's weaken time — not the batcher entry's, which may carry a
+        // ramped plan whose weakenTime was minted at a different security and would
+        // flap the depth (and the reserved estimate) tick-to-tick. Lag is governed
+        // by MAX_BATCH_TARGETS (number of targets), not per-target depth.
+        const depth = Math.ceil((batchPlan.get(target)?.weakenTime ?? t.weakenTime) / BATCH_PERIOD);
+
+        // SECURITY-PHASE DEFERRAL (the central limit-cycle fix). An op's duration is
+        // fixed when the WORKER calls ns.hack/grow/weaken — about one engine tick
+        // AFTER this exec — but the landing delays below are computed from op-times
+        // read NOW. If security changes in that gap (the grid's 100ms G→W2 hot
+        // window), the real duration differs from the estimate by SECONDS (op times
+        // scale with security), the ops land off-slot, create larger hot windows,
+        // and the error self-sustains (observed: rawS swinging to +6/+12 every other
+        // tick). So never fire while the target reads above min security: defer to
+        // the next tick — the scheduler is self-pacing, so the slot is not lost, and
+        // a cold phase comes every BATCH_PERIOD. Unlike a fire gate that stalls
+        // the landing clock, lastLand keeps advancing.
+        const secNow = ns.getServerSecurityLevel(target);
+        const hot = secNow > t.minSecurity * (1 + SEC_MARGIN);
 
         // Fresh op-times for landing math (see fireBatch).
         const weakenTime = ns.getWeakenTime(target);
@@ -1020,7 +1181,7 @@ function batchPhase(ns, eligible, pool, rootedHosts) {
         // batch half-fire. Sized at weakenRam (1.75) for all four ops — hack threads
         // are 1.70, so this is marginally conservative, never optimistic.
         const threadsPerBatch = t.h + t.g + t.w1 + t.w2;
-        while (pipe.committed.length < depth && k < MAX_FIRES_PER_TICK) {
+        while (!hot && pipe.committed.length < depth && k < MAX_FIRES_PER_TICK) {
             if (placeableThreads(pool, WORKER_RAM.weakenRam) < threadsPerBatch) { deferred = true; break; }
             const land = Math.max(now + weakenTime + BATCH_SAFETY_MS, pipe.lastLand + BATCH_PERIOD);
             fireBatch(ns, pool, t, land, now, hackTime, growTime, weakenTime);
@@ -1029,6 +1190,16 @@ function batchPhase(ns, eligible, pool, rootedHosts) {
             k++;
         }
 
+        // FIRE-HOT: a refill was wanted but the target read above min security (see
+        // the security-phase deferral above). Expected occasionally (the hot window
+        // is ~100ms of every BATCH_PERIOD); chronic FIRE-HOT with rising secOver
+        // means the grid itself is unhealthy.
+        if (CONTROLLER_DEBUG && hot && pipe.committed.length < depth) {
+            dbg(
+                `  batch ${target} FIRE-HOT sec=+${(secNow - t.minSecurity).toFixed(2)} ` +
+                `fill=${pipe.committed.length}/${depth}`
+            );
+        }
         // A pipeline that wanted to refill but couldn't (pool momentarily full) runs
         // shallower than `depth`: fewer grows land per cycle than the hacks need, so
         // money can drift down even though the locked plan is balanced. Logging the
@@ -1057,10 +1228,16 @@ function fireBatch(ns, pool, t, base, now, hackTime, growTime, weakenTime) {
     const addG = Math.max(0, base + D_GAP - now - growTime);
     const addW2 = Math.max(0, base + 2 * D_GAP - now - weakenTime);
 
-    const ph = placeThreads(ns, pool, HACK_WORKER, WORKER_RAM.hackRam, t.h, target, addH);
-    const pw1 = placeThreads(ns, pool, WEAKEN_WORKER, WORKER_RAM.weakenRam, t.w1, target, addW1);
-    const pg = placeThreads(ns, pool, GROW_WORKER, WORKER_RAM.growRam, t.g, target, addG);
-    const pw2 = placeThreads(ns, pool, WEAKEN_WORKER, WORKER_RAM.weakenRam, t.w2, target, addW2);
+    // Landing telemetry: tag every Nth batch so its workers report actual landings
+    // (0 GB port write). exp(offset) is the op's expected landing on the grid; 0
+    // disables reporting in the worker. Debug-gated so a quiet build stays silent.
+    const sample = CONTROLLER_DEBUG && ++telemetrySeq % TELEMETRY_SAMPLE === 0;
+    const exp = (offset) => (sample ? base + offset : 0);
+
+    const ph = placeThreads(ns, pool, HACK_WORKER, WORKER_RAM.hackRam, t.h, target, addH, exp(-D_GAP), "H");
+    const pw1 = placeThreads(ns, pool, WEAKEN_WORKER, WORKER_RAM.weakenRam, t.w1, target, addW1, exp(0), "W1");
+    const pg = placeThreads(ns, pool, GROW_WORKER, WORKER_RAM.growRam, t.g, target, addG, exp(D_GAP), "G");
+    const pw2 = placeThreads(ns, pool, WEAKEN_WORKER, WORKER_RAM.weakenRam, t.w2, target, addW2, exp(2 * D_GAP), "W2");
     // The placeableThreads gate should make a shortfall impossible; if one ever shows
     // up here it means the gate math and reality disagree — worth a debug line.
     if (CONTROLLER_DEBUG && (ph < t.h || pg < t.g || pw1 < t.w1 || pw2 < t.w2)) {
@@ -1162,14 +1339,16 @@ function prepWave(ns, t, pool, ramBudget = Infinity) {
  * host first. Mutates pool free RAM. Returns the number of threads actually
  * placed (may be less than requested if RAM runs out).
  */
-function placeThreads(ns, pool, script, ramPerThread, threads, target, delay) {
+function placeThreads(ns, pool, script, ramPerThread, threads, target, delay, expLand = 0, opTag = "") {
     let remaining = threads;
     for (const server of pool) {
         if (remaining <= 0) break;
         const fit = Math.floor(server.free / ramPerThread);
         const n = Math.min(fit, remaining);
         if (n <= 0) continue;
-        ns.exec(script, server.host, n, target, delay, batchSeq++);
+        // Trailing args are the landing-telemetry contract (see workers/*.js):
+        // expLand > 0 makes the worker report [opTag, target, expLand, actual, ret, n].
+        ns.exec(script, server.host, n, target, delay, batchSeq++, expLand, opTag, n);
         server.free -= n * ramPerThread;
         remaining -= n;
     }
@@ -1241,7 +1420,7 @@ function placeShare(ns, pool, threads) {
     return threads - remaining;
 }
 
-// ── Scoring (kept for stage 3b batching; not used in the 3a prep loop) ───────
+// ── Batch planning: score / ramp factories ──────────────────────────────────
 
 /**
  * Build a per-target plan factory. Resolves the f-independent baseline once (hack-per-
@@ -1274,7 +1453,14 @@ function buildPlanner(ns, server, chance) {
             h * WORKER_RAM.hackRam + g * WORKER_RAM.growRam + (w1 + w2) * WORKER_RAM.weakenRam;
         const moneyPerBatch = server.maxMoney * f * chance;
         const score = moneyPerBatch / (weakenTime * ramPerBatch);
-        return { f, h, g, w1, w2, ramPerBatch, weakenTime, score };
+        // Telemetry references: `steal` = expected $ per successful hack from a FULL
+        // server (drainTelemetry's HACK-LOW baseline); `growMult` = the restore
+        // multiplier g was sized for. Both derive from hackFrac AT PLAN TIME — if the
+        // plan was minted at elevated security they are optimistic, which is exactly
+        // what the telemetry is trying to expose.
+        const steal = server.maxMoney * actualF;
+        const growMult = 1 / (1 - actualF);
+        return { f, h, g, w1, w2, ramPerBatch, weakenTime, score, steal, growMult };
     };
     return { atF };
 }

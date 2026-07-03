@@ -20,8 +20,13 @@ export const D_GAP = 100;
 /** Interval between batch launches into the pipeline, ms. One batch per period. */
 export const BATCH_PERIOD = 4 * D_GAP;
 
-/** Main loop sleep, ms. Wake often enough to never miss a grid launch window. */
-export const LOOP_SLEEP = BATCH_PERIOD / 2;
+/** Main loop sleep, ms. Wake often enough to never miss a grid launch window.
+ *  Deliberately NOT an exact divisor of BATCH_PERIOD: at exactly BATCH_PERIOD/2 the
+ *  tick phase-locks to two fixed points of the landing grid (observed as gap=205ms
+ *  every tick), so fires and health samples always hit the same grid phases — if one
+ *  of them is the 100ms post-grow "hot" security window, every fire/sample is bad,
+ *  a deterministic resonance. The +30 makes the phase rotate through the whole grid. */
+export const LOOP_SLEEP = BATCH_PERIOD / 2 + 30;
 
 /** Launch lead, ms: a batch's grid slot is fired this far before its launch lead
  *  (slot − weakenTime), so on the absolute landing grid its per-op delays stay ≥ 0
@@ -45,8 +50,7 @@ export const HACK_SEC = 0.002;
 // No hack-chance floor: chance is already a multiplier in bestHackPct's score
 // (moneyPerBatch = maxMoney × f × chance), so a low-chance target is correctly
 // scored low rather than excluded — it only wins a batch slot if nothing
-// higher-scoring is competing for the RAM. Removed CHANCE_FILTER/CHANCE_BATCH
-// (0.5 / 0.8 floors) in favor of trusting the score outright.
+// higher-scoring is competing for the RAM.
 
 /** "Prepped"/healthy if security ≤ minSecurity × (1 + this). */
 export const SEC_MARGIN = 0.05;
@@ -66,6 +70,13 @@ export const BATCH_KEEP_MONEY_FRAC = 0.9;
  *  scales with the target instead of one flat number being too loose on a
  *  low-minSecurity server and too tight on a high one. */
 export const BATCH_KEEP_SEC_FRAC = 0.10;
+/** ABSOLUTE floor for the security keep-bound: keep while
+ *  secOver ≤ max(minSecurity × BATCH_KEEP_SEC_FRAC, this). Purely relative bounds
+ *  are hair-triggers on low-minSecurity servers (min=3 → only +0.30 tolerated),
+ *  which is where the drift-drops clustered (foodnstuff/sigma-cosmetics). 1.0 of
+ *  security ≈ one large batch's grow bump — tolerates a real transient without
+ *  letting sustained drift through. */
+export const BATCH_KEEP_SEC_ABS = 1.0;
 
 // Drift grace. A batch fired during a transient security bump (caused by a
 // high-grow target's own in-flight grows) lands a little late and briefly
@@ -277,21 +288,14 @@ export const SHARE_OFF_FLAG = "shareOff";
 
 // ── RAM reservation ────────────────────────────────────────────────────────
 
-/** booster's own RAM footprint, GB (its function budget — see devlog). Measured
- *  with `mem booster.js` (8.85 at Stage 8: +0.50 kill from killWorkersFor). */
-export const BOOSTER_RAM_GB = 8.85;
+// Measured script footprints (for reference — the pool reads live used RAM, so
+// these are not imported anywhere): booster 8.85 GB, orbiter 8.35 GB,
+// dashboard 1.6 GB. Re-measure with `mem <file>` after changes, and keep
+// variable/property names off NS-function names (e.g. `share`) or the RAM
+// analyzer phantom-charges them (+2.40 GB incident — see orbiter devlog).
+
 /** Extra home RAM left free as a safety buffer, GB. */
 export const HOME_SAFETY_BUFFER_GB = 2;
-
-// ── Port-opener programs (file name → NS method to call) ───────────────────
-
-export const CRACKS = [
-    { file: "BruteSSH.exe", method: "brutessh" },
-    { file: "FTPCrack.exe", method: "ftpcrack" },
-    { file: "relaySMTP.exe", method: "relaysmtp" },
-    { file: "HTTPWorm.exe", method: "httpworm" },
-    { file: "SQLInject.exe", method: "sqlinject" },
-];
 
 // ── Managers / orchestration ───────────────────────────────────────────────
 
@@ -310,7 +314,7 @@ export const PSERVER_MANAGER = "/managers/pserver.js";
 export const HACKNET_MANAGER = "/managers/hacknet.js";
 
 /**
- * Manager RAM footprints, GB. Hardcoded (like BOOSTER_RAM_GB) so booster can
+ * Manager RAM footprints, GB. Hardcoded so booster can
  * reserve home headroom for the next pending manager WITHOUT a getScriptRam call.
  * Measure each with `mem <file>` after any change and update here.
  */
@@ -421,6 +425,34 @@ export const STATUS_PORT_HACKNET = 5;
  *  BitNode reset to start the horizon history fresh. */
 export const BN_DURATIONS_JSON = "/data/bn-durations.json";
 
+// ── Worker landing telemetry (drift diagnosis) ─────────────────────────────
+//
+// The HWGW workers can report each op's ACTUAL landing back to the controller:
+// [opTag, target, expectedLand, actualLand, opReturn, threads] written to
+// TELEMETRY_PORT right after the op resolves (writePort is 0 GB; Date.now is
+// plain JS). The controller drains the port every tick and aggregates per-target
+// stats that separate the competing drift hypotheses:
+//   - landing error (actual − expected): |err| > ~D_GAP/2 means the H→W1→G→W2
+//     landing order is at risk → timing/engine cause;
+//   - hack return (money stolen) below the plan's expected steal from a FULL
+//     server → the server was NOT at max money when the hack landed → the
+//     previous cycle under-restored → plan-balance cause (e.g. a plan minted at
+//     slightly-elevated security oversizes h relative to g);
+//   - hack return of 0 → failed hack (chance < 100%) — benign for money (a miss
+//     steals nothing) but measured to rule it in/out.
+// Only every TELEMETRY_SAMPLE-th batch is tagged for reporting so port volume
+// stays far below the buffer between drains (a full port silently drops the
+// oldest entry). Workers hardcode the port number: they are scp'd standalone to
+// every rooted host, where an import of constants.js would not resolve.
+
+/** Port the workers report landings on. HARDCODED in workers/*.js — keep in sync. */
+export const TELEMETRY_PORT = 6;
+/** Report every Nth batch's landings (1 = every batch; raise if the port floods). */
+export const TELEMETRY_SAMPLE = 8;
+/** Landing error (ms) beyond which a landing is logged as off-slot. Half of D_GAP
+ *  is where the landing ORDER starts to be at risk. */
+export const TELEMETRY_ERR_WARN_MS = 50;
+
 // ── Diagnostics ────────────────────────────────────────────────────────────
 
 /** When true, the active controller (booster OR orbiter) appends per-tick
@@ -435,8 +467,9 @@ export const BN_DURATIONS_JSON = "/data/bn-durations.json";
  *  couldn't refill because the pool was full). Trace lines are gated to the
  *  windowed-drift case plus a sparse heartbeat, so a healthy fleet stays quiet. One
  *  shared flag: booster and orbiter run at different stages, so it only ever drives
- *  whichever is live. Set false to silence. */
-export const CONTROLLER_DEBUG = true;
+ *  whichever is live. Default false since the stage-9 drift diagnosis closed; set
+ *  true to re-arm the full logging + landing-telemetry toolkit. */
+export const CONTROLLER_DEBUG = false;
 export const BOOSTER_DEBUG_LOG = "/data/booster-debug.txt";
 export const ORBITER_DEBUG_LOG = "/data/orbiter-debug.txt";
 
@@ -449,13 +482,6 @@ export const FORMULAS_EXE = "Formulas.exe";
  *  booster execs this and exits once Formulas.exe is owned. */
 export const ORBITER = "/orbiter.js";
 
-/** orbiter's own RAM footprint, GB (measured: `mem orbiter.js`). The Formulas API
- *  functions are free (0 GB) — only owning Formulas.exe is required. 8.35 = booster's
- *  8.85 − 1GB hackAnalyze − 1GB hackAnalyzeChance − 1GB growthAnalyze + 2GB getServer
- *  + 0.5GB getPlayer. Re-measure with `mem orbiter.js` after any NS-call change (a
- *  phantom `share` property once inflated this to 10.75 — see ramAttribution note). */
-export const ORBITER_RAM_GB = 8.35;
-
 // ── Dashboard ──────────────────────────────────────────────────────────────
 
 /** Unified HTML/CSS overlay dashboard (reads the status-bus ports above). */
@@ -464,6 +490,3 @@ export const DASHBOARD = "/dashboard.js";
  *  the controller opens its own tail window instead (ns.ui.openTail, 0 GB) — early
  *  home RAM is too scarce to spend on an overlay. */
 export const DASHBOARD_MIN_HOME_RAM_GB = 256;
-/** dashboard.js own RAM footprint, GB. Measure with `mem dashboard.js` and update
- *  (port reads + ns.atExit are free, so this is essentially just the base cost). */
-export const DASHBOARD_RAM_GB = 1.6; // 1.60 base — keep the snapshot field names off NS-function names (e.g. `share`) or the analyzer phantom-charges +2.40
