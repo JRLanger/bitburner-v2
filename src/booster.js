@@ -219,6 +219,8 @@ let ramAbundantMode = false;
  *  log lines from the same tick can be grouped. See CONTROLLER_DEBUG in constants. */
 let debugBuf = [];
 let tickNo = 0;
+/** One-shot startup purge guard — see the STARTUP PURGE block in the main loop. */
+let startupPurged = false;
 /** Last hacking level seen, to log level-ups (a prime drift suspect: the locked
  *  plan's hack-thread count goes stale as per-thread hack fraction rises). */
 let lastHackLevel = 0;
@@ -327,6 +329,31 @@ export async function main(ns) {
         ns.write(SERVERS_JSON, JSON.stringify(servers, null, 2), "w");
 
         const rootedHosts = servers.filter((s) => s.hasRoot).map((s) => s.hostname);
+
+        // STARTUP PURGE (once per controller run): kill every HWGW/share worker on
+        // the cluster before the first pool build. A game reload restores in-flight
+        // workers but restarts them FROM SCRATCH, so their timing args are
+        // meaningless; a fresh controller (empty pipelines) then fires a full new
+        // grid on top of that zombie generation — RAM accounting (`reserved`) never
+        // sees the zombies and usage runs to 100%. One weakenTime of in-flight
+        // throughput is the price of a truthful, empty slate on every restart.
+        if (!startupPurged) {
+            startupPurged = true;
+            const shareFile = stripSlash(SHARE_WORKER);
+            let purged = 0;
+            for (const host of rootedHosts) {
+                for (const proc of ns.ps(host)) {
+                    const file = stripSlash(proc.filename);
+                    if (!WORKER_FILES.has(file) && file !== shareFile) continue;
+                    if (ns.kill(proc.pid)) purged += proc.threads;
+                }
+            }
+            if (purged > 0) {
+                ns.print(`startup purge: killed ${purged} stale worker threads`);
+                dbg(`T${tickNo} STARTUP-PURGE killed=${purged} stale worker threads`);
+            }
+        }
+
         // Reserve home headroom for the next pending manager, then launch it if its
         // gate trips. Done before buildPool so the pool already excludes that reserve.
         const homeReserveExtra = nextManagerReserve(ns);
