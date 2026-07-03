@@ -25,6 +25,7 @@ import {
     MONEY_EPSILON,
     BATCH_KEEP_MONEY_FRAC,
     BATCH_KEEP_SEC_FRAC,
+    BATCH_KEEP_SEC_ABS,
     BATCH_DROP_MIN_FILL,
     DRIFT_GRACE_MS,
     HACK_PCT_MIN,
@@ -602,7 +603,7 @@ function drainTelemetry(ns) {
         const [op, target, expLand, actLand, ret, threads] = rec;
         let s = telemetry.get(target);
         if (!s) {
-            s = { n: 0, offSlot: 0, maxErr: 0, hackZero: 0, hackLow: 0, growMin: Infinity };
+            s = { n: 0, offSlot: 0, maxErr: 0, hackZero: 0, hackLow: 0, growMin: Infinity, wClamp: 0 };
             telemetry.set(target, s);
         }
         s.n++;
@@ -613,6 +614,20 @@ function drainTelemetry(ns) {
             dbg(`  tele ${target} ${op} OFF-SLOT err=${Math.round(err)}ms thr=${threads} ret=${typeof ret === "number" ? ret.toFixed(3) : ret}`);
         }
         if (op === "G" && typeof ret === "number" && ret < s.growMin) s.growMin = ret;
+        // A weaken whose actual reduction fell well short of 0.05×threads was CLAMPED
+        // by the min-security floor: it landed with security ~at min, i.e. the grow it
+        // was scheduled to counter had NOT landed yet — direct order-inversion evidence.
+        // (A small clamp is normal: weakens are over-provisioned by THREAD_MARGIN.)
+        if ((op === "W1" || op === "W2") && typeof ret === "number" && threads > 0) {
+            const expectedSec = WEAKEN_SEC * threads;
+            if (ret < expectedSec * 0.9) {
+                s.wClamp++;
+                dbg(
+                    `  tele ${target} ${op} W-CLAMP reduced=${ret.toFixed(3)} ` +
+                    `expected=${expectedSec.toFixed(3)} (landed at ~min sec → its G had not landed)`
+                );
+            }
+        }
         if (op === "H" && typeof ret === "number") {
             if (ret === 0) {
                 s.hackZero++;
@@ -636,7 +651,7 @@ function teleSummary(target) {
     if (!s) return "tele=none";
     const gm = s.growMin === Infinity ? "-" : s.growMin.toFixed(2);
     return `tele n=${s.n} off=${s.offSlot} maxErr=${Math.round(s.maxErr)}ms ` +
-        `hLow=${s.hackLow} h0=${s.hackZero} gMin=${gm}`;
+        `hLow=${s.hackLow} h0=${s.hackZero} wCl=${s.wClamp} gMin=${gm}`;
 }
 
 // ── Manager orchestration ───────────────────────────────────────────────────
@@ -769,9 +784,15 @@ function classify(ns, servers) {
                 sec,
                 minSecurity: s.minSecurity,
             });
+            // Security keep-bound: relative (scales with the target) with an ABSOLUTE
+            // floor — min×0.10 is a hair-trigger on low-minSecurity servers (min=3 →
+            // only +0.30 tolerated), which is exactly where the observed drift-drops
+            // (foodnstuff/sigma-cosmetics) clustered. 1.0 of security ≈ one large
+            // batch's grow bump, so the floor tolerates a real transient without
+            // letting genuine sustained drift through.
             const healthy =
                 moneyFrac >= BATCH_KEEP_MONEY_FRAC &&
-                secOver <= s.minSecurity * BATCH_KEEP_SEC_FRAC;
+                secOver <= Math.max(s.minSecurity * BATCH_KEEP_SEC_FRAC, BATCH_KEEP_SEC_ABS);
             // A pipeline still filling toward depth (cold start, or RAM-starved by a
             // flood of newly-eligible servers) hasn't reached the steady state the
             // keep-test judges — its low windowed money is the ramp, not drift.
@@ -808,12 +829,29 @@ function classify(ns, servers) {
                 const locked = batchPlan.get(s.hostname);
                 let best = locked && locked.level === level ? locked : null;
                 if (!best) {
-                    best = bestHackPct(ns, s, chance);
-                    if (best) rampPlan.delete(s.hostname); // base changed → waterfall re-ramps fresh
+                    // BASELINE MINT GATE: hackAnalyze/getWeakenTime read the CURRENT
+                    // security, so a plan minted during the grid's hot phase (the
+                    // 100ms G→W2 window, where security is momentarily elevated)
+                    // carries oversized h and an inflated weakenTime — skewed threads
+                    // in flight and a flapping depth/reserved. Only re-mint on a tick
+                    // that reads the target at min security; until then keep running
+                    // the previous locked plan (the cold phase comes every
+                    // BATCH_PERIOD, so the deferral lasts a tick or two). Money is
+                    // deliberately NOT gated: none of the mint inputs depend on it.
+                    if (sec <= s.minSecurity * (1 + SEC_MARGIN)) {
+                        best = bestHackPct(ns, s, chance);
+                        if (best) {
+                            rampPlan.delete(s.hostname); // base changed → waterfall re-ramps fresh
+                            // Stamp ONLY the fresh mint. The deferred path below must
+                            // keep the OLD level so the re-mint retries next tick.
+                            best.level = level;
+                            batchPlan.set(s.hostname, best);
+                        }
+                    } else {
+                        best = locked; // hot phase → defer the re-mint, reuse the old plan
+                    }
                 }
                 if (best) {
-                    best.level = level;
-                    batchPlan.set(s.hostname, best);
                     eligible.push({ ...s, chance, sec, money, ...best });
                     // Drift trajectory trace. Logged when the WINDOWED baseline shows
                     // genuine drift (not the normal per-cycle oscillation, which the
@@ -855,7 +893,7 @@ function classify(ns, servers) {
             dbg(
                 `  classify DROP ${s.hostname}: moneyFrac=${moneyFrac.toFixed(3)} ` +
                 `(keep≥${BATCH_KEEP_MONEY_FRAC}) secOver=${secOver.toFixed(2)} ` +
-                `(keep≤${(s.minSecurity * BATCH_KEEP_SEC_FRAC).toFixed(2)}) ` +
+                `(keep≤${Math.max(s.minSecurity * BATCH_KEEP_SEC_FRAC, BATCH_KEEP_SEC_ABS).toFixed(2)}) ` +
                 `killed=${killed} graceMs=${now - (unhealthySince.get(s.hostname) ?? now)} ` +
                 teleSummary(s.hostname)
             );
@@ -1022,8 +1060,19 @@ function selectBatchers(ns, eligible, poolTotal) {
                 lockedCost <= capacity * (1 + RAMP_HYSTERESIS_FRAC) &&
                 lockedCost >= capacity * (1 - RAMP_HYSTERESIS_FRAC);
             if (!(wasBatching.has(t.hostname) && withinBand)) {
-                ramped = maximizeHackPct(ns, t, t.chance, capacity / conc, t.f);
-                if (ramped) rampPlan.set(t.hostname, ramped);
+                // BASELINE MINT GATE (same as classify's): maximizeHackPct reads live
+                // security via buildPlanner, so re-ramping during the grid's hot phase
+                // mints a plan with inflated weakenTime and skewed h/g — the observed
+                // tick-to-tick depth/reserved flap. On a hot tick keep the existing
+                // locked ramp unchanged (or run at base if none exists yet) and
+                // re-ramp on the next cold tick.
+                if (t.sec <= t.minSecurity * (1 + SEC_MARGIN)) {
+                    ramped = maximizeHackPct(ns, t, t.chance, capacity / conc, t.f);
+                    if (ramped) rampPlan.set(t.hostname, ramped);
+                } else if (!ramped) {
+                    allAtMax = false;
+                    continue; // hot phase, no locked ramp yet → base plan this tick
+                }
             }
             if (!ramped) { allAtMax = false; break; }
             a.plan = { ...t, ...ramped, score: t.score }; // keep base score for rank
@@ -1074,10 +1123,26 @@ function batchPhase(ns, eligible, pool, rootedHosts) {
         const target = t.hostname;
         const ramPerBatch = t.ramPerBatch;
 
-        // In-flight depth = a full pipeline at BATCH_PERIOD spacing, from the stable
-        // plan weaken time (constant depth, no overfill on a transient security bump).
-        // Lag is governed by MAX_BATCH_TARGETS (number of targets), not per-target depth.
-        const depth = Math.ceil(t.weakenTime / BATCH_PERIOD);
+        // In-flight depth = a full pipeline at BATCH_PERIOD spacing, from the BASE
+        // locked plan's weaken time — not the batcher entry's, which may carry a
+        // ramped plan whose weakenTime was minted at a different security and would
+        // flap the depth (and the reserved estimate) tick-to-tick. Lag is governed
+        // by MAX_BATCH_TARGETS (number of targets), not per-target depth.
+        const depth = Math.ceil((batchPlan.get(target)?.weakenTime ?? t.weakenTime) / BATCH_PERIOD);
+
+        // SECURITY-PHASE DEFERRAL (the central limit-cycle fix). An op's duration is
+        // fixed when the WORKER calls ns.hack/grow/weaken — about one engine tick
+        // AFTER this exec — but the landing delays below are computed from op-times
+        // read NOW. If security changes in that gap (the grid's 100ms G→W2 hot
+        // window), the real duration differs from the estimate by SECONDS (op times
+        // scale with security), the ops land off-slot, create larger hot windows,
+        // and the error self-sustains (observed: rawS swinging to +6/+12 every other
+        // tick). So never fire while the target reads above min security: defer to
+        // the next tick — the scheduler is self-pacing, so the slot is not lost, and
+        // a cold phase comes every BATCH_PERIOD. This is NOT the old Mode-A baseline
+        // fire gate (which stalled the landing clock); lastLand keeps advancing.
+        const secNow = ns.getServerSecurityLevel(target);
+        const hot = secNow > t.minSecurity * (1 + SEC_MARGIN);
 
         // Fresh op-times for landing math (see fireBatch).
         const weakenTime = ns.getWeakenTime(target);
@@ -1121,7 +1186,7 @@ function batchPhase(ns, eligible, pool, rootedHosts) {
         // batch half-fire. Sized at weakenRam (1.75) for all four ops — hack threads
         // are 1.70, so this is marginally conservative, never optimistic.
         const threadsPerBatch = t.h + t.g + t.w1 + t.w2;
-        while (pipe.committed.length < depth && k < MAX_FIRES_PER_TICK) {
+        while (!hot && pipe.committed.length < depth && k < MAX_FIRES_PER_TICK) {
             if (placeableThreads(pool, WORKER_RAM.weakenRam) < threadsPerBatch) { deferred = true; break; }
             const land = Math.max(now + weakenTime + BATCH_SAFETY_MS, pipe.lastLand + BATCH_PERIOD);
             fireBatch(ns, pool, t, land, now, hackTime, growTime, weakenTime);
@@ -1130,6 +1195,16 @@ function batchPhase(ns, eligible, pool, rootedHosts) {
             k++;
         }
 
+        // FIRE-HOT: a refill was wanted but the target read above min security (see
+        // the security-phase deferral above). Expected occasionally (the hot window
+        // is ~100ms of every BATCH_PERIOD); chronic FIRE-HOT with rising secOver
+        // means the grid itself is unhealthy.
+        if (CONTROLLER_DEBUG && hot && pipe.committed.length < depth) {
+            dbg(
+                `  batch ${target} FIRE-HOT sec=+${(secNow - t.minSecurity).toFixed(2)} ` +
+                `fill=${pipe.committed.length}/${depth}`
+            );
+        }
         // A pipeline that wanted to refill but couldn't (pool momentarily full) runs
         // shallower than `depth`: fewer grows land per cycle than the hacks need, so
         // money can drift down even though the locked plan is balanced. Logging the

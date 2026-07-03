@@ -20,8 +20,13 @@ export const D_GAP = 100;
 /** Interval between batch launches into the pipeline, ms. One batch per period. */
 export const BATCH_PERIOD = 4 * D_GAP;
 
-/** Main loop sleep, ms. Wake often enough to never miss a grid launch window. */
-export const LOOP_SLEEP = BATCH_PERIOD / 2;
+/** Main loop sleep, ms. Wake often enough to never miss a grid launch window.
+ *  Deliberately NOT an exact divisor of BATCH_PERIOD: at exactly BATCH_PERIOD/2 the
+ *  tick phase-locks to two fixed points of the landing grid (observed as gap=205ms
+ *  every tick), so fires and health samples always hit the same grid phases — if one
+ *  of them is the 100ms post-grow "hot" security window, every fire/sample is bad,
+ *  a deterministic resonance. The +30 makes the phase rotate through the whole grid. */
+export const LOOP_SLEEP = BATCH_PERIOD / 2 + 30;
 
 /** Launch lead, ms: a batch's grid slot is fired this far before its launch lead
  *  (slot − weakenTime), so on the absolute landing grid its per-op delays stay ≥ 0
@@ -66,6 +71,13 @@ export const BATCH_KEEP_MONEY_FRAC = 0.9;
  *  scales with the target instead of one flat number being too loose on a
  *  low-minSecurity server and too tight on a high one. */
 export const BATCH_KEEP_SEC_FRAC = 0.10;
+/** ABSOLUTE floor for the security keep-bound: keep while
+ *  secOver ≤ max(minSecurity × BATCH_KEEP_SEC_FRAC, this). Purely relative bounds
+ *  are hair-triggers on low-minSecurity servers (min=3 → only +0.30 tolerated),
+ *  which is where the drift-drops clustered (foodnstuff/sigma-cosmetics). 1.0 of
+ *  security ≈ one large batch's grow bump — tolerates a real transient without
+ *  letting sustained drift through. */
+export const BATCH_KEEP_SEC_ABS = 1.0;
 
 // Drift grace. A batch fired during a transient security bump (caused by a
 // high-grow target's own in-flight grows) lands a little late and briefly
