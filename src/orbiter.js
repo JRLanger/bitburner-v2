@@ -74,6 +74,9 @@ import {
     STATUS_PORT_CONTROLLER,
     DASHBOARD,
     DASHBOARD_MIN_HOME_RAM_GB,
+    TELEMETRY_PORT,
+    TELEMETRY_SAMPLE,
+    TELEMETRY_ERR_WARN_MS,
 } from "/config/constants.js";
 import { readFlags, writeFlags } from "/lib/flags.js";
 import { publishStatus } from "/lib/status.js";
@@ -126,6 +129,19 @@ const MANAGERS_SEEN_FLAG = "managersSeen";
 
 /** Monotonic id appended to every worker exec so concurrent workers are unique. */
 let batchSeq = 0;
+
+/**
+ * Landing-telemetry state (drift diagnosis, CONTROLLER_DEBUG only — see the
+ * TELEMETRY_* constants). Every TELEMETRY_SAMPLE-th batch is tagged so its four
+ * workers report [opTag, target, expLand, actualLand, ret, threads] on
+ * TELEMETRY_PORT; drainTelemetry aggregates per-target rolling stats since
+ * admission (cleared on drop). Fields as in booster: n, offSlot, maxErr,
+ * hackZero (failed hacks), hackLow (successful hack stole below the plan's
+ * expected full-server steal → previous cycle under-restored), growMin.
+ */
+const telemetry = new Map();
+/** Batches fired since start; drives the every-Nth telemetry sampling. */
+let telemetrySeq = 0;
 
 /**
  * Per-target HWGW pipeline state: target -> { committed, lastLand, depth }.
@@ -309,6 +325,10 @@ export async function main(ns) {
         launchManagers(ns, servers);
         const pool = buildPool(ns, rootedHosts, homeReserveExtra);
         const inFlight = inFlightByTarget(ns, rootedHosts);
+
+        // Drain worker landing telemetry BEFORE classify, so this tick's DROP/trace
+        // lines can include up-to-date per-target landing stats.
+        drainTelemetry(ns);
 
         // One Player snapshot per tick, fed to every Formulas call (hack %, chance,
         // op-times, grow threads). Cheap and constant within a tick.
@@ -637,6 +657,62 @@ function ramAttribution(ns, rootedHosts, batchSet, prepSet) {
     return { batch, prep, shareUse, orphan, byTarget, orphanHosts };
 }
 
+// ── Landing telemetry (drift diagnosis) ─────────────────────────────────────
+
+/**
+ * Drain TELEMETRY_PORT and fold each record into the per-target rolling stats
+ * (see the `telemetry` map doc). Logs a dbg line for each anomalous landing:
+ *   off-slot — |actual − expected| > TELEMETRY_ERR_WARN_MS (landing-order risk);
+ *   hackLow  — a successful hack stole < 95% of the plan's expected steal from a
+ *              FULL server, i.e. money was already below max when it landed.
+ * All port ops are 0 GB; runs every tick but the port only ever holds data when
+ * CONTROLLER_DEBUG sampling is on (fireBatch tags no batches otherwise).
+ */
+function drainTelemetry(ns) {
+    while (true) {
+        const rec = ns.readPort(TELEMETRY_PORT);
+        if (rec === "NULL PORT DATA") break;
+        if (!Array.isArray(rec) || rec.length < 6) continue;
+        const [op, target, expLand, actLand, ret, threads] = rec;
+        let s = telemetry.get(target);
+        if (!s) {
+            s = { n: 0, offSlot: 0, maxErr: 0, hackZero: 0, hackLow: 0, growMin: Infinity };
+            telemetry.set(target, s);
+        }
+        s.n++;
+        const err = actLand - expLand;
+        if (Math.abs(err) > Math.abs(s.maxErr)) s.maxErr = err;
+        if (Math.abs(err) > TELEMETRY_ERR_WARN_MS) {
+            s.offSlot++;
+            dbg(`  tele ${target} ${op} OFF-SLOT err=${Math.round(err)}ms thr=${threads} ret=${typeof ret === "number" ? ret.toFixed(3) : ret}`);
+        }
+        if (op === "G" && typeof ret === "number" && ret < s.growMin) s.growMin = ret;
+        if (op === "H" && typeof ret === "number") {
+            if (ret === 0) {
+                s.hackZero++;
+            } else {
+                const plan = batchPlan.get(target);
+                if (plan && plan.steal && ret < plan.steal * 0.95) {
+                    s.hackLow++;
+                    dbg(
+                        `  tele ${target} H HACK-LOW stole=${ns.format.number(ret)} ` +
+                        `expected=${ns.format.number(plan.steal)} (money below max at landing)`
+                    );
+                }
+            }
+        }
+    }
+}
+
+/** One-line summary of a target's telemetry stats for DROP/trace log lines. */
+function teleSummary(target) {
+    const s = telemetry.get(target);
+    if (!s) return "tele=none";
+    const gm = s.growMin === Infinity ? "-" : s.growMin.toFixed(2);
+    return `tele n=${s.n} off=${s.offSlot} maxErr=${Math.round(s.maxErr)}ms ` +
+        `hLow=${s.hackLow} h0=${s.hackZero} gMin=${gm}`;
+}
+
 // ── Manager orchestration ───────────────────────────────────────────────────
 
 /**
@@ -816,13 +892,15 @@ function classify(ns, servers, player) {
                     `(keep≥${BATCH_KEEP_MONEY_FRAC}) secOver=${secOver.toFixed(2)} ` +
                     `(keep≤${(s.minSecurity * BATCH_KEEP_SEC_FRAC).toFixed(2)}) ` +
                     `fill=${pipe ? pipe.committed.length + "/" + pipe.depth : "-/-"} ramping=${ramping} ` +
-                    `killed=${killed} graceMs=${now - (unhealthySince.get(s.hostname) ?? now)}`
+                    `killed=${killed} graceMs=${now - (unhealthySince.get(s.hostname) ?? now)} ` +
+                    teleSummary(s.hostname)
                 );
                 unhealthySince.delete(s.hostname);  // clear grace state
                 activeBatching.delete(s.hostname);
                 batchPlan.delete(s.hostname);  // recompute a fresh plan on re-admission
                 rampPlan.delete(s.hostname);   // drop the sticky ramp so re-admission re-ramps fresh
                 pipelines.delete(s.hostname);  // re-anchor the pipeline on re-admission
+                telemetry.delete(s.hostname);  // stats belong to the dropped generation
             }
         }
 
@@ -836,10 +914,18 @@ function classify(ns, servers, player) {
         if (best) {
             activeBatching.add(s.hostname);
             eligible.push({ ...s, sec, money, ...best });
+            // Log the FULL minted plan (Formulas-exact against the prepped snapshot,
+            // so — unlike booster — it CANNOT be security-skewed; if drift still shows
+            // here the cause is elsewhere). steal = expected $ per successful hack from
+            // a FULL server (the telemetry HACK-LOW reference); growMult = the restore
+            // multiplier g was sized for.
             dbg(
                 `  classify ADMIT-NEW ${s.hostname} (was re-prepped or fresh): ` +
                 `money=${((money / s.maxMoney) * 100).toFixed(1)}% sec=+${(sec - s.minSecurity).toFixed(2)} ` +
-                `(min=${s.minSecurity.toFixed(2)})`
+                `(min=${s.minSecurity.toFixed(2)}) plan f=${best.f.toFixed(2)} h=${best.h} g=${best.g} ` +
+                `w1=${best.w1} w2=${best.w2} chance=${(best.chance * 100).toFixed(0)}% ` +
+                `steal=${ns.format.number(best.steal)} growMult=${best.growMult.toFixed(3)} ` +
+                `wt=${(best.weakenTime / 1000).toFixed(1)}s`
             );
         }
     }
@@ -1116,10 +1202,16 @@ function fireBatch(ns, pool, t, base, now, hackTime, growTime, weakenTime) {
     const addG = Math.max(0, base + D_GAP - now - growTime);
     const addW2 = Math.max(0, base + 2 * D_GAP - now - weakenTime);
 
-    const ph = placeThreads(ns, pool, HACK_WORKER, WORKER_RAM.hackRam, t.h, target, addH);
-    const pw1 = placeThreads(ns, pool, WEAKEN_WORKER, WORKER_RAM.weakenRam, t.w1, target, addW1);
-    const pg = placeThreads(ns, pool, GROW_WORKER, WORKER_RAM.growRam, t.g, target, addG);
-    const pw2 = placeThreads(ns, pool, WEAKEN_WORKER, WORKER_RAM.weakenRam, t.w2, target, addW2);
+    // Landing telemetry: tag every Nth batch so its workers report actual landings
+    // (0 GB port write). exp(offset) is the op's expected landing on the grid; 0
+    // disables reporting in the worker. Debug-gated so a quiet build stays silent.
+    const sample = CONTROLLER_DEBUG && ++telemetrySeq % TELEMETRY_SAMPLE === 0;
+    const exp = (offset) => (sample ? base + offset : 0);
+
+    const ph = placeThreads(ns, pool, HACK_WORKER, WORKER_RAM.hackRam, t.h, target, addH, exp(-D_GAP), "H");
+    const pw1 = placeThreads(ns, pool, WEAKEN_WORKER, WORKER_RAM.weakenRam, t.w1, target, addW1, exp(0), "W1");
+    const pg = placeThreads(ns, pool, GROW_WORKER, WORKER_RAM.growRam, t.g, target, addG, exp(D_GAP), "G");
+    const pw2 = placeThreads(ns, pool, WEAKEN_WORKER, WORKER_RAM.weakenRam, t.w2, target, addW2, exp(2 * D_GAP), "W2");
     // The placeableThreads gate should make a shortfall impossible; if one ever shows
     // up here it means the gate math and reality disagree — worth a debug line.
     if (CONTROLLER_DEBUG && (ph < t.h || pg < t.g || pw1 < t.w1 || pw2 < t.w2)) {
@@ -1223,14 +1315,16 @@ function prepWave(ns, t, pool, player, ramBudget = Infinity) {
  * host first. Mutates pool free RAM. Returns the number of threads actually
  * placed (may be less than requested if RAM runs out).
  */
-function placeThreads(ns, pool, script, ramPerThread, threads, target, delay) {
+function placeThreads(ns, pool, script, ramPerThread, threads, target, delay, expLand = 0, opTag = "") {
     let remaining = threads;
     for (const server of pool) {
         if (remaining <= 0) break;
         const fit = Math.floor(server.free / ramPerThread);
         const n = Math.min(fit, remaining);
         if (n <= 0) continue;
-        ns.exec(script, server.host, n, target, delay, batchSeq++);
+        // Trailing args are the landing-telemetry contract (see workers/*.js):
+        // expLand > 0 makes the worker report [opTag, target, expLand, actual, ret, n].
+        ns.exec(script, server.host, n, target, delay, batchSeq++, expLand, opTag, n);
         server.free -= n * ramPerThread;
         remaining -= n;
     }
@@ -1384,7 +1478,13 @@ function buildPlanner(ns, server, player) {
             h * WORKER_RAM.hackRam + g * WORKER_RAM.growRam + (w1 + w2) * WORKER_RAM.weakenRam;
         const moneyPerBatch = maxMoney * f * chance;
         const score = moneyPerBatch / (weakenTime * ramPerBatch);
-        return { f, h, g, w1, w2, ramPerBatch, weakenTime, growTime, hackTime, chance, score };
+        // Telemetry references: `steal` = expected $ per successful hack from a FULL
+        // server (drainTelemetry's HACK-LOW baseline); `growMult` = the restore
+        // multiplier g was sized for. Formulas-exact (prepped snapshot), so unlike
+        // booster's these cannot be security-skewed at plan time.
+        const steal = maxMoney * actualF;
+        const growMult = 1 / (1 - actualF);
+        return { f, h, g, w1, w2, ramPerBatch, weakenTime, growTime, hackTime, chance, score, steal, growMult };
     };
     return { atF };
 }

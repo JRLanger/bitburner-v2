@@ -421,6 +421,34 @@ export const STATUS_PORT_HACKNET = 5;
  *  BitNode reset to start the horizon history fresh. */
 export const BN_DURATIONS_JSON = "/data/bn-durations.json";
 
+// ── Worker landing telemetry (drift diagnosis) ─────────────────────────────
+//
+// The HWGW workers can report each op's ACTUAL landing back to the controller:
+// [opTag, target, expectedLand, actualLand, opReturn, threads] written to
+// TELEMETRY_PORT right after the op resolves (writePort is 0 GB; Date.now is
+// plain JS). The controller drains the port every tick and aggregates per-target
+// stats that separate the competing drift hypotheses:
+//   - landing error (actual − expected): |err| > ~D_GAP/2 means the H→W1→G→W2
+//     landing order is at risk → timing/engine cause;
+//   - hack return (money stolen) below the plan's expected steal from a FULL
+//     server → the server was NOT at max money when the hack landed → the
+//     previous cycle under-restored → plan-balance cause (e.g. a plan minted at
+//     slightly-elevated security oversizes h relative to g);
+//   - hack return of 0 → failed hack (chance < 100%) — benign for money (a miss
+//     steals nothing) but measured to rule it in/out.
+// Only every TELEMETRY_SAMPLE-th batch is tagged for reporting so port volume
+// stays far below the buffer between drains (a full port silently drops the
+// oldest entry). Workers hardcode the port number: they are scp'd standalone to
+// every rooted host, where an import of constants.js would not resolve.
+
+/** Port the workers report landings on. HARDCODED in workers/*.js — keep in sync. */
+export const TELEMETRY_PORT = 6;
+/** Report every Nth batch's landings (1 = every batch; raise if the port floods). */
+export const TELEMETRY_SAMPLE = 8;
+/** Landing error (ms) beyond which a landing is logged as off-slot. Half of D_GAP
+ *  is where the landing ORDER starts to be at risk. */
+export const TELEMETRY_ERR_WARN_MS = 50;
+
 // ── Diagnostics ────────────────────────────────────────────────────────────
 
 /** When true, the active controller (booster OR orbiter) appends per-tick
