@@ -50,8 +50,7 @@ export const HACK_SEC = 0.002;
 // No hack-chance floor: chance is already a multiplier in bestHackPct's score
 // (moneyPerBatch = maxMoney × f × chance), so a low-chance target is correctly
 // scored low rather than excluded — it only wins a batch slot if nothing
-// higher-scoring is competing for the RAM. Removed CHANCE_FILTER/CHANCE_BATCH
-// (0.5 / 0.8 floors) in favor of trusting the score outright.
+// higher-scoring is competing for the RAM.
 
 /** "Prepped"/healthy if security ≤ minSecurity × (1 + this). */
 export const SEC_MARGIN = 0.05;
@@ -289,21 +288,14 @@ export const SHARE_OFF_FLAG = "shareOff";
 
 // ── RAM reservation ────────────────────────────────────────────────────────
 
-/** booster's own RAM footprint, GB (its function budget — see devlog). Measured
- *  with `mem booster.js` (8.85 at Stage 8: +0.50 kill from killWorkersFor). */
-export const BOOSTER_RAM_GB = 8.85;
+// Measured script footprints (for reference — the pool reads live used RAM, so
+// these are not imported anywhere): booster 8.85 GB, orbiter 8.35 GB,
+// dashboard 1.6 GB. Re-measure with `mem <file>` after changes, and keep
+// variable/property names off NS-function names (e.g. `share`) or the RAM
+// analyzer phantom-charges them (+2.40 GB incident — see orbiter devlog).
+
 /** Extra home RAM left free as a safety buffer, GB. */
 export const HOME_SAFETY_BUFFER_GB = 2;
-
-// ── Port-opener programs (file name → NS method to call) ───────────────────
-
-export const CRACKS = [
-    { file: "BruteSSH.exe", method: "brutessh" },
-    { file: "FTPCrack.exe", method: "ftpcrack" },
-    { file: "relaySMTP.exe", method: "relaysmtp" },
-    { file: "HTTPWorm.exe", method: "httpworm" },
-    { file: "SQLInject.exe", method: "sqlinject" },
-];
 
 // ── Managers / orchestration ───────────────────────────────────────────────
 
@@ -322,7 +314,7 @@ export const PSERVER_MANAGER = "/managers/pserver.js";
 export const HACKNET_MANAGER = "/managers/hacknet.js";
 
 /**
- * Manager RAM footprints, GB. Hardcoded (like BOOSTER_RAM_GB) so booster can
+ * Manager RAM footprints, GB. Hardcoded so booster can
  * reserve home headroom for the next pending manager WITHOUT a getScriptRam call.
  * Measure each with `mem <file>` after any change and update here.
  */
@@ -475,8 +467,9 @@ export const TELEMETRY_ERR_WARN_MS = 50;
  *  couldn't refill because the pool was full). Trace lines are gated to the
  *  windowed-drift case plus a sparse heartbeat, so a healthy fleet stays quiet. One
  *  shared flag: booster and orbiter run at different stages, so it only ever drives
- *  whichever is live. Set false to silence. */
-export const CONTROLLER_DEBUG = true;
+ *  whichever is live. Default false since the stage-9 drift diagnosis closed; set
+ *  true to re-arm the full logging + landing-telemetry toolkit. */
+export const CONTROLLER_DEBUG = false;
 export const BOOSTER_DEBUG_LOG = "/data/booster-debug.txt";
 export const ORBITER_DEBUG_LOG = "/data/orbiter-debug.txt";
 
@@ -489,13 +482,6 @@ export const FORMULAS_EXE = "Formulas.exe";
  *  booster execs this and exits once Formulas.exe is owned. */
 export const ORBITER = "/orbiter.js";
 
-/** orbiter's own RAM footprint, GB (measured: `mem orbiter.js`). The Formulas API
- *  functions are free (0 GB) — only owning Formulas.exe is required. 8.35 = booster's
- *  8.85 − 1GB hackAnalyze − 1GB hackAnalyzeChance − 1GB growthAnalyze + 2GB getServer
- *  + 0.5GB getPlayer. Re-measure with `mem orbiter.js` after any NS-call change (a
- *  phantom `share` property once inflated this to 10.75 — see ramAttribution note). */
-export const ORBITER_RAM_GB = 8.35;
-
 // ── Dashboard ──────────────────────────────────────────────────────────────
 
 /** Unified HTML/CSS overlay dashboard (reads the status-bus ports above). */
@@ -504,6 +490,3 @@ export const DASHBOARD = "/dashboard.js";
  *  the controller opens its own tail window instead (ns.ui.openTail, 0 GB) — early
  *  home RAM is too scarce to spend on an overlay. */
 export const DASHBOARD_MIN_HOME_RAM_GB = 256;
-/** dashboard.js own RAM footprint, GB. Measure with `mem dashboard.js` and update
- *  (port reads + ns.atExit are free, so this is essentially just the base cost). */
-export const DASHBOARD_RAM_GB = 1.6; // 1.60 base — keep the snapshot field names off NS-function names (e.g. `share`) or the analyzer phantom-charges +2.40

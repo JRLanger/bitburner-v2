@@ -522,6 +522,9 @@ under-restore fingerprint), near-totally clamped weakens (`wCl` — a weaken red
 < 25% of its capacity landed *before* the grow it counters; partial clamping is
 normal, the margin over-provisions weakens by design) — and the `DROP`/trace lines
 carry the summary. Debug-gated: with `CONTROLLER_DEBUG` off no batch is ever tagged.
+Since the stage-9 diagnosis closed, `CONTROLLER_DEBUG` defaults to **false** — the
+telemetry and debug logging stay in the code, dormant at zero cost; flip the flag in
+`constants.js` to re-arm the whole toolkit if drift ever returns.
 
 ## History
 

@@ -1119,9 +1119,8 @@ function selectBatchers(ns, eligible, poolTotal, player) {
  * security — see fireBatch. (An earlier version scheduled with the prepped plan
  * times too; whenever the live server sat above min that delayed each weaken ~4× more
  * than its hack, so counter-weakens fell behind and the grid ran away. Live times
- * match booster's proven scheduler.) Validated in the isolated rig (src/test/
- * batch-rig.js, Mode C on iron-gym at full depth): +0.00 security, ~2ms landing
- * error, ~full throughput indefinitely.
+ * match booster's proven scheduler.) Validated in an isolated rig at full depth:
+ * +0.00 security, ~2ms landing error, ~full throughput indefinitely.
  */
 function batchPhase(ns, eligible, pool, rootedHosts) {
     const now = Date.now();
@@ -1152,7 +1151,7 @@ function batchPhase(ns, eligible, pool, rootedHosts) {
         // from the estimate by seconds, the ops land off-slot, and the error
         // self-sustains. Never fire while the target reads above min security; the
         // scheduler is self-pacing, so the slot is not lost and a cold phase comes
-        // every BATCH_PERIOD. NOT the old Mode-A fire gate: lastLand keeps advancing.
+        // every BATCH_PERIOD. The landing clock never stalls: lastLand keeps advancing.
         const secNow = ns.getServerSecurityLevel(target);
         const hot = secNow > t.minSecurity * (1 + SEC_MARGIN);
 

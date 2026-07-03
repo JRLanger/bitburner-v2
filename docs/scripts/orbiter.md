@@ -125,7 +125,8 @@ final design, both worth preserving:
    SEC_MARGIN)` — it defers to the next tick (`FIRE-HOT` debug line); the landing
    clock keeps advancing, so no slot is lost. The keep-bound also gained the
    `BATCH_KEEP_SEC_ABS` absolute floor, and orbiter carries the same
-   worker-landing telemetry (`TELEMETRY_*` / `drainTelemetry` / `teleSummary`) —
+   worker-landing telemetry (`TELEMETRY_*` / `drainTelemetry` / `teleSummary`;
+   dormant while `CONTROLLER_DEBUG` is false, the post-stage-9 default) —
    see booster.md, "The security limit cycle and its four coupled fixes", for the
    full diagnosis. One difference: orbiter needs **no baseline mint gate** —
    `buildPlanner` computes everything against the prepped snapshot, so a plan

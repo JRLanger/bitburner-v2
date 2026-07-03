@@ -1108,9 +1108,8 @@ function selectBatchers(ns, eligible, poolTotal) {
  * at exactly N in flight; using the live (security-inflated) weaken time here would
  * grow the target on a transient bump and overfill. Landing *times*, however, use
  * FRESH op-times (current security) so each op lands exactly on its slot regardless
- * of security — see fireBatch. Validated in the isolated rig (src/test/batch-rig.js,
- * Mode C on iron-gym at full depth): +0.00 security, ~2ms landing error, ~full
- * throughput indefinitely.
+ * of security — see fireBatch. Validated in an isolated rig at full depth:
+ * +0.00 security, ~2ms landing error, ~full throughput indefinitely.
  */
 function batchPhase(ns, eligible, pool, rootedHosts) {
     const now = Date.now();
@@ -1135,8 +1134,8 @@ function batchPhase(ns, eligible, pool, rootedHosts) {
         // and the error self-sustains (observed: rawS swinging to +6/+12 every other
         // tick). So never fire while the target reads above min security: defer to
         // the next tick — the scheduler is self-pacing, so the slot is not lost, and
-        // a cold phase comes every BATCH_PERIOD. This is NOT the old Mode-A baseline
-        // fire gate (which stalled the landing clock); lastLand keeps advancing.
+        // a cold phase comes every BATCH_PERIOD. Unlike a fire gate that stalls
+        // the landing clock, lastLand keeps advancing.
         const secNow = ns.getServerSecurityLevel(target);
         const hot = secNow > t.minSecurity * (1 + SEC_MARGIN);
 
@@ -1421,7 +1420,7 @@ function placeShare(ns, pool, threads) {
     return threads - remaining;
 }
 
-// ── Scoring (kept for stage 3b batching; not used in the 3a prep loop) ───────
+// ── Batch planning: score / ramp factories ──────────────────────────────────
 
 /**
  * Build a per-target plan factory. Resolves the f-independent baseline once (hack-per-
