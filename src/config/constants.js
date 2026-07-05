@@ -237,6 +237,31 @@ export const RAMP_HYSTERESIS_FRAC = 0.15;
 /** Minimum relative f drop that triggers a kill-all + refill re-anchor. */
 export const REANCHOR_DROP_FRAC = 0.15;
 
+// A re-anchor is a massacre (it kills the target's ENTIRE in-flight pipeline), so
+// it must only answer a REAL sustained ramp-down, never planner noise. Observed
+// pathology: the admission waterfall's leftover budget whipsaws tick-to-tick (an
+// upstream deep target's locked plan is kept on its hot ticks and re-minted on its
+// cold ones, so `reserved` oscillates), making the last-ranked targets' f flip
+// between two values every other tick — and the instant re-anchor then killed
+// 13-23k threads every ~20 ticks, forever (alpha-ent/zb-def flap). A genuine
+// ramp-down persists indefinitely; the flap reverses within a tick or two. So the
+// f-drop must hold for this many CONSECUTIVE ticks before the kill fires.
+/** Consecutive ticks an f-drop must persist before the re-anchor kill fires. */
+export const REANCHOR_STABLE_TICKS = 20;
+
+// Same flap, one level up: the Pass-B waterfall re-mints an incumbent's ramped
+// plan DOWN the instant its allocated capacity falls below the hysteresis band —
+// but when the capacity itself whipsaws tick-to-tick (upstream locked plans kept
+// on hot ticks, re-minted on cold ones), that instant down-mint is what feeds the
+// f-flip the re-anchor gate above has to absorb. A genuine capacity loss (fleet
+// shrank, better target admitted) persists; the flap reverses within a tick or
+// two. So a down-mint only fires after the capacity deficit holds this many
+// CONSECUTIVE ticks; until then the locked plan is kept at its real cost (the
+// transient `reserved` overshoot is bounded and preferable to plan churn).
+// Up-mints stay immediate — they kill nothing.
+/** Consecutive ticks a capacity deficit must persist before a ramp-down re-mint. */
+export const RAMP_DOWN_STABLE_TICKS = 20;
+
 // ── Worker scripts ─────────────────────────────────────────────────────────
 
 export const HACK_WORKER = "/workers/hack.js";
@@ -472,6 +497,16 @@ export const TELEMETRY_ERR_WARN_MS = 50;
 export const CONTROLLER_DEBUG = true; // re-armed: diagnosing stalled 0/N pipelines (stage 10)
 export const BOOSTER_DEBUG_LOG = "/data/booster-debug.txt";
 export const ORBITER_DEBUG_LOG = "/data/orbiter-debug.txt";
+
+// The debug log grows ~1.4KB/s and was never truncated mid-run; a multi-hour run
+// left a 45MB file. The sync tool pulls these files over the Remote API, and each
+// pull makes the GAME JSON-serialize the whole file on its main thread — at tens
+// of MB that freezes the UI (prime suspect for the recurring crashes; game stable
+// with sync off). Rotation caps the cost: when the file would exceed this,
+// flushDebug truncates and starts over (~25 min of history at debug rates — enough
+// window to diagnose a stall).
+/** Max debug-log size in bytes before flushDebug truncates and restarts the file. */
+export const DEBUG_LOG_MAX_BYTES = 2_000_000;
 
 // ── Detection / handoff ────────────────────────────────────────────────────
 

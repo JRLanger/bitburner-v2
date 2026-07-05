@@ -44,7 +44,9 @@ import {
     BATCH_BUDGET_FRAC,
     REFILL_HEADROOM_FRAC,
     RAMP_HYSTERESIS_FRAC,
+    RAMP_DOWN_STABLE_TICKS,
     REANCHOR_DROP_FRAC,
+    REANCHOR_STABLE_TICKS,
     MAX_FIRES_PER_TICK,
     MAX_BATCH_TARGETS,
     SELECT_KEEP_BIAS,
@@ -54,6 +56,7 @@ import {
     BATCH_SAFETY_MS,
     CONTROLLER_DEBUG,
     BOOSTER_DEBUG_LOG,
+    DEBUG_LOG_MAX_BYTES,
     CONTRACTS_MANAGER,
     PSERVER_MANAGER,
     HACKNET_MANAGER,
@@ -182,6 +185,10 @@ const rampPlan = new Map();
 
 /** Hostnames admitted to batching last tick — drives selectBatchers hysteresis. */
 const wasBatching = new Set();
+/** host -> consecutive ticks its waterfall capacity has sat below the locked
+ *  ramp's band; a ramp-DOWN re-mint only fires past RAMP_DOWN_STABLE_TICKS
+ *  (damps the capacity whipsaw — see selectBatchers Pass B). */
+const rampDownSince = new Map();
 
 /**
  * Per-target timestamp (ms) when a batching target first went unhealthy (outside
@@ -236,10 +243,23 @@ let lastWorkMs = 0;
 function dbg(line) {
     if (CONTROLLER_DEBUG) debugBuf.push(line);
 }
-/** Append this tick's buffered diagnostic lines to the log file and clear. */
+/** Bytes written to the debug log this run, for rotation (see DEBUG_LOG_MAX_BYTES). */
+let debugBytes = 0;
+/** Append this tick's buffered diagnostic lines to the log file and clear.
+ *  Rotates (truncates and restarts) past DEBUG_LOG_MAX_BYTES — an unbounded log
+ *  makes every Remote API pull serialize the whole file in the game's main
+ *  thread, which at tens of MB freezes the UI. */
 function flushDebug(ns) {
     if (CONTROLLER_DEBUG && debugBuf.length > 0) {
-        ns.write(BOOSTER_DEBUG_LOG, debugBuf.join("\n") + "\n", "a");
+        const chunk = debugBuf.join("\n") + "\n";
+        if (debugBytes + chunk.length > DEBUG_LOG_MAX_BYTES) {
+            const header = `# booster debug log — rotated ${new Date().toISOString()} (cap ${DEBUG_LOG_MAX_BYTES}B)\n`;
+            ns.write(BOOSTER_DEBUG_LOG, header + chunk, "w");
+            debugBytes = header.length + chunk.length;
+        } else {
+            ns.write(BOOSTER_DEBUG_LOG, chunk, "a");
+            debugBytes += chunk.length;
+        }
     }
     debugBuf = [];
 }
@@ -827,8 +847,19 @@ function classify(ns, servers) {
             // state (batchPhase refills after classify); a target with no pipe yet
             // (just admitted) counts as ramping too. Inert in steady state.
             const pipe = pipelines.get(s.hostname);
+            // EMPTY pipelines are NOT protected: the protection exists to avoid
+            // orphaning in-flight workers, and an empty pipeline has none — while
+            // protecting it can deadlock. A crash/reload leaves targets drained
+            // and hot (startup purge kills workers mid-cycle); batchPhase's
+            // security deferral then never fires (security only falls when a
+            // weaken LANDS — an empty pipeline has none coming), and the old
+            // blanket protection kept classify from ever dropping the target to
+            // re-prep. Three-way deadlock, observed as every batcher frozen at
+            // fill=0/N with money=4% and chronic FIRE-HOT. Empty+unhealthy now
+            // falls through to the normal keep-test/grace and re-preps.
             const ramping = pipe
-                ? pipe.committed.length < pipe.depth * BATCH_DROP_MIN_FILL
+                ? pipe.committed.length > 0 &&
+                  pipe.committed.length < pipe.depth * BATCH_DROP_MIN_FILL
                 : true;
             // Drift grace: keep batching through a brief unhealthy blip (a
             // bump-fired batch landing late self-heals in a few seconds); only
@@ -868,6 +899,13 @@ function classify(ns, servers) {
                             // Stamp ONLY the fresh mint. The deferred path below must
                             // keep the OLD level so the re-mint retries next tick.
                             best.level = level;
+                            // MINT-TIME chance: minted at ~min security (gate above), so
+                            // this is the stable prepped-chance. It rides the `...best`
+                            // spread into the eligible entry, overriding the live read —
+                            // ns.hackAnalyzeChance swings with the grid's security phase,
+                            // and ranking by it flapped the admission order tick-to-tick
+                            // (the waterfall whipsaw behind the alpha-ent/zb-def f-flip).
+                            best.chance = chance;
                             batchPlan.set(s.hostname, best);
                         }
                     } else {
@@ -937,6 +975,7 @@ function classify(ns, servers) {
         const best = bestHackPct(ns, s, chance);
         if (best) {
             best.level = level;
+            best.chance = chance; // mint-time (prepped) chance — see the re-mint site above
             activeBatching.add(s.hostname);
             batchPlan.set(s.hostname, best); // lock the base plan (+ level) for this run
             rampPlan.delete(s.hostname); // fresh admission → waterfall re-ramps fresh
@@ -1090,12 +1129,37 @@ function selectBatchers(ns, eligible, poolTotal) {
                 // locked ramp unchanged (or run at base if none exists yet) and
                 // re-ramp on the next cold tick.
                 if (t.sec <= t.minSecurity * (1 + SEC_MARGIN)) {
-                    ramped = maximizeHackPct(ns, t, t.chance, capacity / conc, t.f);
-                    if (ramped) rampPlan.set(t.hostname, ramped);
+                    // RAMP-DOWN DAMPING: a re-mint here with capacity BELOW the locked
+                    // band shrinks f — and when the capacity itself whipsaws (upstream
+                    // locked plans kept on hot ticks, re-minted on cold ones), that
+                    // instant down-mint fed the every-other-tick f-flip that REANCHOR
+                    // then turned into pipeline massacres. A genuine capacity loss
+                    // persists; the flap reverses in a tick or two. So the deficit must
+                    // hold RAMP_DOWN_STABLE_TICKS consecutive ticks before the down-mint
+                    // fires; until then keep the locked plan at its real (counted) cost.
+                    // Up-mints (capacity above band) stay immediate — they kill nothing.
+                    const deficit = ramped && wasBatching.has(t.hostname) &&
+                        lockedCost > capacity * (1 + RAMP_HYSTERESIS_FRAC);
+                    const held = (rampDownSince.get(t.hostname) ?? 0) + 1;
+                    if (deficit && held < RAMP_DOWN_STABLE_TICKS) {
+                        rampDownSince.set(t.hostname, held);
+                        if (CONTROLLER_DEBUG) {
+                            dbg(
+                                `  ramp-hold ${t.hostname} locked=${ns.format.ram(lockedCost)} ` +
+                                `cap=${ns.format.ram(capacity)} n=${held}`
+                            );
+                        }
+                    } else {
+                        rampDownSince.delete(t.hostname);
+                        ramped = maximizeHackPct(ns, t, t.chance, capacity / conc, t.f);
+                        if (ramped) rampPlan.set(t.hostname, ramped);
+                    }
                 } else if (!ramped) {
                     allAtMax = false;
                     continue; // hot phase, no locked ramp yet → base plan this tick
                 }
+            } else {
+                rampDownSince.delete(t.hostname); // capacity back within band → deficit over
             }
             if (!ramped) { allAtMax = false; break; }
             a.plan = { ...t, ...ramped, score: t.score }; // keep base score for rank
@@ -1114,6 +1178,12 @@ function selectBatchers(ns, eligible, poolTotal) {
         saturated = allAtMax && excess > 0 && allPlaced && admitted.length > 0;
     }
 
+    // Transient overshoot is allowed (a held locked plan is counted at its real
+    // cost), but it must be brief — chronic OVERBUDGET means the ramp-down damping
+    // is not converging and the capacity feed is still unstable.
+    if (CONTROLLER_DEBUG && used > budget) {
+        dbg(`  OVERBUDGET reserved=${ns.format.ram(used)} budget=${ns.format.ram(budget)}`);
+    }
     const batchers = admitted.map((a) => a.plan);
     batchers.sort((a, b) => rankKey(b) - rankKey(a)); // restore global rank order (same metric)
     return { batchers, reserved: used, rampSaturated: saturated };
@@ -1185,15 +1255,31 @@ function batchPhase(ns, eligible, pool, rootedHosts) {
         // rebuild from empty at the new f — actual RAM snaps down to match `reserved`
         // this tick. f-UP needs no kill. Rare, because RAMP_HYSTERESIS_FRAC keeps f
         // from wobbling.
+        //
+        // PERSISTENCE GATE: the drop must hold for REANCHOR_STABLE_TICKS consecutive
+        // ticks before the kill fires. When the waterfall's leftover budget whipsaws
+        // (upstream locked plans kept on hot ticks, re-minted on cold ones), f can
+        // flip between two values every other tick — the instant kill then massacred
+        // the pipeline every ~20 ticks forever. While the drop is pending, pipe.f is
+        // deliberately NOT updated: it stays anchored at the in-flight generation's f
+        // so a genuine sustained drop keeps counting up, while a flap back to the old
+        // f resets the count (and the massacre never happens).
         if (pipe.committed.length > 0 && t.f < pipe.f * (1 - REANCHOR_DROP_FRAC)) {
-            const killed = killWorkersFor(ns, rootedHosts, target);
-            if (CONTROLLER_DEBUG) {
-                dbg(`  batch ${target} REANCHOR f ${Math.round(pipe.f * 100)}%->${Math.round(t.f * 100)}% killed=${killed}`);
+            pipe.reanchorTicks = (pipe.reanchorTicks ?? 0) + 1;
+            if (pipe.reanchorTicks >= REANCHOR_STABLE_TICKS) {
+                const killed = killWorkersFor(ns, rootedHosts, target);
+                if (CONTROLLER_DEBUG) {
+                    dbg(`  batch ${target} REANCHOR f ${Math.round(pipe.f * 100)}%->${Math.round(t.f * 100)}% killed=${killed}`);
+                }
+                pipe.committed = [];
+                pipe.lastLand = 0;
+                pipe.reanchorTicks = 0;
+                pipe.f = t.f;
             }
-            pipe.committed = [];
-            pipe.lastLand = 0;
+        } else {
+            pipe.reanchorTicks = 0;
+            pipe.f = t.f;
         }
-        pipe.f = t.f;
 
         // Drop landings that have already passed; what remains is the live depth.
         pipe.committed = pipe.committed.filter((land) => land > now);

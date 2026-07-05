@@ -325,6 +325,39 @@ and fixed:
   ramp/marginal plan is now **hysteretic** (`RAMP_HYSTERESIS_FRAC`): an incumbent keeps
   its locked plan while its cost stays within a band of its allocated capacity, making f
   piecewise-constant so re-anchors are rare and deliberate.
+- **Empty-pipeline deadlock (stage 10).** The `BATCH_DROP_MIN_FILL` ramping guard
+  protected any pipeline under 90% fill from the keep-test drop — *including a
+  completely empty one*. A crash/reload leaves targets drained and hot (the startup
+  purge kills workers mid-cycle); the security-phase deferral then never fires
+  (security only falls when a weaken *lands*, and an empty pipeline has none coming),
+  classify never dropped it to re-prep (protected as "ramping"), and prep never
+  touched it (still classified eligible). Three-way deadlock: targets frozen at
+  `fill=0/N`, money ~4%, chronic `FIRE-HOT`, one after another as each drained. Fix:
+  an **empty** pipeline is *not* protected — the guard exists to avoid orphaning
+  in-flight workers, and an empty pipeline has none. Empty + unhealthy now falls
+  through to the normal keep-test/grace and re-preps.
+- **REANCHOR persistence gate (stage 10).** The instant re-anchor turned planner
+  noise into massacres: when f flipped between two values every other tick (see next
+  bullet), each downward flip killed the target's entire in-flight pipeline (13–23k
+  threads), which refilled for ~20 ticks and was killed again, forever. The f-drop
+  must now persist `REANCHOR_STABLE_TICKS` consecutive ticks before the kill fires;
+  while pending, `pipe.f` stays anchored at the in-flight generation's f so a genuine
+  sustained drop keeps counting while a flap resets.
+- **Planner oscillation (stage 10).** Two sources, both in `selectBatchers`:
+  (1) *rank flap* — ranking used the live `ns.hackAnalyzeChance`, which swings with
+  the grid's security phase, so similar-potential targets swapped order tick-to-tick
+  and the Pass-B waterfall handed the leftover budget to different targets on
+  alternating ticks. Plans now carry their **mint-time chance** (minted at ~min
+  security per the mint gate, so effectively the stable prepped chance), and it rides
+  the `...best` spread into the eligible entry, overriding the live read everywhere.
+  (2) *capacity whipsaw* — an upstream incumbent's locked ramp is kept on its hot
+  ticks (mint gate) at full counted cost with no budget clamp (`reserved` observed
+  57% over budget), collapsing downstream capacity that tick and releasing it the
+  next. Downward re-mints are now **damped** (`RAMP_DOWN_STABLE_TICKS`): the capacity
+  deficit must hold that many consecutive ticks before a down-mint fires; until then
+  the locked plan is kept at its real cost (`ramp-hold` debug line, plus an
+  `OVERBUDGET` line whenever `reserved > budget` so chronic non-convergence is
+  visible). Up-mints stay immediate — they kill nothing.
 
 Together these keep `reserved ≡ actual`, so the pool can never silently oversubscribe.
 (A fourth source — a server *evicted* from the top-`MAX_BATCH_TARGETS` leaving its
@@ -522,9 +555,14 @@ under-restore fingerprint), near-totally clamped weakens (`wCl` — a weaken red
 < 25% of its capacity landed *before* the grow it counters; partial clamping is
 normal, the margin over-provisions weakens by design) — and the `DROP`/trace lines
 carry the summary. Debug-gated: with `CONTROLLER_DEBUG` off no batch is ever tagged.
-Since the stage-9 diagnosis closed, `CONTROLLER_DEBUG` defaults to **false** — the
-telemetry and debug logging stay in the code, dormant at zero cost; flip the flag in
-`constants.js` to re-arm the whole toolkit if drift ever returns.
+`CONTROLLER_DEBUG` is currently **true** (re-armed for the stage-10 stalled-pipeline
+diagnosis); flip it in `constants.js` to disarm once stage 10 closes. The debug log
+now **rotates**: `flushDebug` truncates and restarts the file past
+`DEBUG_LOG_MAX_BYTES` (2 MB ≈ 25 min of history). An unbounded log is not just
+disk noise — the sync tool pulls it over the Remote API every few seconds, and each
+pull makes the *game* JSON-serialize the whole file on its main thread; a multi-hour
+run left a 45 MB file whose pulls froze the game UI (the prime suspect for the
+stage-10 recurring crashes — the game was stable with sync off).
 
 ## History
 
