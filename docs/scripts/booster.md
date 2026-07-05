@@ -356,7 +356,8 @@ and fixed:
   next. Downward re-mints are now **damped** (`RAMP_DOWN_STABLE_TICKS`): the capacity
   deficit must hold that many consecutive ticks before a down-mint fires; until then
   the locked plan is kept at its real cost (`ramp-hold` debug line, plus an
-  `OVERBUDGET` line whenever `reserved > budget` so chronic non-convergence is
+  `OVERBUDGET` line when `reserved` exceeds budget by >5% — sub-1% steady
+  overshoot is the normal hysteresis band — so chronic non-convergence is
   visible). Up-mints stay immediate — they kill nothing.
 
 Together these keep `reserved ≡ actual`, so the pool can never silently oversubscribe.

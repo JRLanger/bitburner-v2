@@ -104,10 +104,17 @@ def ws_read_message(sock):
         fin, op, payload = _ws_read_raw_frame(sock)
         if op == 0x8:                    # close — devolve já (aborta remontagem)
             return op, payload
-        if op == 0x9:                    # ping -> pong inline
-            ws_send(sock, payload, 0xA)
-            continue
-        if op == 0xA:                    # pong -> ignora
+        if op in (0x9, 0xA):             # ping -> pong inline; pong -> ignora
+            if op == 0x9:
+                ws_send(sock, payload, 0xA)
+            # SEM remontagem em andamento: devolve o controle ao loop principal.
+            # Continuar lendo aqui bloqueava em _recv_exact à espera de um frame
+            # de dados que podia nunca vir (um ping do jogo num momento ocioso
+            # congelava pulls/heartbeat até o timeout de 60 s derrubar a sessão —
+            # a "desconexão ~1 min após conectar"). No MEIO de uma mensagem
+            # fragmentada, continuar é correto: o resto dela está a caminho.
+            if opcode is None:
+                return op, payload
             continue
         if op != 0x0:                    # frame inicial (texto/binário)
             opcode = op
