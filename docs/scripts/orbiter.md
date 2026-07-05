@@ -54,9 +54,16 @@ The Formulas core is what differs:
   destructive re-prep.
 - **`classify`** keeps booster's strict-to-admit / loose-windowed-to-keep hysteresis,
   the `unhealthySince`/`DRIFT_GRACE_MS` drift grace (raised to **10 s**) and the
-  `BATCH_DROP_MIN_FILL` ramping guard, and — like booster — **kills a dropped target's
-  in-flight workers** (`killWorkersFor`) so re-prep starts clean instead of stacking
-  stale workers onto the re-admitted pipeline. A target drifts out only if its windowed
+  `BATCH_DROP_MIN_FILL` ramping guard — with booster's stage-10 exemption: an
+  **empty** pipeline is *not* protected (protecting it deadlocked hot+drained targets
+  at `fill=0/N` forever; see booster.md "Empty-pipeline deadlock"). The other
+  stage-10 stability gates are mirrored too: the REANCHOR persistence gate
+  (`REANCHOR_STABLE_TICKS`) and the Pass-B ramp-down damping
+  (`RAMP_DOWN_STABLE_TICKS` + `ramp-hold`/`OVERBUDGET` debug lines); orbiter never
+  had booster's live-chance rank flap, since its plans already carry the
+  prepped-snapshot `fm.hackChance`. And — like booster — it **kills a dropped
+  target's in-flight workers** (`killWorkersFor`) so re-prep starts clean instead of
+  stacking stale workers onto the re-admitted pipeline. A target drifts out only if its windowed
   baseline stays outside the keep-bounds past the grace. A **null plan** from
   `lockedPlan` (hackPercent 0 — rare) is treated exactly like a drift-out and runs the
   same drop cleanup; before this it fell through to the not-batching path with the

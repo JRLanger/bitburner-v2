@@ -34,7 +34,7 @@ WS_GUID       = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"  # RFC 6455
 # Mão contrária do push e fora de src/, então nunca colide com a sincronização.
 PULL_FILES    = ("data/booster-debug.txt", "data/orbiter-debug.txt", "data/servers.json")
 PULL_DIR      = Path(__file__).resolve().parents[2] / "game-logs"
-PULL_INTERVAL = 2.0                         # s entre leituras do jogo
+PULL_INTERVAL = 15.0                        # s entre leituras do jogo
 
 def log(msg):
     print(f"{time.strftime('%H:%M:%S')}  {msg}", flush=True)
@@ -70,9 +70,10 @@ def ws_handshake(sock):
          f"Sec-WebSocket-Accept: {accept}\r\n\r\n").encode()
     )
 
-def ws_read_frame(sock):
-    """Lê 1 frame. Retorna (opcode, payload_bytes). Desmascara frames do cliente."""
+def _ws_read_raw_frame(sock):
+    """Lê 1 frame bruto. Retorna (fin, opcode, payload_bytes). Desmascara."""
     b0, b1 = _recv_exact(sock, 2)
+    fin = bool(b0 & 0x80)
     opcode = b0 & 0x0F
     masked = b1 & 0x80
     length = b1 & 0x7F
@@ -84,7 +85,42 @@ def ws_read_frame(sock):
     payload = _recv_exact(sock, length) if length else b""
     if masked:
         payload = bytes(payload[i] ^ mask[i % 4] for i in range(length))
-    return opcode, payload
+    return fin, opcode, payload
+
+def ws_read_message(sock):
+    """Lê 1 MENSAGEM completa, remontando fragmentos (RFC 6455 §5.4).
+
+    O navegador fragmenta mensagens grandes: o 1º frame vem com FIN=0 e o
+    conteúdo continua em frames de opcode 0x0 (continuation) até um com FIN=1.
+    A versão antiga lia 1 frame por vez e descartava as continuações — respostas
+    grandes de getFile (logs de debug > dezenas de KB) viravam JSON truncado e
+    eram perdidas em silêncio. Frames de CONTROLE (ping/pong/close) podem chegar
+    intercalados no meio de uma mensagem fragmentada; ping é respondido inline,
+    pong é ignorado, close é devolvido ao chamador.
+    """
+    opcode = None
+    buf = b""
+    while True:
+        fin, op, payload = _ws_read_raw_frame(sock)
+        if op == 0x8:                    # close — devolve já (aborta remontagem)
+            return op, payload
+        if op in (0x9, 0xA):             # ping -> pong inline; pong -> ignora
+            if op == 0x9:
+                ws_send(sock, payload, 0xA)
+            # SEM remontagem em andamento: devolve o controle ao loop principal.
+            # Continuar lendo aqui bloqueava em _recv_exact à espera de um frame
+            # de dados que podia nunca vir (um ping do jogo num momento ocioso
+            # congelava pulls/heartbeat até o timeout de 60 s derrubar a sessão —
+            # a "desconexão ~1 min após conectar"). No MEIO de uma mensagem
+            # fragmentada, continuar é correto: o resto dela está a caminho.
+            if opcode is None:
+                return op, payload
+            continue
+        if op != 0x0:                    # frame inicial (texto/binário)
+            opcode = op
+        buf += payload
+        if fin:
+            return opcode, buf
 
 def ws_send(sock, payload_bytes, opcode=0x1):
     """Envia 1 frame (servidor -> cliente, sem máscara)."""
@@ -120,6 +156,13 @@ def scan():
 
 # ─── Sessão de conexão (um jogo por vez) ─────────────────────────────────────
 def handle(conn):
+    # Timeout em TODO recv/send: sem isso, um jogo que trava NO MEIO do envio de
+    # uma resposta grande (fragmentada) deixa _recv_exact bloqueado para sempre —
+    # o loop inteiro (pulls, heartbeat) congela com a conexão ainda ESTABLISHED
+    # (observado: pulls parados por 20 min com o jogo lagado). Com timeout, o
+    # recv estoura socket.timeout (OSError) -> a sessão encerra e o servidor
+    # volta a aceitar a próxima conexão.
+    conn.settimeout(60.0)
     ws_handshake(conn)
     log("✅ jogo conectado — enviando todos os arquivos…")
     sel = selectors.DefaultSelector()
@@ -169,12 +212,11 @@ def handle(conn):
         while True:
             events = sel.select(timeout=SCAN_INTERVAL)
             if events:
-                # há dados do jogo: resposta JSON-RPC, ping/pong ou close.
-                opcode, payload = ws_read_frame(conn)
+                # há dados do jogo: mensagem JSON-RPC completa (remontada) ou close.
+                # ping/pong são tratados dentro de ws_read_message.
+                opcode, payload = ws_read_message(conn)
                 if opcode == 0x8:            # close
                     break
-                elif opcode == 0x9:          # ping -> pong
-                    ws_send(conn, payload, 0xA)
                 elif opcode == 0x1:          # resposta
                     try:
                         r = json.loads(payload.decode("utf-8"))
@@ -186,9 +228,10 @@ def handle(conn):
                                 log(f"⚠️  erro do jogo: {r['error']}")
                         elif name is not None:
                             pull_store(name, r.get("result"))
-                    except Exception:
-                        pass
-                # opcode 0xA (pong) -> ignora
+                    except Exception as e:
+                        # Antes: `pass` silencioso — respostas grandes fragmentadas
+                        # falhavam o parse e sumiam sem rastro. Agora loga sempre.
+                        log(f"⚠️  resposta ilegível ({len(payload)} bytes): {e}")
             else:
                 sync_once()                  # timeout -> varre e sincroniza mudanças
             # Heartbeat: ping periódico. Se a conexão morreu (ex.: Mac dormiu), o
@@ -199,8 +242,20 @@ def handle(conn):
                 ws_send(conn, b"", 0x9)      # ping
                 last_ping = now
             if now - last_pull >= PULL_INTERVAL:
-                pull_once()                  # espelha logs do jogo em game-logs/
-                last_pull = now
+                # BACKPRESSURE: só pede a próxima leva quando a anterior já foi
+                # toda respondida. Antes, um novo trio de getFile era enviado a
+                # cada 2 s INDEPENDENTE de o jogo ter respondido — num jogo já
+                # lagado os pedidos se empilhavam e cada um exige serializar o
+                # log de debug inteiro (que só cresce), realimentando o lag
+                # (suspeito de derrubar o jogo com o sync ligado).
+                if pending and now - last_pull >= 4 * PULL_INTERVAL:
+                    # Respostas perdidas (ex.: reconexão no meio) travariam o pull
+                    # para sempre; após ~60 s sem resposta, descarta e recomeça.
+                    log(f"⚠️  {len(pending)} getFile sem resposta — descartando e repedindo")
+                    pending.clear()
+                if not pending:
+                    pull_once()              # espelha logs do jogo em game-logs/
+                    last_pull = now
     except (ConnectionError, OSError, BrokenPipeError):
         pass
     finally:

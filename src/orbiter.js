@@ -54,7 +54,9 @@ import {
     BATCH_BUDGET_FRAC,
     REFILL_HEADROOM_FRAC,
     RAMP_HYSTERESIS_FRAC,
+    RAMP_DOWN_STABLE_TICKS,
     REANCHOR_DROP_FRAC,
+    REANCHOR_STABLE_TICKS,
     MAX_FIRES_PER_TICK,
     MAX_BATCH_TARGETS,
     SELECT_KEEP_BIAS,
@@ -64,6 +66,7 @@ import {
     BATCH_SAFETY_MS,
     CONTROLLER_DEBUG,
     ORBITER_DEBUG_LOG,
+    DEBUG_LOG_MAX_BYTES,
     CONTRACTS_MANAGER,
     PSERVER_MANAGER,
     HACKNET_MANAGER,
@@ -191,6 +194,10 @@ const rampPlan = new Map();
 
 /** Hostnames admitted to batching last tick — drives selectBatchers hysteresis. */
 const wasBatching = new Set();
+/** host -> consecutive ticks its waterfall capacity has sat below the locked
+ *  ramp's band; a ramp-DOWN re-mint only fires past RAMP_DOWN_STABLE_TICKS
+ *  (damps the capacity whipsaw — see selectBatchers Pass B). */
+const rampDownSince = new Map();
 
 /**
  * Per-target timestamp (ms) when a batching target first went unhealthy (outside the
@@ -232,6 +239,8 @@ let ramAbundantMode = false;
  *  log lines from the same tick can be grouped. See CONTROLLER_DEBUG in constants. */
 let debugBuf = [];
 let tickNo = 0;
+/** One-shot startup purge guard — see the STARTUP PURGE block in the main loop. */
+let startupPurged = false;
 /** Last hacking level seen, to log level-ups (a prime drift suspect: the locked
  *  plan's hack-thread count goes stale as per-thread hack fraction rises). */
 let lastHackLevel = 0;
@@ -247,10 +256,23 @@ let lastWorkMs = 0;
 function dbg(line) {
     if (CONTROLLER_DEBUG) debugBuf.push(line);
 }
-/** Append this tick's buffered diagnostic lines to the log file and clear. */
+/** Bytes written to the debug log this run, for rotation (see DEBUG_LOG_MAX_BYTES). */
+let debugBytes = 0;
+/** Append this tick's buffered diagnostic lines to the log file and clear.
+ *  Rotates (truncates and restarts) past DEBUG_LOG_MAX_BYTES — an unbounded log
+ *  makes every Remote API pull serialize the whole file in the game's main
+ *  thread, which at tens of MB freezes the UI (the observed 45MB log). */
 function flushDebug(ns) {
     if (CONTROLLER_DEBUG && debugBuf.length > 0) {
-        ns.write(ORBITER_DEBUG_LOG, debugBuf.join("\n") + "\n", "a");
+        const chunk = debugBuf.join("\n") + "\n";
+        if (debugBytes + chunk.length > DEBUG_LOG_MAX_BYTES) {
+            const header = `# orbiter debug log — rotated ${new Date().toISOString()} (cap ${DEBUG_LOG_MAX_BYTES}B)\n`;
+            ns.write(ORBITER_DEBUG_LOG, header + chunk, "w");
+            debugBytes = header.length + chunk.length;
+        } else {
+            ns.write(ORBITER_DEBUG_LOG, chunk, "a");
+            debugBytes += chunk.length;
+        }
     }
     debugBuf = [];
 }
@@ -325,6 +347,31 @@ export async function main(ns) {
         ns.write(SERVERS_JSON, JSON.stringify(servers, null, 2), "w");
 
         const rootedHosts = servers.filter((s) => s.hasRoot).map((s) => s.hostname);
+
+        // STARTUP PURGE (once per controller run): kill every HWGW/share worker on
+        // the cluster before the first pool build. A game reload restores in-flight
+        // workers but restarts them FROM SCRATCH, so their timing args are
+        // meaningless; a fresh controller (empty pipelines) then fires a full new
+        // grid on top of that zombie generation — RAM accounting (`reserved`) never
+        // sees the zombies and usage runs to 100%. One weakenTime of in-flight
+        // throughput is the price of a truthful, empty slate on every restart.
+        if (!startupPurged) {
+            startupPurged = true;
+            const shareFile = stripSlash(SHARE_WORKER);
+            let purged = 0;
+            for (const host of rootedHosts) {
+                for (const proc of ns.ps(host)) {
+                    const file = stripSlash(proc.filename);
+                    if (!WORKER_FILES.has(file) && file !== shareFile) continue;
+                    if (ns.kill(proc.pid)) purged += proc.threads;
+                }
+            }
+            if (purged > 0) {
+                ns.print(`startup purge: killed ${purged} stale worker threads`);
+                dbg(`T${tickNo} STARTUP-PURGE killed=${purged} stale worker threads`);
+            }
+        }
+
         // Reserve home headroom for the next pending manager, then launch it if its
         // gate trips. Done before buildPool so the pool already excludes that reserve.
         const homeReserveExtra = nextManagerReserve(ns);
@@ -874,8 +921,19 @@ function classify(ns, servers, player) {
             // only governs FULL pipelines (≥ BATCH_DROP_MIN_FILL × depth). Inert in steady
             // state (full pipelines sit at ~100% fill), so throughput is unchanged.
             const pipe = pipelines.get(s.hostname);
+            // EMPTY pipelines are NOT protected: the protection exists to avoid
+            // orphaning in-flight workers, and an empty pipeline has none — while
+            // protecting it can deadlock. A crash/reload leaves targets drained
+            // and hot (startup purge kills workers mid-cycle); batchPhase's
+            // security deferral then never fires (security only falls when a
+            // weaken LANDS — an empty pipeline has none coming), and the old
+            // blanket protection kept classify from ever dropping the target to
+            // re-prep. Three-way deadlock, observed as every batcher frozen at
+            // fill=0/N with money=4% and chronic FIRE-HOT. Empty+unhealthy now
+            // falls through to the normal keep-test/grace and re-preps.
             const ramping = pipe
-                ? pipe.committed.length < pipe.depth * BATCH_DROP_MIN_FILL
+                ? pipe.committed.length > 0 &&
+                  pipe.committed.length < pipe.depth * BATCH_DROP_MIN_FILL
                 : true;
             // Drift grace: keep batching through a brief unhealthy blip (a SLOW engine
             // tick or a level-up momentarily desyncs the windowed baseline); only drop
@@ -1076,8 +1134,32 @@ function selectBatchers(ns, eligible, poolTotal, player) {
                 lockedCost <= capacity * (1 + RAMP_HYSTERESIS_FRAC) &&
                 lockedCost >= capacity * (1 - RAMP_HYSTERESIS_FRAC);
             if (!(wasBatching.has(t.hostname) && withinBand)) {
-                ramped = maximizeHackPct(ns, t, player, capacity / conc, t.f);
-                if (ramped) rampPlan.set(t.hostname, ramped);
+                // RAMP-DOWN DAMPING (mirrors booster): a re-mint with capacity BELOW
+                // the locked band shrinks f — and when the capacity whipsaws
+                // tick-to-tick, that instant down-mint feeds the every-other-tick
+                // f-flip that REANCHOR then turns into pipeline massacres. A genuine
+                // capacity loss persists; a flap reverses in a tick or two. So the
+                // deficit must hold RAMP_DOWN_STABLE_TICKS consecutive ticks before
+                // the down-mint fires; until then keep the locked plan at its real
+                // (counted) cost. Up-mints stay immediate — they kill nothing.
+                const deficit = ramped && wasBatching.has(t.hostname) &&
+                    lockedCost > capacity * (1 + RAMP_HYSTERESIS_FRAC);
+                const held = (rampDownSince.get(t.hostname) ?? 0) + 1;
+                if (deficit && held < RAMP_DOWN_STABLE_TICKS) {
+                    rampDownSince.set(t.hostname, held);
+                    if (CONTROLLER_DEBUG) {
+                        dbg(
+                            `  ramp-hold ${t.hostname} locked=${ns.format.ram(lockedCost)} ` +
+                            `cap=${ns.format.ram(capacity)} n=${held}`
+                        );
+                    }
+                } else {
+                    rampDownSince.delete(t.hostname);
+                    ramped = maximizeHackPct(ns, t, player, capacity / conc, t.f);
+                    if (ramped) rampPlan.set(t.hostname, ramped);
+                }
+            } else {
+                rampDownSince.delete(t.hostname); // capacity back within band → deficit over
             }
             if (!ramped) { allAtMax = false; break; }
             a.plan = { ...t, ...ramped, score: t.score }; // keep base score for rank
@@ -1096,6 +1178,14 @@ function selectBatchers(ns, eligible, poolTotal, player) {
         saturated = allAtMax && excess > 0 && allPlaced && admitted.length > 0;
     }
 
+    // Transient overshoot is allowed (a held locked plan is counted at its real
+    // cost), but it must be brief — chronic OVERBUDGET means the ramp-down damping
+    // is not converging and the capacity feed is still unstable. Locked plans
+    // legitimately sit up to +RAMP_HYSTERESIS_FRAC over their capacity, so a
+    // sub-1% steady overshoot is normal — only log past 5%, where it's signal.
+    if (CONTROLLER_DEBUG && used > budget * 1.05) {
+        dbg(`  OVERBUDGET reserved=${ns.format.ram(used)} budget=${ns.format.ram(budget)}`);
+    }
     const batchers = admitted.map((a) => a.plan);
     batchers.sort((a, b) => rankKey(b) - rankKey(a)); // restore global rank order (same metric)
     return { batchers, reserved: used, rampSaturated: saturated };
@@ -1173,15 +1263,31 @@ function batchPhase(ns, eligible, pool, rootedHosts) {
         // rebuild from empty at the new f — actual RAM snaps down to match `reserved`
         // this tick. f-UP needs no kill (old small + new big drains safely). Rare,
         // because RAMP_HYSTERESIS_FRAC keeps f from wobbling.
+        //
+        // PERSISTENCE GATE: the drop must hold for REANCHOR_STABLE_TICKS consecutive
+        // ticks before the kill fires. When the waterfall's leftover budget whipsaws
+        // (upstream locked plans kept on hot ticks, re-minted on cold ones), f can
+        // flip between two values every other tick — the instant kill then massacred
+        // the pipeline every ~20 ticks forever. While the drop is pending, pipe.f is
+        // deliberately NOT updated: it stays anchored at the in-flight generation's f
+        // so a genuine sustained drop keeps counting up, while a flap back to the old
+        // f resets the count (and the massacre never happens).
         if (pipe.committed.length > 0 && t.f < pipe.f * (1 - REANCHOR_DROP_FRAC)) {
-            const killed = killWorkersFor(ns, rootedHosts, target);
-            if (CONTROLLER_DEBUG) {
-                dbg(`  batch ${target} REANCHOR f ${Math.round(pipe.f * 100)}%->${Math.round(t.f * 100)}% killed=${killed}`);
+            pipe.reanchorTicks = (pipe.reanchorTicks ?? 0) + 1;
+            if (pipe.reanchorTicks >= REANCHOR_STABLE_TICKS) {
+                const killed = killWorkersFor(ns, rootedHosts, target);
+                if (CONTROLLER_DEBUG) {
+                    dbg(`  batch ${target} REANCHOR f ${Math.round(pipe.f * 100)}%->${Math.round(t.f * 100)}% killed=${killed}`);
+                }
+                pipe.committed = [];
+                pipe.lastLand = 0;
+                pipe.reanchorTicks = 0;
+                pipe.f = t.f;
             }
-            pipe.committed = [];
-            pipe.lastLand = 0;
+        } else {
+            pipe.reanchorTicks = 0;
+            pipe.f = t.f;
         }
-        pipe.f = t.f;
 
         // Drop landings that have already passed; what remains is the live depth.
         pipe.committed = pipe.committed.filter((land) => land > now);
