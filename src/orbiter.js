@@ -1180,8 +1180,10 @@ function selectBatchers(ns, eligible, poolTotal, player) {
 
     // Transient overshoot is allowed (a held locked plan is counted at its real
     // cost), but it must be brief — chronic OVERBUDGET means the ramp-down damping
-    // is not converging and the capacity feed is still unstable.
-    if (CONTROLLER_DEBUG && used > budget) {
+    // is not converging and the capacity feed is still unstable. Locked plans
+    // legitimately sit up to +RAMP_HYSTERESIS_FRAC over their capacity, so a
+    // sub-1% steady overshoot is normal — only log past 5%, where it's signal.
+    if (CONTROLLER_DEBUG && used > budget * 1.05) {
         dbg(`  OVERBUDGET reserved=${ns.format.ram(used)} budget=${ns.format.ram(budget)}`);
     }
     const batchers = admitted.map((a) => a.plan);
