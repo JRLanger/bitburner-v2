@@ -19,6 +19,7 @@ import {
     STATUS_PORT_PSERVER,
     STATUS_PORT_HACKNET,
     STATUS_PORT_PILOT,
+    STATUS_PORT_LIFECYCLE,
 } from "/config/constants.js";
 import { readStatus } from "/lib/status.js";
 
@@ -90,6 +91,9 @@ export function renderTail(ns, snap) {
     const pilotSnap = readStatus(ns, STATUS_PORT_PILOT);
     ns.print(`║ ${mgrLine("pilot", pilotSnap, now, (s) =>
         `programs ${s.programs.owned}/${s.programs.total} · backdoors ${s.backdoors.done.length}/${s.backdoors.done.length + s.backdoors.pending.length} · ladder ${s.focusOwner ?? "—"}`)}`);
+    const lifecycleSnap = readStatus(ns, STATUS_PORT_LIFECYCLE);
+    ns.print(`║ ${mgrLine("lifecycle", lifecycleSnap, now, (s) =>
+        `pending ${s.pending} · run ${s.runHrs.toFixed(1)}h · stagnant ${s.stagnantMin.toFixed(0)}m · auto-install ${s.autoInstallArmed ? "ARMED" : "off"}`)}`);
 
     // ── Alerts (same rules as dashboard.js renderAlerts) ──
     const alerts = [];
@@ -97,6 +101,8 @@ export function renderTail(ns, snap) {
     if (snap.totalRam > 0 && snap.poolFree / snap.totalRam < 0.03) alerts.push("pool nearly full");
     if (snap.shareOff) alerts.push("share manually paused");
     if (pilotSnap?.pendingInvites?.length > 0) alerts.push(`faction invite needs decision: ${pilotSnap.pendingInvites.join(", ")}`);
+    if (lifecycleSnap?.recommendInstall) alerts.push(`recommend aug install: ${lifecycleSnap.reason}`);
+    if (lifecycleSnap?.bnCompletable) alerts.push("BitNode completable — run utils/finish-bn.js <nextBN>");
     ns.print(`╠${"═".repeat(W)}`);
     ns.print(alerts.length === 0 ? "║ ✓ all systems nominal" : `║ ⚠ ${alerts.join(" · ")}`);
     ns.print(`╚${"═".repeat(W)}`);

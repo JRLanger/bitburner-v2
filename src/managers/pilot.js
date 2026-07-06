@@ -34,7 +34,7 @@ import {
     STATUS_PORT_PSERVER,
 } from "/config/constants.js";
 import { publishStatus, readStatus } from "/lib/status.js";
-import { getFlag, setFlag } from "/lib/flags.js";
+import { getFlag, setFlag, moneyFloor } from "/lib/flags.js";
 import { findPath } from "/lib/netpath.js";
 
 /** Crime name used by ladder row 1 (bootstrap) and row 8 (money fallback). Kept as
@@ -56,6 +56,12 @@ export async function main(ns) {
     let currentRow = null;
     let challenger = null;
     let challengerStreak = 0;
+    // Timestamp of the last successful aug purchase (this process's lifetime only
+    // — a fresh pilot process post-reset starts null, which is fine: lifecycle's
+    // stagnantMs check reads "now - lastAugPurchaseTs" and null means "never
+    // purchased yet this run", the same as a very stale timestamp for that
+    // purpose). Read by lifecycle.js off pilot's status snapshot (arbitration.md).
+    let lastAugPurchaseTs = null;
 
     while (true) {
         if (!singularityAvailable(ns)) {
@@ -71,12 +77,13 @@ export async function main(ns) {
         await phaseBackdoors(ns, snapshot);
         phaseFactions(ns, snapshot);
         phaseAugs(ns, snapshot);
+        if (snapshot.augsPurchasedThisTick > 0) lastAugPurchaseTs = Date.now();
         const workState = phaseWork(ns, snapshot, {
             get: () => ({ currentRow, challenger, challengerStreak }),
             set: (next) => { currentRow = next.currentRow; challenger = next.challenger; challengerStreak = next.challengerStreak; },
         });
 
-        const status = buildStatus(ns, snapshot, workState);
+        const status = buildStatus(ns, snapshot, workState, lastAugPurchaseTs);
         renderStatus(ns, status);
         publishStatus(ns, STATUS_PORT_PILOT, status);
 
@@ -103,7 +110,10 @@ function singularityAvailable(ns) {
 function gatherState(ns) {
     const sing = ns.singularity;
     return {
-        money: ns.getServerMoneyAvailable("home"),
+        // moneyFloor (lib/flags.js): reserve lifecycle asks all managers to leave
+        // untouched — Infinity during the pre-reset checklist freezes spending
+        // entirely. Subtracted at the snapshot so every phase's spend cap sees it.
+        money: Math.max(0, ns.getServerMoneyAvailable("home") - moneyFloor(ns)),
         homeRam: ns.getServerMaxRam("home"),
         ownedPrograms: new Set(ns.ls("home", ".exe")),
         hasTor: ns.hasTorRouter(),
@@ -499,7 +509,7 @@ function describeWork(task) {
 
 // ── Status ───────────────────────────────────────────────────────────────────
 
-function buildStatus(ns, snap, workState) {
+function buildStatus(ns, snap, workState, lastAugPurchaseTs) {
     const sing = ns.singularity;
     const programs = sing.getDarkwebPrograms();
     const ownedCount = programs.filter((p) => snap.ownedPrograms.has(p)).length;
@@ -525,6 +535,9 @@ function buildStatus(ns, snap, workState) {
             nextUnlock: nextUnlock(snap),
         },
         nfAffordableLevels: snap.nfAffordableLevels ?? 0,
+        // Read by lifecycle.js (docs/plans/reset-lifecycle.md) as the "stagnantMs"
+        // signal — null until this process's first aug purchase this run.
+        lastAugPurchaseTs,
         action: workState.overridden ? "player-controlled — pilot standing by" : `ladder: ${workState.focusOwner}`,
     };
 }

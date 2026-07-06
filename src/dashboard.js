@@ -21,6 +21,7 @@ import {
     STATUS_PORT_PSERVER,
     STATUS_PORT_HACKNET,
     STATUS_PORT_PILOT,
+    STATUS_PORT_LIFECYCLE,
     LOOP_SLEEP,
     SHARE_RAM,
 } from "/config/constants.js";
@@ -53,6 +54,7 @@ export async function main(ns) {
             pserver: readStatus(ns, STATUS_PORT_PSERVER),
             hacknet: readStatus(ns, STATUS_PORT_HACKNET),
             pilot: readStatus(ns, STATUS_PORT_PILOT),
+            lifecycle: readStatus(ns, STATUS_PORT_LIFECYCLE),
         };
         // Live title: "Dashboard - <Controller> · <income>/s · <n> tgt".
         const c = snaps.ctrl;
@@ -255,6 +257,13 @@ function renderScripts(snaps, now) {
             ["factions", fmtCount(snaps.pilot.factions)],
             ["ladder", snaps.pilot.focusOwner ?? "—"],
         ] : []));
+    rows.push(managerRow("lifecycle", snaps.lifecycle, now,
+        snaps.lifecycle ? [
+            ["pending augs", fmtCount(snaps.lifecycle.pending)],
+            ["run age", `${snaps.lifecycle.runHrs.toFixed(1)}h`],
+            ["stagnant", `${snaps.lifecycle.stagnantMin.toFixed(0)}m`],
+            ["auto-install", snaps.lifecycle.autoInstallArmed ? "ARMED" : "off"],
+        ] : []));
 
     // Share row: state lives on the controller snapshot, not its own port.
     const shareState = !c ? "off" : c.shareOff ? "paused" : c.shareThreads > 0 ? "live" : "idle";
@@ -303,7 +312,7 @@ function renderAlerts(snaps, now) {
         if (c.totalRam > 0 && c.poolFree / c.totalRam < 0.03) alerts.push("Pool nearly full");
         if (c.shareOff) alerts.push("Share manually paused");
     }
-    for (const [name, staleMs] of [["contracts", MGR_STALE_MS], ["pserver", MGR_STALE_MS], ["hacknet", MGR_STALE_MS], ["pilot", MGR_STALE_MS]]) {
+    for (const [name, staleMs] of [["contracts", MGR_STALE_MS], ["pserver", MGR_STALE_MS], ["hacknet", MGR_STALE_MS], ["pilot", MGR_STALE_MS], ["lifecycle", MGR_STALE_MS]]) {
         const s = snaps[name];
         if (s && now - (s.ts || 0) > staleMs && !/done|maxed|exit|exhaust/i.test(s.action || "")) {
             alerts.push(`${name} not reporting`);
@@ -311,6 +320,12 @@ function renderAlerts(snaps, now) {
     }
     if (snaps.pilot?.pendingInvites?.length > 0) {
         alerts.push(`Faction invite needs decision: ${snaps.pilot.pendingInvites.join(", ")}`);
+    }
+    if (snaps.lifecycle?.recommendInstall) {
+        alerts.push(`Recommend aug install: ${snaps.lifecycle.reason}`);
+    }
+    if (snaps.lifecycle?.bnCompletable) {
+        alerts.push("BitNode completable — run utils/finish-bn.js <nextBN>");
     }
     if (alerts.length === 0) return `<div class="bb-section bb-alerts bb-alerts-ok"><span class="bb-dot bb-dot-ok"></span>ALL SYSTEMS NOMINAL</div>`;
     return `<div class="bb-section bb-alerts bb-alerts-warn">⚠ ${alerts.join(" · ")}</div>`;

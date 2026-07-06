@@ -32,6 +32,7 @@ import {
     STATUS_PORT_HACKNET,
 } from "/config/constants.js";
 import { publishStatus } from "/lib/status.js";
+import { moneyFloor } from "/lib/flags.js";
 
 export async function main(ns) {
     ns.disableLog("ALL");
@@ -76,7 +77,9 @@ export async function main(ns) {
  *   "waiting…"   — a worthwhile action exists but we can't afford it yet (keep looping).
  */
 function step(ns, horizon) {
-    let money = ns.getServerMoneyAvailable("home");
+    // moneyFloor (lib/flags.js): reserve lifecycle asks all managers to leave
+    // untouched — Infinity during the pre-reset checklist freezes spending entirely.
+    let money = Math.max(0, ns.getServerMoneyAvailable("home") - moneyFloor(ns));
 
     let bought = 0;
     let shown = null; // action reflected in the status box (last bought, or next pending)

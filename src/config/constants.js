@@ -353,6 +353,12 @@ export const HACKNET_MANAGER_RAM = 8.20; // measured in-game (mem managers/hackn
  *  split into per-phase one-shot scripts (the documented RAM fallback in
  *  docs/plans/pilot-singularity.md) and this constant re-measured. */
 export const PILOT_MANAGER_RAM = 65.65; // measured in-game at SF4.3
+/** Estimated (not yet measured in-game — re-measure with `mem managers/lifecycle.js`
+ *  once played) from the type defs' documented per-call RAM costs: ~27.75 GB at
+ *  SF4.3 (×1 multiplier). Like pilot, only viable as a single script at SF4.3 —
+ *  at SF4.2 this becomes ~95 GB, at SF4.1 ~365 GB, and would need the same
+ *  per-phase one-shot split pilot's plan documents as its RAM fallback. */
+export const LIFECYCLE_MANAGER_RAM = 27.75; // ESTIMATED — verify with `mem`
 
 /** Loop sleep for the (infrequent-purchase) managers, ms. */
 export const MANAGER_LOOP_SLEEP = 10000;
@@ -453,6 +459,12 @@ export const STATUS_PORT_PSERVER = 4;
 export const STATUS_PORT_HACKNET = 5;
 /** pilot (singularity progression) manager status snapshot. */
 export const STATUS_PORT_PILOT = 7;
+/** lifecycle (reset automation) manager status snapshot. */
+export const STATUS_PORT_LIFECYCLE = 8;
+/** stocks manager status snapshot (port reserved per arbitration.md's port map —
+ *  the stocks manager itself doesn't exist yet; lifecycle's liquidation-ack read
+ *  is a no-op until it does, per docs/plans/reset-lifecycle.md checklist step 0). */
+export const STATUS_PORT_STOCKS = 9;
 
 /** Recorded run (aug-reset) durations + last-seen aug-reset timestamp, for hacknet's
  *  ROI horizon. Survives aug installs (a soft reset keeps files); delete on a full
@@ -598,3 +610,51 @@ export const MECH_SPEND_FRAC = 0.25;
  *  and defers (log once) if a launch wouldn't fit — gates stay true, so it
  *  launches once home grows enough. */
 export const MANAGER_HOME_RAM_FRAC = 0.25;
+
+// ── lifecycle (reset automation) — docs/plans/reset-lifecycle.md ───────────
+//
+// Closes the outermost loop: decide when installing augmentations is worth it,
+// run the pre-reset checklist, reset, and bring the system back up (boot.js).
+
+/** lifecycle manager script path. */
+export const LIFECYCLE_MANAGER = "/managers/lifecycle.js";
+/** boot.js — post-reset bring-up callback, passed as cbScript to every reset call.
+ *  Bare filename (not a leading-slash path): installAugmentations/softReset/
+ *  destroyW0r1dD43m0n's cbScript parameter is documented as looked up on home
+ *  by bare filename. */
+export const BOOT_SCRIPT = "boot.js";
+/** One-shot grind helper boot.js execs to do the actual Mug/gym/upgradeHomeRam
+ *  loop — see docs/scripts/boot.md "Why a separate grind script" for why boot.js
+ *  itself never calls a singularity function directly. */
+export const BOOT_GRIND_SCRIPT = "/utils/boot-grind.js";
+/** booster.js's on-home path — boot.js execs this once bring-up is done. There
+ *  was no existing path constant for booster (only ORBITER); added here per the
+ *  plan's "exec booster.js" step. */
+export const BOOSTER_SCRIPT = "/booster.js";
+
+/** lifecycle's own loop sleep, ms — decision state changes slowly. */
+export const LIFECYCLE_LOOP_SLEEP = 60_000;
+/** Recommend-only by default: lifecycle publishes recommendInstall + reason but
+ *  never calls installAugmentations itself until the player arms this (or the
+ *  runtime `autoInstall` flag — see utils/auto-install-{on,off}.js). NEVER ship
+ *  with this true. */
+export const LIFECYCLE_AUTO_INSTALL = false;
+/** Minimum purchased-but-not-installed aug count before an install is considered
+ *  worthwhile (paired with LIFECYCLE_STAGNANT_MS). */
+export const LIFECYCLE_MIN_AUGS = 8;
+/** How long aug purchases must have stalled (no new purchase) before pending
+ *  augs alone justify an install, ms. */
+export const LIFECYCLE_STAGNANT_MS = 30 * 60_000;
+/** Max run length before at least 1 pending aug justifies an install regardless
+ *  of stagnation, ms — aligns with the hacknet horizon model. */
+export const LIFECYCLE_MAX_RUN_MS = 12 * 3600_000;
+/** Whether the pre-reset checklist donates leftover money to the highest-favor
+ *  faction (favor ≥ getFavorToDonate()) before installing. */
+export const LIFECYCLE_SPEND_DOWN = true;
+/** Home RAM target boot.js's grind loop upgrades toward (devlog 01). */
+export const BOOT_TARGET_HOME_GB = 32;
+/** Minimum Mug success chance boot.js requires before skipping the gym-training
+ *  pre-step (devlog 01: gym first only helps when Mug's chance is poor). */
+export const BOOT_MUG_MIN_CHANCE = 0.6;
+/** Persistent (survives resets) human-readable lifecycle log file. */
+export const LIFECYCLE_LOG_FILE = "/data/lifecycle-log.txt";
