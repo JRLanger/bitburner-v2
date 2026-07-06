@@ -20,6 +20,7 @@ import {
     STATUS_PORT_CONTRACTS,
     STATUS_PORT_PSERVER,
     STATUS_PORT_HACKNET,
+    STATUS_PORT_PILOT,
     LOOP_SLEEP,
     SHARE_RAM,
 } from "/config/constants.js";
@@ -51,6 +52,7 @@ export async function main(ns) {
             contracts: readStatus(ns, STATUS_PORT_CONTRACTS),
             pserver: readStatus(ns, STATUS_PORT_PSERVER),
             hacknet: readStatus(ns, STATUS_PORT_HACKNET),
+            pilot: readStatus(ns, STATUS_PORT_PILOT),
         };
         // Live title: "Dashboard - <Controller> · <income>/s · <n> tgt".
         const c = snaps.ctrl;
@@ -246,6 +248,13 @@ function renderScripts(snaps, now) {
             ["horizon", `${snaps.hacknet.horizonHrs.toFixed(1)}h`],
             ["next cost", fmtMoney(snaps.hacknet.nextCost)],
         ] : []));
+    rows.push(managerRow("pilot", snaps.pilot, now,
+        snaps.pilot ? [
+            ["programs", `${snaps.pilot.programs.owned}/${snaps.pilot.programs.total}`],
+            ["backdoors", `${snaps.pilot.backdoors.done.length}/${snaps.pilot.backdoors.done.length + snaps.pilot.backdoors.pending.length}`],
+            ["factions", fmtCount(snaps.pilot.factions)],
+            ["ladder", snaps.pilot.focusOwner ?? "—"],
+        ] : []));
 
     // Share row: state lives on the controller snapshot, not its own port.
     const shareState = !c ? "off" : c.shareOff ? "paused" : c.shareThreads > 0 ? "live" : "idle";
@@ -294,11 +303,14 @@ function renderAlerts(snaps, now) {
         if (c.totalRam > 0 && c.poolFree / c.totalRam < 0.03) alerts.push("Pool nearly full");
         if (c.shareOff) alerts.push("Share manually paused");
     }
-    for (const [name, staleMs] of [["contracts", MGR_STALE_MS], ["pserver", MGR_STALE_MS], ["hacknet", MGR_STALE_MS]]) {
+    for (const [name, staleMs] of [["contracts", MGR_STALE_MS], ["pserver", MGR_STALE_MS], ["hacknet", MGR_STALE_MS], ["pilot", MGR_STALE_MS]]) {
         const s = snaps[name];
         if (s && now - (s.ts || 0) > staleMs && !/done|maxed|exit|exhaust/i.test(s.action || "")) {
             alerts.push(`${name} not reporting`);
         }
+    }
+    if (snaps.pilot?.pendingInvites?.length > 0) {
+        alerts.push(`Faction invite needs decision: ${snaps.pilot.pendingInvites.join(", ")}`);
     }
     if (alerts.length === 0) return `<div class="bb-section bb-alerts bb-alerts-ok"><span class="bb-dot bb-dot-ok"></span>ALL SYSTEMS NOMINAL</div>`;
     return `<div class="bb-section bb-alerts bb-alerts-warn">⚠ ${alerts.join(" · ")}</div>`;

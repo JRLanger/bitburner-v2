@@ -337,6 +337,7 @@ export const HACKNET_GATE = {
 export const CONTRACTS_MANAGER = "/managers/contracts.js";
 export const PSERVER_MANAGER = "/managers/pserver.js";
 export const HACKNET_MANAGER = "/managers/hacknet.js";
+export const PILOT_MANAGER = "/managers/pilot.js";
 
 /**
  * Manager RAM footprints, GB. Hardcoded so booster can
@@ -346,6 +347,11 @@ export const HACKNET_MANAGER = "/managers/hacknet.js";
 export const CONTRACTS_MANAGER_RAM = 16.80; // measured in-game (mem managers/contracts.js): 1.6 base + 0.2 ls + 15 getContract
 export const PSERVER_MANAGER_RAM = 5.85; // measured in-game (mem managers/pserver.js)
 export const HACKNET_MANAGER_RAM = 8.20; // measured in-game (mem managers/hacknet.js)
+/** Placeholder until measured with `mem managers/pilot.js` in-game (see testing
+ *  checklist in docs/plans/pilot-singularity.md) — singularity RAM costs are
+ *  multiplied ×16/×4/×1 by SF4 level, so this MUST be re-measured under the
+ *  player's actual SF4 level before trusting launchManagers' reserve math. */
+export const PILOT_MANAGER_RAM = 40.0; // UNVERIFIED — measure in-game, see docs/scripts/pilot.md
 
 /** Loop sleep for the (infrequent-purchase) managers, ms. */
 export const MANAGER_LOOP_SLEEP = 10000;
@@ -444,6 +450,8 @@ export const STATUS_PORT_CONTRACTS = 3;
 export const STATUS_PORT_PSERVER = 4;
 /** hacknet manager status snapshot. */
 export const STATUS_PORT_HACKNET = 5;
+/** pilot (singularity progression) manager status snapshot. */
+export const STATUS_PORT_PILOT = 7;
 
 /** Recorded run (aug-reset) durations + last-seen aug-reset timestamp, for hacknet's
  *  ROI horizon. Survives aug installs (a soft reset keeps files); delete on a full
@@ -525,3 +533,67 @@ export const DASHBOARD = "/dashboard.js";
  *  the controller opens its own tail window instead (ns.ui.openTail, 0 GB) — early
  *  home RAM is too scarce to spend on an overlay. */
 export const DASHBOARD_MIN_HOME_RAM_GB = 256;
+
+// ── pilot (singularity progression manager) ────────────────────────────────
+//
+// See docs/plans/pilot-singularity.md. All ns.singularity.* calls require SF4
+// (or BitNode 4) and are RAM-multiplied ×16/×4/×1 by SF4 level, so pilot is a
+// separate slow-tick manager — never imported into booster/orbiter.
+
+/** pilot's own loop sleep, ms. Progression state changes slowly; a slow tick also
+ *  amortizes pilot's high per-call singularity RAM cost. */
+export const PILOT_LOOP_SLEEP = 30_000;
+
+/** Fraction of current money pilot may spend per tick on programs/augs. pserver's
+ *  spending is ROI-driven; pilot's is progression-driven, so it gets its own
+ *  (smaller, flatter) cap — see arbitration.md's money-class table. */
+export const PILOT_SPEND_FRAC = 0.5;
+
+/** Never auto-join these factions (city factions etc. conflict with each other).
+ *  Auto-join is only otherwise safe when getFactionEnemies(f) is empty. Player can
+ *  add names as they learn which factions matter for their build. */
+export const PILOT_JOIN_BLOCKLIST = [];
+
+/** Priority list of "story" servers pilot backdoors, in order. w0r1d_d43m0n is
+ *  deliberately excluded — installing its backdoor is a win-condition action owned
+ *  by the (not-yet-built) lifecycle script, not pilot. */
+export const BACKDOOR_TARGETS = [
+    "CSEC", "avmnite-02h", "I.I.I.I", "run4theh111z", "fulcrumassets",
+];
+
+/** Skip augs whose price exceeds this multiple of current money (i.e. only buy
+ *  what's affordable right now — no saving up mid-tick). */
+export const PILOT_AUG_PRICE_HORIZON = 1.0;
+
+/** Aug name for the repeatable NeuroFlux Governor (dumped by lifecycle pre-reset,
+ *  not purchased here — pilot only reports affordable-level count). */
+export const PILOT_NEUROFLUX = "NeuroFlux Governor";
+
+// ── arbitration (docs/plans/arbitration.md) ────────────────────────────────
+//
+// Cross-manager conventions recorded once here so every mechanic manager (gang,
+// sleeves, bladeburner, stocks, corp, stanek, ...) agrees on the same constants.
+
+/** Consecutive pilot ticks a new ladder assignment must beat the current one
+ *  before choosePlayerActivity() actually switches — anti-thrash hysteresis,
+ *  same philosophy as the controllers' REANCHOR/ramp-down stable-tick guards. */
+export const FOCUS_STABLE_TICKS = 4;
+
+/** How long sleeves get to cover the remaining karma grind before pilot itself
+ *  steps in with player-driven Homicide (ladder row 2), ms. */
+export const KARMA_PLAYER_ASSIST_HORIZON_MS = 2 * 3600_000;
+
+/** How long faction-rep progress must stall before grafting (ladder row 5) is
+ *  allowed to take over player focus, ms. */
+export const GRAFT_PATIENCE_MS = 30 * 60_000;
+
+/** Per-tick spend cap (fraction of current money) for "mechanic capex" managers
+ *  (gang equipment, sleeve augs/memory, hacknet) — see arbitration.md's money
+ *  class table. */
+export const MECH_SPEND_FRAC = 0.25;
+
+/** Combined RAM budget for ALL mechanic managers running on home, as a fraction
+ *  of home's total RAM. launchManagers checks candidates against remaining budget
+ *  and defers (log once) if a launch wouldn't fit — gates stay true, so it
+ *  launches once home grows enough. */
+export const MANAGER_HOME_RAM_FRAC = 0.25;

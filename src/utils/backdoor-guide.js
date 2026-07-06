@@ -5,7 +5,37 @@
  * prints a ready-to-paste terminal command, e.g.:
  *   connect n00dles; connect CSEC; backdoor
  * One-shot terminal utility, run manually: `run /utils/backdoor-guide.js`.
+ *
+ * Path-finding (BFS + command building) now lives in lib/netpath.js, a pure 0-GB
+ * module shared with managers/pilot.js (which needs the same hop sequence to
+ * automate backdoor installs — see docs/plans/pilot-singularity.md phase 2). This
+ * script builds its own live `{hostname, parent}` list via a fresh ns.scan() BFS
+ * (it's a one-shot manual tool, so the extra scan cost doesn't matter); pilot
+ * instead reads the `parent` field the controllers stamp into servers.json each
+ * tick, avoiding a duplicate scan in a persistent script.
  */
+
+import { findPath, buildConnectCommand } from "/lib/netpath.js";
+
+/** BFS the live network from home, recording each host's parent — the same shape
+ *  (`{hostname, parent}`) servers.json now carries, so findPath works unmodified
+ *  on either source. */
+function scanTopology(ns) {
+    const parentOf = new Map([["home", null]]);
+    const queue = ["home"];
+    const result = [];
+    while (queue.length) {
+        const host = queue.shift();
+        result.push({ hostname: host, parent: parentOf.get(host) });
+        for (const nb of ns.scan(host)) {
+            if (!parentOf.has(nb)) {
+                parentOf.set(nb, host);
+                queue.push(nb);
+            }
+        }
+    }
+    return result;
+}
 
 export async function main(ns) {
     const TARGETS = [
@@ -17,27 +47,7 @@ export async function main(ns) {
         { host: "w0r1d_d43m0n",  note: "World Daemon -- WIN CONDITION" },
     ];
 
-    function findPath(target) {
-        const visited = new Set(["home"]);
-        const queue = [["home"]];
-        while (queue.length) {
-            const path = queue.shift();
-            const node = path[path.length - 1];
-            if (node === target) return path;
-            for (const nb of ns.scan(node)) {
-                if (!visited.has(nb)) {
-                    visited.add(nb);
-                    queue.push([...path, nb]);
-                }
-            }
-        }
-        return null;
-    }
-
-    function buildCommand(path) {
-        return "home; " + path.slice(1).map((s) => `connect ${s}`).join("; ") + "; backdoor";
-    }
-
+    const topology = scanTopology(ns);
     const hackLvl = ns.getHackingLevel();
     ns.tprint(`Backdoor guide -- hacking level: ${hackLvl}`);
 
@@ -63,13 +73,13 @@ export async function main(ns) {
             continue;
         }
 
-        const path = findPath(t.host);
+        const path = findPath(topology, t.host);
         if (!path) {
             ns.tprint(`  ${t.host} (${t.note}) -- not reachable from home yet`);
             continue;
         }
 
         ns.tprint(`  ${t.note}:`);
-        ns.tprint(`  ${buildCommand(path)}`);
+        ns.tprint(`  ${buildConnectCommand(path)}`);
     }
 }

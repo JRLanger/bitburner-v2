@@ -18,6 +18,7 @@ import {
     STATUS_PORT_CONTRACTS,
     STATUS_PORT_PSERVER,
     STATUS_PORT_HACKNET,
+    STATUS_PORT_PILOT,
 } from "/config/constants.js";
 import { readStatus } from "/lib/status.js";
 
@@ -86,12 +87,16 @@ export function renderTail(ns, snap) {
         `fleet ${s.count}/${s.limit} · ${fmt.ram(s.fleetRam ?? 0)} · next $${fmt.number(s.nextCost ?? 0)}`)}`);
     ns.print(`║ ${mgrLine("hacknet", readStatus(ns, STATUS_PORT_HACKNET), now, (s) =>
         `nodes ${s.nodes}/${s.maxNodes ?? "∞"} · $${fmt.number(s.production ?? 0)}/s · next $${fmt.number(s.nextCost ?? 0)}`)}`);
+    const pilotSnap = readStatus(ns, STATUS_PORT_PILOT);
+    ns.print(`║ ${mgrLine("pilot", pilotSnap, now, (s) =>
+        `programs ${s.programs.owned}/${s.programs.total} · backdoors ${s.backdoors.done.length}/${s.backdoors.done.length + s.backdoors.pending.length} · ladder ${s.focusOwner ?? "—"}`)}`);
 
     // ── Alerts (same rules as dashboard.js renderAlerts) ──
     const alerts = [];
     if (snap.tickGap > 2 * LOOP_SLEEP) alerts.push(`engine lag ${Math.round(snap.tickGap)}ms`);
     if (snap.totalRam > 0 && snap.poolFree / snap.totalRam < 0.03) alerts.push("pool nearly full");
     if (snap.shareOff) alerts.push("share manually paused");
+    if (pilotSnap?.pendingInvites?.length > 0) alerts.push(`faction invite needs decision: ${pilotSnap.pendingInvites.join(", ")}`);
     ns.print(`╠${"═".repeat(W)}`);
     ns.print(alerts.length === 0 ? "║ ✓ all systems nominal" : `║ ⚠ ${alerts.join(" · ")}`);
     ns.print(`╚${"═".repeat(W)}`);
