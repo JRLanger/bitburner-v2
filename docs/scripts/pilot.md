@@ -109,7 +109,7 @@ plans only need to fill in a row's three functions, never restructure the ladder
 
 | # | Row | Applicable when (this build) |
 |---|---|---|
-| 1 | `bootstrap-crime` | `home` RAM < 32 GB (nothing else works without base RAM) |
+| 1 | `bootstrap-crime` | `home` RAM < 32 GB (nothing else works without base RAM) — chance-aware crime (see row 8) |
 | 2 | `karma-grind` | placeholder — always false (needs gang manager) |
 | 3 | `bladeburner-bn67` | placeholder — always false |
 | 4 | `company-work` | placeholder — always false |
@@ -118,6 +118,16 @@ plans only need to fill in a row's three functions, never restructure the ladder
 | 7 | `bladeburner-passive` | placeholder — always false |
 | 8 | `crime-fallback` | money still wanted — port-4 snapshot fresh, i.e. pserver manager alive and still buying (once the fleet is maxed, idle beats heisting) |
 | 9 | `idle` | always true (terminal fallback) |
+
+Rows 1 and 8 are **chance-aware** (`bestCrime`/`startCrimeOrTrain`/`maintainCrime`):
+each (re)start picks the best expected-$/sec crime — `money × successChance ÷ time`
+over the full CrimeType catalog, all live reads, so a level-1 character starts at
+Shoplift/Mug and graduates to Heist as stats grow. When even the best option's
+chance is below `PILOT_CRIME_MIN_CHANCE` (0.4), pilot instead trains the lowest
+combat stat at the gym (`Powerhouse Gym` — the GymLocationName enum *value*, not
+the key); the row's `maintain()` hook (called every tick the row stays assigned)
+restarts finished crimes and stops gym training the moment the chance clears the
+bar, since a gym session never ends on its own.
 
 Row 6 (`faction-work`) picks, among joined factions, the one with the smallest
 positive `repReq − currentRep` gap across its aug list (tie-break: whichever has
@@ -294,7 +304,7 @@ or a JSON file.
 
 ## Unverified / open items
 
-- **`PILOT_MANAGER_RAM` measured 2026-07-06 at SF4.3: 65.65 GB** (~61 GB of it
+- **`PILOT_MANAGER_RAM`: 65.65 GB measured at SF4.3, +12 GB computed for the chance-aware crime fallback (getCrimeStats, getCrimeChance, gymWorkout) = 77.65 GB — re-measure with `mem`** (~61 GB of it
   singularity functions, biggest single items 5 GB each: getOwnedAugmentations,
   getAugmentationsFromFaction, getAugmentationPrereq, purchaseAugmentation,
   commitCrime, donateToFaction). Because singularity RAM scales ×16/×4/×1 with

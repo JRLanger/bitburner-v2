@@ -30,8 +30,11 @@ const BOOTSTRAP_CRIME = "Mug";
  *  that gate Mug's success chance. */
 const GYM_STATS = ["str", "def", "dex", "agi"];
 /** Gym location used for training (devlog 01 doesn't pin one; any city gym
- *  works — Sector12PowerhouseGym is the default starting-city option). */
-const GYM_LOCATION = "Sector12PowerhouseGym";
+ *  works — Sector-12's Powerhouse Gym is the default starting-city option).
+ *  NOTE: this must be the GymLocationName enum VALUE ("Powerhouse Gym"), not the
+ *  enum key (Sector12PowerhouseGym) — gymWorkout silently returns false on an
+ *  unknown name. */
+const GYM_LOCATION = "Powerhouse Gym";
 /** Target stat level devlog 01 trains to (unlocks ~50% Mug chance). */
 const GYM_TARGET_LEVEL = 25;
 

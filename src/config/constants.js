@@ -352,7 +352,7 @@ export const HACKNET_MANAGER_RAM = 8.20; // measured in-game (mem managers/hackn
  *  at SF4.2 this becomes ~249 GB, at SF4.1 ~981 GB — below SF4.3, pilot must be
  *  split into per-phase one-shot scripts (the documented RAM fallback in
  *  docs/plans/pilot-singularity.md) and this constant re-measured. */
-export const PILOT_MANAGER_RAM = 65.65; // measured in-game at SF4.3
+export const PILOT_MANAGER_RAM = 77.65; // 65.65 measured at SF4.3 + 12 computed (getCrimeStats 5, getCrimeChance 5, gymWorkout 2 — chance-aware crime fallback); re-measure with mem
 /** Estimated (not yet measured in-game — re-measure with `mem managers/lifecycle.js`
  *  once played) from the type defs' documented per-call RAM costs: ~27.75 GB at
  *  SF4.3 (×1 multiplier). Like pilot, only viable as a single script at SF4.3 —

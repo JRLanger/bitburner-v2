@@ -37,11 +37,27 @@ import { publishStatus, readStatus } from "/lib/status.js";
 import { getFlag, setFlag, moneyFloor } from "/lib/flags.js";
 import { findPath } from "/lib/netpath.js";
 
-/** Crime name used by ladder row 1 (bootstrap) and row 8 (money fallback). Kept as
- *  a local const (not exported from constants.js) since it's pilot-internal detail,
- *  not a cross-manager convention. */
-const BOOTSTRAP_CRIME = "Mug";
-const FALLBACK_CRIME = "Heist";
+/** Crime selection for ladder rows 1 (bootstrap) and 8 (money fallback) is
+ *  CHANCE-AWARE: pick the best expected-$/sec crime (money × chance ÷ time) from
+ *  live getCrimeStats/getCrimeChance, and when even the best option's success
+ *  chance is below PILOT_CRIME_MIN_CHANCE, train the lowest combat stat at the
+ *  gym instead (re-evaluated every tick, so training hands back to crime as soon
+ *  as the chance clears the bar). All pilot-internal detail, so local consts.
+ *  Crime names verified against the CrimeType enum in the type defs. */
+const CRIME_CANDIDATES = [
+    "Shoplift", "Rob Store", "Mug", "Larceny", "Deal Drugs", "Bond Forgery",
+    "Traffick Arms", "Homicide", "Grand Theft Auto", "Kidnap", "Assassination",
+    "Heist",
+];
+const PILOT_CRIME_MIN_CHANCE = 0.4;
+/** Any city gym works; Sector-12's is the default starting-city option (same
+ *  choice as utils/boot-grind.js). gymWorkout returns false if unreachable —
+ *  handled by falling back to committing the best crime anyway. */
+const GYM_LOCATION = "Powerhouse Gym";
+/** GymType enum values keyed by the Player.skills field they train. */
+const COMBAT_SKILLS = [
+    ["strength", "str"], ["defense", "def"], ["dexterity", "dex"], ["agility", "agi"],
+];
 /** Below this much home RAM, nothing else in the pipeline works yet — see
  *  arbitration.md ladder row 1. */
 const BOOTSTRAP_HOME_RAM_GB = 32;
@@ -324,7 +340,8 @@ function ladder(ns, snap) {
         {
             name: "bootstrap-crime",
             applicable: () => snap.homeRam < BOOTSTRAP_HOME_RAM_GB,
-            start: (ns) => ns.singularity.commitCrime(BOOTSTRAP_CRIME, false),
+            start: (ns) => startCrimeOrTrain(ns),
+            maintain: (ns, reassert) => maintainCrime(ns, reassert),
             stop: (ns) => ns.singularity.stopAction(),
         },
         // Row 2 (karma grind / gang assist) — needs the gang manager's focusRequest.
@@ -350,7 +367,8 @@ function ladder(ns, snap) {
             // heisting, and the ladder falls through to row 9.
             name: "crime-fallback",
             applicable: () => moneyStillWanted(ns),
-            start: (ns) => ns.singularity.commitCrime(FALLBACK_CRIME, false),
+            start: (ns) => startCrimeOrTrain(ns),
+            maintain: (ns, reassert) => maintainCrime(ns, reassert),
             stop: (ns) => ns.singularity.stopAction(),
         },
         {
@@ -391,6 +409,60 @@ function bestFactionTarget(ns, snap) {
         }
     }
     return best;
+}
+
+/** Best expected-$/sec crime right now: money × successChance ÷ time over the
+ *  full CrimeType catalog. Chance is a live read, so this self-adjusts as combat
+ *  stats grow — a fresh character picks Shoplift/Mug, a trained one graduates to
+ *  Heist on its own. */
+function bestCrime(ns) {
+    const sing = ns.singularity;
+    let best = null;
+    for (const crime of CRIME_CANDIDATES) {
+        const stats = sing.getCrimeStats(crime);
+        const chance = sing.getCrimeChance(crime);
+        const ev = (stats.money * chance) / stats.time;
+        if (!best || ev > best.ev) best = { crime, chance, ev };
+    }
+    return best;
+}
+
+/** Crime rows' start(): commit the best-EV crime, unless even ITS success chance
+ *  is below PILOT_CRIME_MIN_CHANCE — then train the lowest combat stat at the gym
+ *  first (chance-gated per the user's request; re-checked every tick by
+ *  maintainCrime, which hands back to crime once the bar clears). gymWorkout can
+ *  fail (not in a city with this gym / no money) — fall back to just committing
+ *  the crime rather than doing nothing. */
+function startCrimeOrTrain(ns) {
+    const sing = ns.singularity;
+    const best = bestCrime(ns);
+    if (best.chance < PILOT_CRIME_MIN_CHANCE) {
+        const skills = ns.getPlayer().skills;
+        let lowest = COMBAT_SKILLS[0];
+        for (const entry of COMBAT_SKILLS) {
+            if (skills[entry[0]] < skills[lowest[0]]) lowest = entry;
+        }
+        if (sing.gymWorkout(GYM_LOCATION, lowest[1], false)) return;
+    }
+    sing.commitCrime(best.crime, false);
+}
+
+/** Crime rows' maintain() — called each tick the row stays assigned:
+ *  - player idle (a crime finished): start the next best crime / training block;
+ *  - player gym-training (type "CLASS") and the best crime's chance now clears
+ *    the bar: stop training and switch to the crime. Without this, the gym —
+ *    which never ends on its own — would hold the row forever. */
+function maintainCrime(ns, reassert) {
+    const sing = ns.singularity;
+    if (!sing.isBusy()) {
+        reassert();
+        return;
+    }
+    const work = sing.getCurrentWork();
+    if (work?.type === "CLASS" && bestCrime(ns).chance >= PILOT_CRIME_MIN_CHANCE) {
+        sing.stopAction();
+        reassert();
+    }
 }
 
 function startFactionWork(ns, snap) {
@@ -446,12 +518,14 @@ function phaseWork(ns, snap, ladderState) {
     } else if (winner.name === currentRow) {
         nextChallenger = null;
         nextStreak = 0;
-        // Re-assert finite work: crimes complete after seconds and leave the player
-        // idle while the row assignment is unchanged — without this, bootstrap-crime
-        // would mug exactly once. Continuous work (faction) keeps isBusy true, so
-        // this is a no-op for it; instant actions (donate) intentionally repeat
-        // once per tick under the spend cap.
-        if (!ns.singularity.isBusy()) applyRow(ns, winner);
+        // Keep the row alive between switches. Rows with a maintain() own their
+        // own upkeep (crime rows: restart finished crimes, hand gym training back
+        // to crime once the success chance clears the bar). For the rest, the
+        // generic rule: finite work (a crime, a donate) leaves the player idle
+        // while the assignment is unchanged — re-assert it. Continuous work
+        // (faction grinding) keeps isBusy true, so this is a no-op for it.
+        if (winner.maintain) winner.maintain(ns, () => applyRow(ns, winner));
+        else if (!ns.singularity.isBusy()) applyRow(ns, winner);
     } else if (winner.name === challenger) {
         nextStreak = challengerStreak + 1;
         if (nextStreak >= FOCUS_STABLE_TICKS) {
@@ -504,6 +578,9 @@ function describeWork(task) {
     if (!task) return null;
     if (task.type === "FACTION") return { faction: task.factionName, type: task.factionWorkType };
     if (task.type === "CRIME") return { crime: task.crimeType };
+    // classType/location so pilot's own gym training is distinguishable from a
+    // class the player started manually (both are type "CLASS").
+    if (task.type === "CLASS") return { classType: task.classType, location: task.location };
     return { type: task.type };
 }
 
