@@ -20,11 +20,16 @@ import {
     STATUS_PORT_HACKNET,
     STATUS_PORT_PILOT,
     STATUS_PORT_LIFECYCLE,
+    PILOT_LOOP_SLEEP,
+    LIFECYCLE_LOOP_SLEEP,
 } from "/config/constants.js";
 import { readStatus } from "/lib/status.js";
 
 /** Manager stale threshold, ms (managers loop every 10s — mirror dashboard.js). */
 const MGR_STALE_MS = 25000;
+// Slow-tick managers publish less often — stale only past 2.5x their own period.
+const PILOT_STALE_MS = 2.5 * PILOT_LOOP_SLEEP;
+const LIFECYCLE_STALE_MS = 2.5 * LIFECYCLE_LOOP_SLEEP;
 /** Inner width of the box (characters after the border glyph). */
 const W = 78;
 
@@ -90,10 +95,10 @@ export function renderTail(ns, snap) {
         `nodes ${s.nodes}/${s.maxNodes ?? "∞"} · $${fmt.number(s.production ?? 0)}/s · next $${fmt.number(s.nextCost ?? 0)}`)}`);
     const pilotSnap = readStatus(ns, STATUS_PORT_PILOT);
     ns.print(`║ ${mgrLine("pilot", pilotSnap, now, (s) =>
-        `programs ${s.programs.owned}/${s.programs.total} · backdoors ${s.backdoors.done.length}/${s.backdoors.done.length + s.backdoors.pending.length} · ladder ${s.focusOwner ?? "—"}`)}`);
+        `programs ${s.programs.owned}/${s.programs.total} · backdoors ${s.backdoors.done.length}/${s.backdoors.done.length + s.backdoors.pending.length} · ladder ${s.focusOwner ?? "—"}`, PILOT_STALE_MS)}`);
     const lifecycleSnap = readStatus(ns, STATUS_PORT_LIFECYCLE);
     ns.print(`║ ${mgrLine("lifecycle", lifecycleSnap, now, (s) =>
-        `pending ${s.pending} · run ${s.runHrs.toFixed(1)}h · stagnant ${s.stagnantMin.toFixed(0)}m · auto-install ${s.autoInstallArmed ? "ARMED" : "off"}`)}`);
+        `pending ${s.pending} · run ${s.runHrs.toFixed(1)}h · stagnant ${s.stagnantMin.toFixed(0)}m · auto-install ${s.autoInstallArmed ? "ARMED" : "off"}`, LIFECYCLE_STALE_MS)}`);
 
     // ── Alerts (same rules as dashboard.js renderAlerts) ──
     const alerts = [];
@@ -109,12 +114,12 @@ export function renderTail(ns, snap) {
 }
 
 /** One manager line: status glyph + name + key stats (or last action / no data). */
-function mgrLine(name, snap, now, stats) {
+function mgrLine(name, snap, now, stats, staleMs = MGR_STALE_MS) {
     if (!snap) return `· ${name.padEnd(10)} no data yet`;
     const age = now - (snap.ts || 0);
     const doneish = /done|maxed|exit|exhaust/i.test(snap.action || "");
-    const glyph = age <= MGR_STALE_MS ? "●" : doneish ? "◦" : "✕";
-    const suffix = age > MGR_STALE_MS && !doneish ? "  [not reporting]" : "";
+    const glyph = age <= staleMs ? "●" : doneish ? "◦" : "✕";
+    const suffix = age > staleMs && !doneish ? "  [not reporting]" : "";
     let detail;
     try {
         detail = stats(snap);
