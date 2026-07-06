@@ -79,6 +79,21 @@ frame with no reassembly in progress, return to the main loop.
 - **Watch the watcher's cost.** The debug log was "free" in-game (0 GB write) but
   its unbounded growth made an external reader lethal to the game's main thread.
 
+## Addendum (2026-07-06, stage 10b): deadlock variant 2 — healthy-but-unfireable
+
+Two days later a live case surfaced the second variant: **deltaone** frozen at
+`fill=0/1956` with `sec=+2.34` — *below* the keep-test's loose bound
+(`max(min×0.10, 1.0)` = +2.60 for min=26) but *above* batchPhase's fire gate
+(`min×(1+SEC_MARGIN)` = +1.30). Healthy → never dropped to re-prep; hot → never
+fires; empty → no weaken will ever land. The stage-10 fix only released
+empty+*unhealthy* targets; this one was empty+*healthy*-but-unfireable, parked in
+the gap between the two thresholds. Fix: when the pipeline is empty, health also
+requires **fireable** security (the exact fire-gate bound) — the loose keep-bound
+is hysteresis for a running pipeline, and an empty pipeline has nothing to
+protect. Lesson: **two gates with different thresholds define a gap; make sure no
+state can park inside it** — any "wait for X" gate needs a companion path that
+guarantees X eventually happens.
+
 ## Deliberate non-fix
 
 At the RAM-abundant/scarce boundary, tail admission slots can go to a bigger-bank

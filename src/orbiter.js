@@ -908,9 +908,25 @@ function classify(ns, servers, player) {
             // Security keep-bound: relative with an ABSOLUTE floor — min×0.10 is a
             // hair-trigger on low-minSecurity servers (min=3 → only +0.30 tolerated),
             // where the observed drift-drops clustered. See BATCH_KEEP_SEC_ABS.
-            const healthy =
+            let healthy =
                 moneyFrac >= BATCH_KEEP_MONEY_FRAC &&
                 secOver <= Math.max(s.minSecurity * BATCH_KEEP_SEC_FRAC, BATCH_KEEP_SEC_ABS);
+            // EMPTY-PIPELINE STRICTNESS (deadlock variant 2). The loose keep-bound
+            // above tolerates more security than batchPhase's fire gate
+            // (min×(1+SEC_MARGIN)) — hysteresis meant for a RUNNING pipeline. A
+            // target parked in that gap with an EMPTY pipeline is healthy-but-
+            // unfireable forever: no in-flight weaken will ever cool it, batchPhase
+            // never fires (hot), and "healthy" keeps it from re-prep (observed:
+            // deltaone min=26 at sec +2.34 — over the +1.30 fire gate, under the
+            // +2.60 keep bound — frozen at fill=0/1956). An empty pipeline has no
+            // workers to protect, so strictness costs nothing: when empty, health
+            // also requires FIREABLE security, letting the normal grace → drop →
+            // re-prep path clear the hot residue with a weaken wave.
+            const pipeNow = pipelines.get(s.hostname);
+            if (healthy && pipeNow && pipeNow.committed.length === 0 &&
+                sec > s.minSecurity * (1 + SEC_MARGIN)) {
+                healthy = false;
+            }
             // A pipeline still FILLING toward depth (RAM-starved while a flood of newly-
             // eligible servers contends for the pool — e.g. just after bulk-buying the port
             // openers) hasn't reached the steady state this keep-test judges; its low

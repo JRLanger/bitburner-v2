@@ -335,7 +335,15 @@ and fixed:
   `fill=0/N`, money ~4%, chronic `FIRE-HOT`, one after another as each drained. Fix:
   an **empty** pipeline is *not* protected — the guard exists to avoid orphaning
   in-flight workers, and an empty pipeline has none. Empty + unhealthy now falls
-  through to the normal keep-test/grace and re-preps.
+  through to the normal keep-test/grace and re-preps. **Variant 2 (stage 10b):**
+  the loose keep-bound (up to `max(min×0.10, 1.0)` over min) tolerates more
+  security than the fire gate (`min×(1+SEC_MARGIN)`), so an empty pipeline could
+  also park in the gap between them — *healthy-but-unfireable* forever (observed:
+  deltaone, min=26, at +2.34 — over the +1.30 fire gate, under the +2.60 keep
+  bound, frozen at `fill=0/1956`). When the pipeline is empty, health now also
+  requires **fireable** security; the loose bound is hysteresis for a *running*
+  pipeline, and strictness on an empty one costs nothing (the drop kills zero
+  workers — re-prep is just a weaken wave).
 - **REANCHOR persistence gate (stage 10).** The instant re-anchor turned planner
   noise into massacres: when f flipped between two values every other tick (see next
   bullet), each downward flip killed the target's entire in-flight pipeline (13–23k
