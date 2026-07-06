@@ -131,7 +131,16 @@ main:
   them in the status snapshot (`pendingInvites`) so the player decides. Dashboard
   shows them as an alert line.
 
-### Phase 4 — buy augmentations (`phaseAugs`)
+### Phase 4 — augmentations (`phaseAugs`)
+
+> **Superseded by arbitration.md Decision 5 (2026-07-06):** purchased augs are
+> inert until installed, so all aug buying moves to lifecycle's pre-reset batch
+> (AUG_PRIORITY-driven set selection, most-expensive-first purchase). Pilot's
+> phase 4 becomes REPORT-ONLY — publish `unlockedUnbought` (count + list) and
+> `lastAugUnlockTs` (first time each aug became rep-unlocked; drives lifecycle's
+> unlock-staleness install decision) — EXCEPT prereq augs needed to make a
+> priority aug installable, which pilot may still buy. The logic below described
+> the original continuous-buy design and remains only as history.
 - Build the want-list once per tick:
   - For each joined faction: `getAugmentationsFromFaction(f)` minus
     `getOwnedAugmentations(true)` (true = include purchased-not-installed).
