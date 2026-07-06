@@ -347,11 +347,12 @@ export const PILOT_MANAGER = "/managers/pilot.js";
 export const CONTRACTS_MANAGER_RAM = 16.80; // measured in-game (mem managers/contracts.js): 1.6 base + 0.2 ls + 15 getContract
 export const PSERVER_MANAGER_RAM = 5.85; // measured in-game (mem managers/pserver.js)
 export const HACKNET_MANAGER_RAM = 8.20; // measured in-game (mem managers/hacknet.js)
-/** Placeholder until measured with `mem managers/pilot.js` in-game (see testing
- *  checklist in docs/plans/pilot-singularity.md) — singularity RAM costs are
- *  multiplied ×16/×4/×1 by SF4 level, so this MUST be re-measured under the
- *  player's actual SF4 level before trusting launchManagers' reserve math. */
-export const PILOT_MANAGER_RAM = 40.0; // UNVERIFIED — measure in-game, see docs/scripts/pilot.md
+/** Measured in-game at SF4.3 (mem managers/pilot.js): 65.65 GB total, ~61 GB of it
+ *  singularity functions. Singularity RAM is multiplied ×16/×4/×1 by SF4 level:
+ *  at SF4.2 this becomes ~249 GB, at SF4.1 ~981 GB — below SF4.3, pilot must be
+ *  split into per-phase one-shot scripts (the documented RAM fallback in
+ *  docs/plans/pilot-singularity.md) and this constant re-measured. */
+export const PILOT_MANAGER_RAM = 65.65; // measured in-game at SF4.3
 
 /** Loop sleep for the (infrequent-purchase) managers, ms. */
 export const MANAGER_LOOP_SLEEP = 10000;

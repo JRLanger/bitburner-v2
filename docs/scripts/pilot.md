@@ -294,10 +294,13 @@ or a JSON file.
 
 ## Unverified / open items
 
-- **`PILOT_MANAGER_RAM` (40.0 GB) is a placeholder**, not yet measured in-game.
-  The spec's testing checklist requires running `mem managers/pilot.js` under the
-  player's actual SF4 level and updating this constant (and re-checking the RAM
-  fallback trigger) before trusting `launchManagers`' reserve math at scale.
+- **`PILOT_MANAGER_RAM` measured 2026-07-06 at SF4.3: 65.65 GB** (~61 GB of it
+  singularity functions, biggest single items 5 GB each: getOwnedAugmentations,
+  getAugmentationsFromFaction, getAugmentationPrereq, purchaseAugmentation,
+  commitCrime, donateToFaction). Because singularity RAM scales ×16/×4/×1 with
+  SF4 level, the same script needs ~249 GB at SF4.2 and ~981 GB at SF4.1 — pilot
+  as a single script is **only viable at SF4.3**; below that, the spec's RAM
+  fallback (per-phase one-shot scripts) must be built before pilot can launch.
 - **NeuroFlux Governor's per-purchase inflation constant** isn't exposed via a
   documented getter here, so `countAffordableNeuroflux`'s simulated loop assumes
   `getAugmentationPrice(PILOT_NEUROFLUX)` already reflects the next level's live
