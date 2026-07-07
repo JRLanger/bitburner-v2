@@ -262,7 +262,7 @@ function renderScripts(snaps, now) {
             ["backdoors", `${snaps.pilot.backdoors.done.length}/${snaps.pilot.backdoors.done.length + snaps.pilot.backdoors.pending.length}`],
             ["factions", fmtCount(snaps.pilot.factions)],
             ["ladder", snaps.pilot.focusOwner ?? "—"],
-            ["grinding", snaps.pilot.augs?.grindTarget ? snaps.pilot.augs.grindTarget.aug : "—"],
+            ["grinding", snaps.pilot.augs?.grindTarget ? `${snaps.pilot.augs.grindTarget.aug} - ${snaps.pilot.augs.grindTarget.faction}` : "—"],
         ] : [], PILOT_STALE_MS));
     rows.push(managerRow("lifecycle", snaps.lifecycle, now,
         snaps.lifecycle ? [

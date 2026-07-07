@@ -90,8 +90,10 @@ never oscillates between rivals. Per `getFactionEnemies`, a run can join one
 compatible group — {Sector-12, Aevum}, {Chongqing, New Tokyo, Ishima}, or Volhaven
 solo; across runs, once a city's wanted augs are owned it drops out and a rival
 becomes eligible, so the cities are exhausted one group per run. The pursued city
-shows as `cityTarget` in status. (Note: while abroad, the Sector-12 gym used by the
-crime row is unreachable, so that row falls back to committing crime — harmless.)
+shows as `cityTarget` in status. Once no city candidates remain, `pursueCityFaction`
+travels the player **back to Sector-12** (only if pilot was the one who left —
+tracked by `state.travel.awayForCity`, so a manually chosen city is left alone) so
+the crime row's Sector-12 gym is reachable again.
 
 Non-city enemy-having factions (Silhouette, etc.) are still left un-joined and
 surfaced in `pendingInvites` for the player. Joined-faction membership comes from

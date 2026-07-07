@@ -88,6 +88,10 @@ export async function main(ns) {
         // unlocking rep OR saving money, so this stalls on whichever is binding —
         // fixing the "gang unlocks everything at once" false trigger.
         acquire: { knownCount: 0, lastAcquireTs: Date.now() },
+        // True while pilot has traveled the player away for a city faction — lets it
+        // travel back to Sector-12 (for the crime-row gym) once city joins are done,
+        // without disturbing a city the PLAYER chose manually.
+        travel: { awayForCity: false },
     };
 
     while (true) {
@@ -103,7 +107,7 @@ export async function main(ns) {
 
         phaseTor(ns, snapshot);
         await phaseBackdoors(ns, snapshot);
-        phaseFactions(ns, snapshot);
+        phaseFactions(ns, snapshot, state);
         phaseAugs(ns, snapshot);            // report-only: computes acquirableNow
         trackAcquire(state, snapshot);      // stamp lastAcquireTs when the set grows
         const workState = phaseWork(ns, snapshot, state);
@@ -276,7 +280,7 @@ const TRAVEL_COST = 200_000;
  *  city factions when they still offer a wanted priority aug and no rival is already
  *  joined, traveling to the city if needed to trigger the invite. Non-city
  *  enemy-having factions still go to `pendingInvites` for the player to decide. */
-function phaseFactions(ns, snap) {
+function phaseFactions(ns, snap, state) {
     const sing = ns.singularity;
     const invites = sing.checkFactionInvitations();
     const joined = new Set(snap.joinedFactions);
@@ -302,7 +306,7 @@ function phaseFactions(ns, snap) {
 
     snap.joinedFactions = [...joined];
     snap.pendingInvites = pending;
-    snap.cityTarget = pursueCityFaction(ns, snap, joined, owned);
+    snap.cityTarget = pursueCityFaction(ns, snap, joined, owned, state);
 }
 
 /** True if a faction still offers a priority aug we don't own (works for factions
@@ -314,25 +318,40 @@ function cityHasWantedAug(sing, faction, owned) {
 
 /** Travel toward the best unjoined city faction that still has wanted augs and no
  *  rival already joined. Stays put once in a candidate city (waiting for the invite /
- *  money requirement), so it never oscillates between rivals. Respects manual
- *  override — won't yank the player mid-manual-work. Returns the pursued city (or null). */
-function pursueCityFaction(ns, snap, joined, owned) {
+ *  money requirement), so it never oscillates between rivals. When there are no more
+ *  city candidates, travels the player BACK to Sector-12 (only if pilot was the one
+ *  who left) so the crime row's gym is reachable again. Respects manual override.
+ *  Returns the pursued city, "Sector-12" while returning, or null. */
+function pursueCityFaction(ns, snap, joined, owned, state) {
     const sing = ns.singularity;
+    const manualOverride = snap.isBusy && !isPilotsOwnWork(ns, snap);
+    const affordTravel = () => ns.getServerMoneyAvailable("home") >= TRAVEL_COST;
+
     const candidates = CITY_FACTIONS.filter((cf) =>
         !joined.has(cf) &&
         !sing.getFactionEnemies(cf).some((e) => joined.has(e)) &&
         cityHasWantedAug(sing, cf, owned));
-    if (candidates.length === 0) return null;
+
+    if (candidates.length === 0) {
+        // City-faction pursuit is done. If pilot traveled away for it, go home to
+        // Sector-12 so gymWorkout (crime row) works again. Don't touch a city the
+        // player chose manually (awayForCity stays false unless pilot moved them).
+        if (state.travel.awayForCity && ns.getPlayer().city !== "Sector-12" && !manualOverride && affordTravel()) {
+            if (sing.travelToCity("Sector-12")) state.travel.awayForCity = false;
+            return "Sector-12";
+        }
+        return null;
+    }
 
     const here = ns.getPlayer().city;
     if (candidates.includes(here)) return here; // already in a candidate city — wait for invite
+    if (manualOverride) return null;
 
-    if (snap.isBusy && !isPilotsOwnWork(ns, snap)) return null; // don't interrupt manual work
     // Travel to the candidate with the most wanted augs (deterministic → no thrash).
     const best = candidates
         .map((cf) => ({ cf, n: sing.getAugmentationsFromFaction(cf).filter((a) => PRIORITY_AUGS.has(a) && !owned.has(a)).length }))
         .sort((a, b) => b.n - a.n)[0].cf;
-    if (ns.getServerMoneyAvailable("home") >= TRAVEL_COST) sing.travelToCity(best);
+    if (affordTravel() && sing.travelToCity(best)) state.travel.awayForCity = true;
     return best;
 }
 
