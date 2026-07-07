@@ -262,12 +262,13 @@ function renderScripts(snaps, now) {
             ["backdoors", `${snaps.pilot.backdoors.done.length}/${snaps.pilot.backdoors.done.length + snaps.pilot.backdoors.pending.length}`],
             ["factions", fmtCount(snaps.pilot.factions)],
             ["ladder", snaps.pilot.focusOwner ?? "—"],
+            ["grinding", snaps.pilot.augs?.grindTarget ? snaps.pilot.augs.grindTarget.aug : "—"],
         ] : [], PILOT_STALE_MS));
     rows.push(managerRow("lifecycle", snaps.lifecycle, now,
         snaps.lifecycle ? [
-            ["pending augs", fmtCount(snaps.lifecycle.pending)],
+            ["augs ready", fmtCount(snaps.lifecycle.readyCount)],
             ["run age", `${snaps.lifecycle.runHrs.toFixed(1)}h`],
-            ["stagnant", `${snaps.lifecycle.stagnantMin.toFixed(0)}m`],
+            ["no-unlock", `${snaps.lifecycle.stagnantMin.toFixed(0)}m`],
             ["auto-install", snaps.lifecycle.autoInstallArmed ? "ARMED" : "off"],
         ] : [], LIFECYCLE_STALE_MS));
 

@@ -98,7 +98,7 @@ export function renderTail(ns, snap) {
         `programs ${s.programs.owned}/${s.programs.total} · backdoors ${s.backdoors.done.length}/${s.backdoors.done.length + s.backdoors.pending.length} · ladder ${s.focusOwner ?? "—"}`, PILOT_STALE_MS)}`);
     const lifecycleSnap = readStatus(ns, STATUS_PORT_LIFECYCLE);
     ns.print(`║ ${mgrLine("lifecycle", lifecycleSnap, now, (s) =>
-        `pending ${s.pending} · run ${s.runHrs.toFixed(1)}h · stagnant ${s.stagnantMin.toFixed(0)}m · auto-install ${s.autoInstallArmed ? "ARMED" : "off"}`, LIFECYCLE_STALE_MS)}`);
+        `ready ${s.readyCount} · run ${s.runHrs.toFixed(1)}h · no-unlock ${s.stagnantMin.toFixed(0)}m · auto-install ${s.autoInstallArmed ? "ARMED" : "off"}`, LIFECYCLE_STALE_MS)}`);
 
     // ── Alerts (same rules as dashboard.js renderAlerts) ──
     const alerts = [];

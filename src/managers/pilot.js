@@ -3,10 +3,11 @@
  *
  * Automates the manual progression loop the player otherwise does by hand: buy
  * TOR + darkweb programs, install backdoors on the story servers, accept "safe"
- * faction invites, buy augmentations, and drive faction work (via the arbitration
- * ladder — see docs/plans/arbitration.md) when nothing more important needs the
- * player's attention. See docs/plans/pilot-singularity.md for the full spec and
- * docs/scripts/pilot.md for the write-up (what/how/why/alternatives).
+ * faction invites, and drive player activity via the arbitration ladder (see
+ * docs/plans/arbitration.md) — including grinding faction rep toward the next-best
+ * (lowest-ETA) PRIORITY augmentation. Pilot does NOT buy augs (arbitration Decision
+ * 5): it reports which are unlocked; lifecycle batch-buys the set at reset. See
+ * docs/plans/pilot-singularity.md and docs/scripts/pilot.md.
  *
  * Independent slow-tick loop, launched on home by booster/orbiter (see MANAGERS
  * in each controller) once the SF4 gate passes. Every ns.singularity.* call is
@@ -27,12 +28,13 @@ import {
     PILOT_SPEND_FRAC,
     PILOT_JOIN_BLOCKLIST,
     BACKDOOR_TARGETS,
-    PILOT_AUG_PRICE_HORIZON,
     PILOT_NEUROFLUX,
     SERVERS_JSON,
     FOCUS_STABLE_TICKS,
     STATUS_PORT_PSERVER,
+    PILOT_INCOME_EMA_ALPHA,
 } from "/config/constants.js";
+import { PRIORITY_AUGS, AUG_BASE_PRICE } from "/config/aug-priority.js";
 import { publishStatus, readStatus } from "/lib/status.js";
 import { getFlag, setFlag, moneyFloor } from "/lib/flags.js";
 import { findPath } from "/lib/netpath.js";
@@ -69,15 +71,20 @@ export async function main(ns) {
     // assigned row and how many consecutive ticks a *different* row has beaten it
     // (anti-thrash — FOCUS_STABLE_TICKS). Lives here, not in lib/flags.js, because
     // it only needs to survive within this process's own lifetime.
-    let currentRow = null;
-    let challenger = null;
-    let challengerStreak = 0;
-    // Timestamp of the last successful aug purchase (this process's lifetime only
-    // — a fresh pilot process post-reset starts null, which is fine: lifecycle's
-    // stagnantMs check reads "now - lastAugPurchaseTs" and null means "never
-    // purchased yet this run", the same as a very stale timestamp for that
-    // purpose). Read by lifecycle.js off pilot's status snapshot (arbitration.md).
-    let lastAugPurchaseTs = null;
+    // Per-process runtime state (not persisted; a fresh pilot post-reset starts
+    // clean by construction). Grouped so the ETA/grind logic can read income &
+    // rep-rate estimates that only make sense as running samples across ticks.
+    const state = {
+        ladder: { currentRow: null, challenger: null, challengerStreak: 0 },
+        // All-sources income rate ($/s), EMA-smoothed from getMoneySources deltas.
+        income: { ema: null, lastTotal: null, lastTs: null },
+        // Empirical rep/sec fallback when Formulas.exe isn't owned (single estimate,
+        // updated whenever pilot is working a faction).
+        rep: { estimate: null, lastRep: null, lastFaction: null, lastTs: null },
+        // Stagnation signal for lifecycle: when the count of rep-unlocked-but-unbought
+        // priority augs last grew (batching means purchases no longer move mid-run).
+        unlock: { knownCount: 0, lastUnlockTs: Date.now() },
+    };
 
     while (true) {
         if (!singularityAvailable(ns)) {
@@ -88,23 +95,53 @@ export async function main(ns) {
         }
 
         const snapshot = gatherState(ns);
+        sampleIncome(ns, state);
 
         phaseTor(ns, snapshot);
         await phaseBackdoors(ns, snapshot);
         phaseFactions(ns, snapshot);
-        phaseAugs(ns, snapshot);
-        if (snapshot.augsPurchasedThisTick > 0) lastAugPurchaseTs = Date.now();
-        const workState = phaseWork(ns, snapshot, {
-            get: () => ({ currentRow, challenger, challengerStreak }),
-            set: (next) => { currentRow = next.currentRow; challenger = next.challenger; challengerStreak = next.challengerStreak; },
-        });
+        phaseAugs(ns, snapshot);            // report-only: computes unlockedUnbought
+        trackUnlocks(state, snapshot);      // stamp lastUnlockTs when the set grows
+        const workState = phaseWork(ns, snapshot, state);
 
-        const status = buildStatus(ns, snapshot, workState, lastAugPurchaseTs);
+        const status = buildStatus(ns, snapshot, workState, state);
         renderStatus(ns, status);
         publishStatus(ns, STATUS_PORT_PILOT, status);
 
         await ns.sleep(PILOT_LOOP_SLEEP);
     }
+}
+
+/** Sum of the positive income-source fields from getMoneySources (monotonic:
+ *  earnings only, expenses/spends are separate fields we exclude), sampled as a
+ *  delta/dt across ticks and EMA-smoothed into state.income.ema ($/s). Captures
+ *  crime/gang/corp/stock income, not just hacking. */
+function sampleIncome(ns, state) {
+    const src = ns.getMoneySources().sinceInstall;
+    const gross = src.hacking + src.crime + src.gang + src.corporation + src.stock +
+        src.codingcontract + src.bladeburner + src.hacknet + src.casino + src.work +
+        src.infiltration + src.sleeves + src.other;
+    const now = Date.now();
+    const inc = state.income;
+    if (inc.lastTotal !== null && inc.lastTs !== null) {
+        const dt = (now - inc.lastTs) / 1000;
+        if (dt > 0) {
+            const rate = Math.max(0, gross - inc.lastTotal) / dt;
+            inc.ema = inc.ema === null ? rate : PILOT_INCOME_EMA_ALPHA * rate + (1 - PILOT_INCOME_EMA_ALPHA) * inc.ema;
+        }
+    }
+    inc.lastTotal = gross;
+    inc.lastTs = now;
+}
+
+/** Stamp state.unlock.lastUnlockTs whenever the number of rep-unlocked-but-unbought
+ *  priority augs grows — the "new unlock" event lifecycle's install decision uses as
+ *  its stagnation signal (see docs/plans/reset-lifecycle.md). */
+function trackUnlocks(state, snap) {
+    const count = snap.unlockedUnbought?.length ?? 0;
+    if (count > state.unlock.knownCount) state.unlock.lastUnlockTs = Date.now();
+    state.unlock.knownCount = count;
+    snap.lastAugUnlockTs = state.unlock.lastUnlockTs;
 }
 
 /** True if ns.singularity exists and at least one cheap call succeeds. Cheap sanity
@@ -244,65 +281,35 @@ function phaseFactions(ns, snap) {
     snap.joinedFactions = [...joined];
 }
 
-// ── Phase 4: augmentations ───────────────────────────────────────────────────
+// ── Phase 4: augmentations (REPORT-ONLY) ─────────────────────────────────────
 
-/** Build the want-list once per tick (rep-unlocked, prereq-satisfied, not yet
- *  owned/purchased augs across every joined faction), buy price-descending (the
- *  game inflates every aug's price ~1.9x per purchase, so buying the expensive
- *  ones first avoids inflating them further before they're affordable). */
+/** Pilot no longer buys augs during the run (arbitration.md Decision 5): purchased
+ *  augs are inert until install, so buying early only pays the ~1.9x price ramp for
+ *  no benefit. lifecycle batch-buys the whole set at reset. Phase 4 just REPORTS
+ *  which PRIORITY augs are rep-unlocked-but-unbought (drives lifecycle's install
+ *  decision via lastAugUnlockTs) and how many NeuroFlux levels are affordable. */
 function phaseAugs(ns, snap) {
     const sing = ns.singularity;
-    let money = snap.money;
-    const spendCap = () => money * PILOT_SPEND_FRAC;
-
     const ownedOrPurchased = new Set(sing.getOwnedAugmentations(true));
-    const wanted = new Map(); // augName -> { faction, price, repReq }
+    const unlocked = [];
+    const seen = new Set();
 
     for (const faction of snap.joinedFactions) {
         const rep = sing.getFactionRep(faction);
         for (const aug of sing.getAugmentationsFromFaction(faction)) {
-            if (ownedOrPurchased.has(aug)) continue;
-            if (wanted.has(aug)) continue; // first faction offering it wins
-            const repReq = sing.getAugmentationRepReq(aug);
-            if (rep < repReq) continue;
-            wanted.set(aug, { faction, repReq });
-        }
-    }
-
-    let list = [...wanted.entries()].map(([aug, info]) => ({
-        aug,
-        faction: info.faction,
-        repReq: info.repReq,
-        price: sing.getAugmentationPrice(aug),
-        prereq: sing.getAugmentationPrereq(aug),
-    }));
-    list.sort((a, b) => b.price - a.price); // expensive first
-
-    let purchased = 0;
-    let changed = true;
-    while (changed) {
-        changed = false;
-        for (const item of list) {
-            if (ownedOrPurchased.has(item.aug)) continue;
-            const prereqMet = item.prereq.every((p) => ownedOrPurchased.has(p));
-            if (!prereqMet) continue;
-            const price = sing.getAugmentationPrice(item.aug);
-            if (price > money * PILOT_AUG_PRICE_HORIZON) continue;
-            if (price > spendCap() || price > money) continue;
-            if (sing.purchaseAugmentation(item.faction, item.aug)) {
-                money -= price;
-                ownedOrPurchased.add(item.aug);
-                purchased++;
-                changed = true; // prices shifted; re-scan for now-affordable/unblocked items
+            if (!PRIORITY_AUGS.has(aug)) continue;
+            if (ownedOrPurchased.has(aug) || seen.has(aug)) continue;
+            if (rep >= sing.getAugmentationRepReq(aug)) {
+                seen.add(aug);
+                unlocked.push(aug);
             }
         }
     }
 
-    snap.augsPurchasedThisTick = purchased;
-    snap.augWantList = list;
+    snap.unlockedUnbought = unlocked;
     // NeuroFlux affordable-level count: informational only (lifecycle owns the
     // actual dump, since buying early wastes the per-purchase inflation).
-    snap.nfAffordableLevels = countAffordableNeuroflux(sing, money);
+    snap.nfAffordableLevels = countAffordableNeuroflux(sing, snap.money);
 }
 
 function countAffordableNeuroflux(sing, money) {
@@ -353,8 +360,10 @@ function ladder(ns, snap) {
         // Row 5 (grafting) — needs the grafting manager's focusRequest.
         { name: "grafting", applicable: () => false, start: () => {}, stop: () => {} },
         {
+            // Grind rep toward the next-best (lowest-ETA) priority aug. Target is
+            // computed once per tick into snap.grindTarget (phaseWork).
             name: "faction-work",
-            applicable: () => bestFactionTarget(ns, snap) !== null,
+            applicable: () => snap.grindTarget != null,
             start: (ns) => startFactionWork(ns, snap),
             stop: (ns) => ns.singularity.stopAction(),
         },
@@ -380,35 +389,103 @@ function ladder(ns, snap) {
     ];
 }
 
-/** Pick among joined factions the one with the cheapest still-locked-by-rep aug
- *  (smallest positive repReq - currentRep), tie-broken by whichever has the most
- *  locked augs. Returns null if nothing is rep-gated (nothing left to grind for). */
-function bestFactionTarget(ns, snap) {
+/** The next PRIORITY aug to grind rep toward, chosen by lowest ETA = max(money-time,
+ *  rep-time) — whichever grind (earning the price or grinding the rep) is longer.
+ *  Only considers priority-tier augs (aug-priority.js) that are still rep-LOCKED at
+ *  a joined faction (unlocked ones are handled by lifecycle's batch buy). For each
+ *  aug, grinds the joined faction where we're closest (highest current rep).
+ *  Returns null when nothing priority is left to grind — the ladder then falls
+ *  through to crime to accumulate money for the reset batch buy. */
+function bestGrindTarget(ns, snap, state) {
     const sing = ns.singularity;
-    let best = null;
+    const ownedOrPurchased = new Set(sing.getOwnedAugmentations(true));
+    const income = state.income.ema; // $/s (null until two samples exist)
+    const money = snap.money;
+
+    // Per aug: the joined faction with the highest current rep (closest to unlock).
+    const perAug = new Map(); // aug -> { faction, rep, repReq }
     for (const faction of snap.joinedFactions) {
         const rep = sing.getFactionRep(faction);
-        const augs = sing.getAugmentationsFromFaction(faction);
-        let lockedCount = 0;
-        let smallestGap = Infinity;
-        for (const aug of augs) {
+        for (const aug of sing.getAugmentationsFromFaction(faction)) {
+            if (!PRIORITY_AUGS.has(aug) || ownedOrPurchased.has(aug)) continue;
             const repReq = sing.getAugmentationRepReq(aug);
-            const gap = repReq - rep;
-            if (gap > 0) {
-                lockedCount++;
-                if (gap < smallestGap) smallestGap = gap;
-            }
-        }
-        if (lockedCount === 0) continue;
-        if (
-            !best ||
-            smallestGap < best.gap ||
-            (smallestGap === best.gap && lockedCount > best.lockedCount)
-        ) {
-            best = { faction, gap: smallestGap, lockedCount };
+            if (rep >= repReq) continue; // already unlocked → not a grind target
+            const cur = perAug.get(aug);
+            if (!cur || rep > cur.rep) perAug.set(aug, { faction, rep, repReq });
         }
     }
-    return best;
+
+    // Cache rep-rate per faction — several augs share a faction, and each rate read
+    // is a Formulas call; compute once per distinct faction.
+    const rateCache = new Map(); // faction -> { workType, rate }
+    const factionRate = (faction) => {
+        let r = rateCache.get(faction);
+        if (!r) {
+            const workType = pickWorkType(sing, faction);
+            r = { workType, rate: repRatePerSec(ns, faction, workType, state) };
+            rateCache.set(faction, r);
+        }
+        return r;
+    };
+
+    let winner = null;
+    for (const [aug, info] of perAug) {
+        const { workType, rate } = factionRate(info.faction);
+        const repGap = Math.max(0, info.repReq - info.rep);
+        // rate unknown (no Formulas + no empirical sample yet) → order by raw gap.
+        const repTime = rate > 0 ? repGap / rate : repGap;
+        const price = AUG_BASE_PRICE[aug] ?? 0;
+        let moneyTime;
+        if (price <= money) moneyTime = 0;
+        else if (income && income > 0) moneyTime = (price - money) / income;
+        else moneyTime = Infinity;
+        const eta = Math.max(moneyTime, repTime);
+        if (!winner || eta < winner.eta) winner = { aug, faction: info.faction, workType, eta };
+    }
+    return winner;
+}
+
+/** Faction work type to grind: prefer hacking (this project's stat), else the
+ *  faction's first available type. */
+function pickWorkType(sing, faction) {
+    const types = sing.getFactionWorkTypes(faction);
+    return types.includes("hacking") ? "hacking" : types[0];
+}
+
+/** Reputation gain rate (rep/sec) for a faction+workType. Exact via Formulas when
+ *  Formulas.exe is owned (factionGains is per 200ms cycle → ×5 for /sec); otherwise
+ *  the single empirical estimate measured while pilot works a faction (0 = unknown,
+ *  caller falls back to raw rep-gap ordering). */
+function repRatePerSec(ns, faction, workType, state) {
+    if (ns.fileExists("Formulas.exe", "home")) {
+        try {
+            const favor = ns.singularity.getFactionFavor(faction);
+            const gains = ns.formulas.work.factionGains(ns.getPlayer(), workType, favor);
+            return Math.max(0, gains.reputation) * 5;
+        } catch { /* fall through to empirical */ }
+    }
+    return state.rep.estimate ?? 0;
+}
+
+/** Empirical rep/sec fallback: while pilot is working a faction, measure Δrep/Δt and
+ *  keep the last positive estimate (used for all factions when Formulas is absent). */
+function updateRepEstimate(ns, snap, state) {
+    const work = snap.currentWork;
+    const now = Date.now();
+    if (work?.type === "FACTION") {
+        const faction = work.factionName;
+        const rep = ns.singularity.getFactionRep(faction);
+        if (state.rep.lastFaction === faction && state.rep.lastRep !== null && state.rep.lastTs !== null) {
+            const dt = (now - state.rep.lastTs) / 1000;
+            if (dt > 0) {
+                const rate = Math.max(0, rep - state.rep.lastRep) / dt;
+                if (rate > 0) state.rep.estimate = rate;
+            }
+        }
+        state.rep.lastFaction = faction; state.rep.lastRep = rep; state.rep.lastTs = now;
+    } else {
+        state.rep.lastFaction = null; state.rep.lastRep = null; state.rep.lastTs = null;
+    }
 }
 
 /** Best expected-$/sec crime right now: money × successChance ÷ time over the
@@ -465,23 +542,21 @@ function maintainCrime(ns, reassert) {
     }
 }
 
+/** Grind the current ETA target (snap.grindTarget, computed once per tick in
+ *  phaseWork). Donate money for rep once favor clears getFavorToDonate() (faster
+ *  than working); otherwise work the faction (never steal focus). */
 function startFactionWork(ns, snap) {
-    const sing = ns.singularity;
-    const target = bestFactionTarget(ns, snap);
+    const target = snap.grindTarget;
     if (!target) return false;
+    const sing = ns.singularity;
     const favor = sing.getFactionFavor(target.faction);
     const donateThreshold = ns.getFavorToDonate ? ns.getFavorToDonate() : 150;
     if (favor >= donateThreshold) {
-        // Grind rep with money instead of time once favor is high enough to donate
-        // efficiently, still under the spend cap.
         const amount = Math.min(snap.money * PILOT_SPEND_FRAC, snap.money);
         if (amount > 0) sing.donateToFaction(target.faction, amount);
         return true;
     }
-    const types = sing.getFactionWorkTypes(target.faction);
-    const workType = types.includes("hacking") ? "hacking" : types[0];
-    if (!workType) return false;
-    return sing.workForFaction(target.faction, workType, false); // never steal focus
+    return sing.workForFaction(target.faction, target.workType, false);
 }
 
 /**
@@ -493,11 +568,13 @@ function startFactionWork(ns, snap) {
  * Pilot also publishes the assigned row as the `focusOwner` flag so future
  * mechanic managers can see who owns the player (arbitration.md focus protocol).
  */
-function phaseWork(ns, snap, ladderState) {
+function phaseWork(ns, snap, state) {
+    updateRepEstimate(ns, snap, state);          // empirical rep-rate fallback
+    snap.grindTarget = bestGrindTarget(ns, snap, state); // computed once; row reads it
     const rows = ladder(ns, snap);
     const winner = rows.find((r) => r.applicable(snap)) ?? rows[rows.length - 1];
 
-    const { currentRow, challenger, challengerStreak } = ladderState.get();
+    const { currentRow, challenger, challengerStreak } = state.ladder;
 
     // Manual-override: if the player is busy with work pilot did NOT start, leave
     // it alone entirely (don't even update the ladder bookkeeping) — see
@@ -541,7 +618,7 @@ function phaseWork(ns, snap, ladderState) {
         nextStreak = 1;
     }
 
-    ladderState.set({ currentRow: nextCurrent, challenger: nextChallenger, challengerStreak: nextStreak });
+    state.ladder = { currentRow: nextCurrent, challenger: nextChallenger, challengerStreak: nextStreak };
     setFlag(ns, "focusOwner", nextCurrent);
 
     return { focusOwner: nextCurrent, working: describeWork(ns.singularity.getCurrentWork()), overridden: false };
@@ -586,7 +663,7 @@ function describeWork(task) {
 
 // ── Status ───────────────────────────────────────────────────────────────────
 
-function buildStatus(ns, snap, workState, lastAugPurchaseTs) {
+function buildStatus(ns, snap, workState, state) {
     const sing = ns.singularity;
     const programs = sing.getDarkwebPrograms();
     const ownedCount = programs.filter((p) => snap.ownedPrograms.has(p)).length;
@@ -596,6 +673,7 @@ function buildStatus(ns, snap, workState, lastAugPurchaseTs) {
         if (ns.getServer(host).backdoorInstalled) backdoorDone.push(host);
         else backdoorPending.push(host);
     }
+    const target = snap.grindTarget;
 
     return {
         ts: Date.now(),
@@ -608,22 +686,18 @@ function buildStatus(ns, snap, workState, lastAugPurchaseTs) {
         focusOwner: workState.focusOwner,
         augs: {
             purchased: sing.getOwnedAugmentations(true).length,
-            affordableNow: snap.augWantList?.filter((a) => a.price <= snap.money).length ?? 0,
-            nextUnlock: nextUnlock(snap),
+            // Priority augs rep-unlocked but not yet bought (lifecycle buys these at reset).
+            unlockedUnbought: snap.unlockedUnbought?.length ?? 0,
+            grindTarget: target ? { aug: target.aug, faction: target.faction, etaSec: Math.round(target.eta) } : null,
         },
         nfAffordableLevels: snap.nfAffordableLevels ?? 0,
-        // Read by lifecycle.js (docs/plans/reset-lifecycle.md) as the "stagnantMs"
-        // signal — null until this process's first aug purchase this run.
-        lastAugPurchaseTs,
+        incomePerSec: state.income.ema ?? 0,
+        // Read by lifecycle.js (docs/plans/reset-lifecycle.md): count of unlocked-but-
+        // unbought priority augs + when that set last grew, its install stagnation signal.
+        unlockedUnbought: snap.unlockedUnbought?.length ?? 0,
+        lastAugUnlockTs: snap.lastAugUnlockTs ?? null,
         action: workState.overridden ? "player-controlled — pilot standing by" : `ladder: ${workState.focusOwner}`,
     };
-}
-
-function nextUnlock(snap) {
-    const list = snap.augWantList ?? [];
-    if (list.length === 0) return null;
-    const cheapest = [...list].sort((a, b) => a.price - b.price)[0];
-    return { aug: cheapest.aug, faction: cheapest.faction, repNeeded: cheapest.repReq };
 }
 
 /** Refresh the tail-window status table each tick (mirrors pserver.js's style). */
@@ -632,11 +706,13 @@ function renderStatus(ns, s) {
     const W = 52;
     ns.print(`╔═ PILOT ═ ${new Date().toLocaleTimeString()} ${"═".repeat(Math.max(0, W - 19))}`);
     ns.print(`║ Programs ${s.programs.owned}/${s.programs.total}  |  Factions joined ${s.factions}`);
-    ns.print(`║ Backdoors ${s.backdoors.done.length}/${s.backdoors.done.length + s.backdoors.pending.length}  |  Augs purchased ${s.augs.purchased}`);
+    ns.print(`║ Backdoors ${s.backdoors.done.length}/${s.backdoors.done.length + s.backdoors.pending.length}  |  Augs installed ${s.augs.purchased}  |  unlocked-unbought ${s.augs.unlockedUnbought}`);
     ns.print(`╠${"═".repeat(W)}`);
     ns.print(`║ Ladder: ${s.focusOwner ?? "—"}${s.working ? `  (${JSON.stringify(s.working)})` : ""}`);
-    if (s.augs.nextUnlock) {
-        ns.print(`║ Next aug: ${s.augs.nextUnlock.aug} (${s.augs.nextUnlock.faction})`);
+    if (s.augs.grindTarget) {
+        const g = s.augs.grindTarget;
+        const eta = Number.isFinite(g.etaSec) ? `${(g.etaSec / 60).toFixed(0)}m` : "∞";
+        ns.print(`║ Grinding: ${g.aug} @ ${g.faction} (ETA ${eta})`);
     }
     if (s.pendingInvites.length > 0) {
         ns.print(`║ ⚠ Pending invites (needs decision): ${s.pendingInvites.join(", ")}`);

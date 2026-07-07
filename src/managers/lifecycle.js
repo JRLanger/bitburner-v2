@@ -37,6 +37,7 @@ import {
     LIFECYCLE_LOG_FILE,
     BOOT_SCRIPT,
 } from "/config/constants.js";
+import { PRIORITY_AUGS } from "/config/aug-priority.js";
 import { publishStatus, readStatus } from "/lib/status.js";
 import { getFlag, setFlag } from "/lib/flags.js";
 
@@ -91,38 +92,41 @@ function singularityAvailable(ns) {
 // ── Install-decision model ──────────────────────────────────────────────────
 
 /**
- * pending = purchased-but-not-installed augs. runMs = time since last aug reset.
- * stagnantMs = time since pilot's last aug purchase (pilot's status snapshot —
- * see the arbitration protocol; pilot publishes `lastAugPurchaseTs`).
+ * readyCount = PRIORITY augs rep-unlocked but not yet bought (pilot's status:
+ * `unlockedUnbought`; augs are bought in the batch step AFTER this decision, so the
+ * trigger is unlock progress, not purchases). runMs = time since last aug reset.
+ * stagnantMs = time since the unlocked set last grew (pilot's `lastAugUnlockTs`).
  *
  * Install when:
- *   pending >= LIFECYCLE_MIN_AUGS AND stagnantMs >= LIFECYCLE_STAGNANT_MS
- *     (pilot can't reach the next aug soon — no point waiting further), OR
- *   pending >= 1 AND runMs >= LIFECYCLE_MAX_RUN_MS
+ *   readyCount >= LIFECYCLE_MIN_AUGS AND stagnantMs >= LIFECYCLE_STAGNANT_MS
+ *     (rep progress has plateaued — no point waiting further), OR
+ *   readyCount >= 1 AND runMs >= LIFECYCLE_MAX_RUN_MS
  *     (run has gone on long enough that SOME progress beats none).
  */
 function computeDecision(ns) {
-    const sing = ns.singularity;
-    const pending = sing.getOwnedAugmentations(true).length - sing.getOwnedAugmentations(false).length;
     const now = Date.now();
     const runMs = now - ns.getResetInfo().lastAugReset;
 
+    // Pilot no longer buys augs mid-run (arbitration.md Decision 5), so the trigger
+    // is UNLOCK progress, not purchases: how many PRIORITY augs are rep-unlocked and
+    // waiting to be batch-bought, and when that set last grew (lastAugUnlockTs).
     const pilotStatus = readStatus(ns, STATUS_PORT_PILOT);
-    const lastAugPurchaseTs = pilotStatus?.lastAugPurchaseTs ?? null;
-    // No recorded purchase this run reads as "stagnant since the run started" —
-    // conservative (never under-counts stagnation), and correct on a fresh pilot
-    // process that hasn't bought anything yet.
-    const stagnantMs = now - (lastAugPurchaseTs ?? ns.getResetInfo().lastAugReset);
+    const readyCount = pilotStatus?.unlockedUnbought ?? 0;
+    const lastUnlockTs = pilotStatus?.lastAugUnlockTs ?? null;
+    // No unlock recorded reads as "stagnant since the run started" — conservative.
+    const stagnantMs = now - (lastUnlockTs ?? ns.getResetInfo().lastAugReset);
 
-    const stagnantTrigger = pending >= LIFECYCLE_MIN_AUGS && stagnantMs >= LIFECYCLE_STAGNANT_MS;
-    const runLengthTrigger = pending >= 1 && runMs >= LIFECYCLE_MAX_RUN_MS;
+    // Plateau: enough augs are ready AND no NEW unlock for a while (rep progress has
+    // stalled → nothing more to gain by waiting). Backstop: max run age with ≥1 ready.
+    const stagnantTrigger = readyCount >= LIFECYCLE_MIN_AUGS && stagnantMs >= LIFECYCLE_STAGNANT_MS;
+    const runLengthTrigger = readyCount >= 1 && runMs >= LIFECYCLE_MAX_RUN_MS;
 
     let reason = null;
-    if (stagnantTrigger) reason = `${pending} pending augs, stagnant ${Math.round(stagnantMs / 60000)}m`;
-    else if (runLengthTrigger) reason = `${pending} pending aug(s), run age ${Math.round(runMs / 3600000)}h`;
+    if (stagnantTrigger) reason = `${readyCount} augs ready, no new unlock ${Math.round(stagnantMs / 60000)}m`;
+    else if (runLengthTrigger) reason = `${readyCount} aug(s) ready, run age ${Math.round(runMs / 3600000)}h`;
 
     return {
-        pending, runMs, stagnantMs,
+        readyCount, runMs, stagnantMs,
         shouldInstall: stagnantTrigger || runLengthTrigger,
         reason,
     };
@@ -138,14 +142,63 @@ function computeDecision(ns) {
 async function runChecklist(ns, decision) {
     ns.print(`Install decision fired: ${decision.reason}. Running pre-reset checklist...`);
 
-    await liquidateAndFreeze(ns);      // 0
-    const nfBought = dumpNeuroflux(ns); // 1
-    const donated = spendDown(ns);      // 2
+    await liquidateAndFreeze(ns);           // 0
+    const augsBought = batchBuyAugs(ns);    // 0.5 — the actual aug purchase, at reset
+    const nfBought = dumpNeuroflux(ns);     // 1
+    const donated = spendDown(ns);          // 2
     const runDurationMs = recordRunDuration(ns); // 3
-    logRun(ns, { runDurationMs, nfBought, donated }); // 4
+    logRun(ns, { runDurationMs, augsBought, nfBought, donated }); // 4
 
     ns.print("Checklist complete — installing augmentations now.");
     ns.singularity.installAugmentations(BOOT_SCRIPT);
+}
+
+/**
+ * Step 0.5: buy the whole aug set NOW, when money is about to become worthless.
+ * Priority tier (aug-priority.js: Hacking/Special/faction-rep augs) first, then the
+ * rest — each tier most-expensive-first, because the game inflates every aug's price
+ * ~1.9x per purchase, so buying the dear ones first avoids inflating them further.
+ * Only rep-unlocked, prereq-satisfied augs are buyable; we re-scan after each buy
+ * since a purchase can satisfy another aug's prereq. Returns count bought.
+ */
+function batchBuyAugs(ns) {
+    const sing = ns.singularity;
+    const owned = new Set(sing.getOwnedAugmentations(true));
+
+    // Gather buyable augs (rep met, not owned) with the faction offering them.
+    const buyable = new Map(); // aug -> faction
+    for (const faction of ns.getPlayer().factions) {
+        const rep = sing.getFactionRep(faction);
+        for (const aug of sing.getAugmentationsFromFaction(faction)) {
+            if (aug === "NeuroFlux Governor" || owned.has(aug) || buyable.has(aug)) continue;
+            if (rep >= sing.getAugmentationRepReq(aug)) buyable.set(aug, faction);
+        }
+    }
+
+    let bought = 0;
+    let progress = true;
+    while (progress) {
+        progress = false;
+        // Rebuild candidate list each pass: priority tier first, then rest; within
+        // each, most-expensive-first by LIVE price (reflects the ramp so far).
+        const candidates = [...buyable.keys()]
+            .filter((aug) => !owned.has(aug))
+            .filter((aug) => sing.getAugmentationPrereq(aug).every((p) => owned.has(p)))
+            .map((aug) => ({ aug, price: sing.getAugmentationPrice(aug), priority: PRIORITY_AUGS.has(aug) }))
+            .sort((a, b) => (a.priority !== b.priority ? (b.priority - a.priority) : b.price - a.price));
+
+        for (const c of candidates) {
+            if (c.price > ns.getServerMoneyAvailable("home")) continue;
+            if (sing.purchaseAugmentation(buyable.get(c.aug), c.aug)) {
+                owned.add(c.aug);
+                bought++;
+                progress = true; // prices shifted + a prereq may now be satisfied → re-scan
+                break;
+            }
+        }
+    }
+    ns.print(`Batch aug buy: purchased ${bought} augmentation(s).`);
+    return bought;
 }
 
 /**
@@ -247,7 +300,7 @@ function logRun(ns, info) {
     const money = ns.getServerMoneyAvailable("home");
     const line =
         `${new Date().toISOString()} | runDurationMs=${info.runDurationMs} | ` +
-        `augsOwned=${augCount} | nfBought=${info.nfBought} | donated=${info.donated} | ` +
+        `augsOwned=${augCount} | augsBought=${info.augsBought} | nfBought=${info.nfBought} | donated=${info.donated} | ` +
         `moneyAtReset=${Math.round(money)}\n`;
     ns.write(LIFECYCLE_LOG_FILE, line, "a");
 }
@@ -281,7 +334,7 @@ function checkBnCompletable(ns) {
 function buildStatus(ns, decision, armed, bnStatus) {
     return {
         ts: Date.now(),
-        pending: decision.pending,
+        readyCount: decision.readyCount,
         runHrs: decision.runMs / 3600000,
         stagnantMin: decision.stagnantMs / 60000,
         recommendInstall: decision.shouldInstall,
@@ -299,7 +352,7 @@ function renderStatus(ns, s) {
     ns.clearLog();
     const W = 52;
     ns.print(`╔═ LIFECYCLE ═ ${new Date().toLocaleTimeString()} ${"═".repeat(Math.max(0, W - 25))}`);
-    ns.print(`║ Pending augs ${s.pending}  |  Run age ${s.runHrs.toFixed(1)}h  |  Stagnant ${s.stagnantMin.toFixed(0)}m`);
+    ns.print(`║ Augs ready ${s.readyCount}  |  Run age ${s.runHrs.toFixed(1)}h  |  No-unlock ${s.stagnantMin.toFixed(0)}m`);
     ns.print(`║ Auto-install: ${s.autoInstallArmed ? "ARMED" : "off (recommend-only)"}`);
     ns.print(`╠${"═".repeat(W)}`);
     if (s.recommendInstall) {

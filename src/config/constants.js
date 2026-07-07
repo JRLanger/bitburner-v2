@@ -352,13 +352,13 @@ export const HACKNET_MANAGER_RAM = 8.20; // measured in-game (mem managers/hackn
  *  at SF4.2 this becomes ~249 GB, at SF4.1 ~981 GB — below SF4.3, pilot must be
  *  split into per-phase one-shot scripts (the documented RAM fallback in
  *  docs/plans/pilot-singularity.md) and this constant re-measured. */
-export const PILOT_MANAGER_RAM = 77.65; // 65.65 measured at SF4.3 + 12 computed (getCrimeStats 5, getCrimeChance 5, gymWorkout 2 — chance-aware crime fallback); re-measure with mem
+export const PILOT_MANAGER_RAM = 77.65; // STALE — re-measure: ETA change dropped aug-buying calls (getAugmentationPrice/Prereq, purchaseAugmentation ~12.5GB) and added getMoneySources + formulas.work.factionGains + fileExists. `mem managers/pilot.js`
 /** Estimated (not yet measured in-game — re-measure with `mem managers/lifecycle.js`
  *  once played) from the type defs' documented per-call RAM costs: ~27.75 GB at
  *  SF4.3 (×1 multiplier). Like pilot, only viable as a single script at SF4.3 —
  *  at SF4.2 this becomes ~95 GB, at SF4.1 ~365 GB, and would need the same
  *  per-phase one-shot split pilot's plan documents as its RAM fallback. */
-export const LIFECYCLE_MANAGER_RAM = 27.75; // ESTIMATED — verify with `mem`
+export const LIFECYCLE_MANAGER_RAM = 27.75; // STALE — batchBuyAugs added getAugmentationsFromFaction/RepReq/Prereq/Price (~15GB). Re-measure `mem managers/lifecycle.js`
 
 /** Loop sleep for the (infrequent-purchase) managers, ms. */
 export const MANAGER_LOOP_SLEEP = 10000;
@@ -574,10 +574,6 @@ export const BACKDOOR_TARGETS = [
     "CSEC", "avmnite-02h", "I.I.I.I", "run4theh111z", "fulcrumassets",
 ];
 
-/** Skip augs whose price exceeds this multiple of current money (i.e. only buy
- *  what's affordable right now — no saving up mid-tick). */
-export const PILOT_AUG_PRICE_HORIZON = 1.0;
-
 /** Aug name for the repeatable NeuroFlux Governor (dumped by lifecycle pre-reset,
  *  not purchased here — pilot only reports affordable-level count). */
 export const PILOT_NEUROFLUX = "NeuroFlux Governor";
@@ -591,6 +587,11 @@ export const PILOT_NEUROFLUX = "NeuroFlux Governor";
  *  before choosePlayerActivity() actually switches — anti-thrash hysteresis,
  *  same philosophy as the controllers' REANCHOR/ramp-down stable-tick guards. */
 export const FOCUS_STABLE_TICKS = 4;
+
+/** EMA smoothing factor for pilot's all-sources income rate (from getMoneySources
+ *  deltas), used in the aug-grind ETA. Higher = more responsive, lower = smoother.
+ *  0.3 tracks real income shifts over a few 30s ticks without jitter. */
+export const PILOT_INCOME_EMA_ALPHA = 0.3;
 
 /** How long sleeves get to cover the remaining karma grind before pilot itself
  *  steps in with player-driven Homicide (ladder row 2), ms. */

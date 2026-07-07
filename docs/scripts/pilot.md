@@ -84,20 +84,14 @@ the dashboard/tail render it as an alert line. Joined-faction membership comes
 from `ns.getPlayer().factions` — the authoritative list, which also captures
 factions joined manually or before pilot ever ran.
 
-**Phase 4 — augmentations (`phaseAugs`).** Builds a want-list once per tick: for
-every joined faction, every aug it offers (`getAugmentationsFromFaction`) that
-isn't already owned/purchased and whose rep requirement is currently met
-(`getFactionRep >= getAugmentationRepReq`). Sorts **price descending** (the game
-inflates every aug's price ~1.9× per purchase, so buying expensive ones first
-avoids inflating them further before they're affordable) and buys in a loop that
-re-scans after each purchase (prices and prereq-satisfaction both shift), gated
-by `PILOT_AUG_PRICE_HORIZON` (buy only if affordable *right now*, no saving up
-mid-tick), prereqs (`getAugmentationPrereq` must be a subset of owned+purchased),
-and the shared `PILOT_SPEND_FRAC` cap. NeuroFlux Governor is **never purchased
-here** — only its currently-affordable level count is reported
-(`nfAffordableLevels`) — because NF dumping is a pre-reset action `lifecycle`
-owns; buying early just wastes the per-purchase inflation on levels bought too
-soon.
+**Phase 4 — augmentations (`phaseAugs`, REPORT-ONLY).** Pilot does **not buy augs
+during the run** (arbitration.md Decision 5): purchased augs are inert until
+install, so buying early only pays the ~1.9× price ramp for no benefit — lifecycle
+batch-buys the whole set at reset. Phase 4 just reports which **priority-tier** augs
+(`config/aug-priority.js` — category Hacking/Special or a `faction_rep` bonus) are
+rep-unlocked but unbought (`unlockedUnbought`), which drives lifecycle's install
+decision (`lastAugUnlockTs`), plus the affordable NeuroFlux level count
+(`nfAffordableLevels`; NF is lifecycle's pre-reset dump, never bought here).
 
 **Phase 5 — player-activity arbitration ladder (`phaseWork`).** Implements
 `choosePlayerActivity()` from `docs/plans/arbitration.md`: an ordered array of
@@ -114,7 +108,7 @@ plans only need to fill in a row's three functions, never restructure the ladder
 | 3 | `bladeburner-bn67` | placeholder — always false |
 | 4 | `company-work` | placeholder — always false |
 | 5 | `grafting` | placeholder — always false |
-| 6 | `faction-work` | a joined faction has an aug locked only by rep (default progression activity) |
+| 6 | `faction-work` | a rep-locked PRIORITY aug exists at a joined faction (grind toward the lowest-ETA one) |
 | 7 | `bladeburner-passive` | placeholder — always false |
 | 8 | `crime-fallback` | money still wanted — port-4 snapshot fresh, i.e. pserver manager alive and still buying (once the fleet is maxed, idle beats heisting) |
 | 9 | `idle` | always true (terminal fallback) |
@@ -129,14 +123,29 @@ the key); the row's `maintain()` hook (called every tick the row stays assigned)
 restarts finished crimes and stops gym training the moment the chance clears the
 bar, since a gym session never ends on its own.
 
-Row 6 (`faction-work`) picks, among joined factions, the one with the smallest
-positive `repReq − currentRep` gap across its aug list (tie-break: whichever has
-the most rep-locked augs) — the cheapest remaining unlock. It works `hacking` type
-when offered, else the faction's first work type, via
-`workForFaction(faction, type, false)` — **`focus` is always `false`**, per the
-project's hard rule (see "Why"). If the faction's favor is at or above
-`ns.getFavorToDonate()` (with a hardcoded 150 fallback if that call is
-unavailable), it donates money instead of grinding time — same spend cap.
+Row 6 (`faction-work`) grinds rep toward the next-best **priority** aug by **ETA**
+(`bestGrindTarget`): among priority-tier augs (`config/aug-priority.js`) still
+rep-locked at a joined faction, it picks the lowest `ETA = max(moneyTime, repTime)`
+— whichever grind (affording the price or grinding the rep) takes longer:
+- `repTime = repGap / repRate`. `repRate` is exact via
+  `ns.formulas.work.factionGains(...).reputation × 5` (200 ms cycle → /sec) when
+  Formulas.exe is owned, else an empirical `Δrep/Δt` estimate measured while
+  working (`updateRepEstimate`); with neither, it falls back to ordering by raw
+  rep-gap.
+- `moneyTime = (basePrice − money) / income`, where `income` is the **all-sources**
+  rate (`getMoneySources().sinceInstall` deltas, EMA-smoothed via
+  `PILOT_INCOME_EMA_ALPHA` — captures crime/gang/corp/stock, not just hacking), and
+  `basePrice` is the aug's base price from `aug-priority.js` (a cheap proxy that
+  avoids a live `getAugmentationPrice` call).
+
+For each aug it grinds the joined faction where current rep is highest (closest to
+unlock). Work uses `hacking` type when offered, else the faction's first, via
+`workForFaction(faction, type, false)` — **`focus` always `false`**. Once favor ≥
+`ns.getFavorToDonate()` (150 fallback) it donates money for rep instead of working
+(same spend cap). When no priority aug is locked (all unlocked, awaiting the reset
+batch buy), the row is inapplicable and the ladder falls through to crime to
+accumulate money. Priorities are a single global order for all BitNodes;
+`aug-priority.js` is hand-editable and is the documented hook for per-BN tuning.
 
 **Anti-thrash hysteresis.** A new ladder winner must beat the *currently assigned*
 row for `FOCUS_STABLE_TICKS` (4) consecutive ticks before pilot actually switches

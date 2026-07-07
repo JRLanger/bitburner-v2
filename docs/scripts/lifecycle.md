@@ -4,10 +4,10 @@
 
 ## What it does
 
-Closes the outermost automation loop: decides **when** installing pending
-augmentations is worth resetting for, runs the pre-reset checklist in order
-(liquidate/freeze spending → dump NeuroFlux Governor → optional favor
-spend-down → record run duration → log → `installAugmentations`), and —
+Closes the outermost automation loop: decides **when** the run's accumulated
+augmentation unlocks are worth resetting for, runs the pre-reset checklist in order
+(liquidate/freeze spending → **batch-buy the aug set** → dump NeuroFlux Governor →
+optional favor spend-down → record run duration → log → `installAugmentations`), and —
 separately — raises a persistent, player-consent-only alert when the BitNode
 is completable. It never resets or ends a BitNode on its own initiative unless
 the player has explicitly armed it (autonomy guard, below) or run the BitNode
@@ -43,20 +43,22 @@ sleep 60s
 
 **Install-decision model (`computeDecision`).** Computes each tick:
 
-- `pending` = `getOwnedAugmentations(true).length - getOwnedAugmentations(false).length`
-  (purchased-but-not-installed count).
+Because pilot no longer buys augs mid-run (arbitration.md Decision 5 — the batch
+buy happens in this checklist *after* the decision), the trigger is UNLOCK
+progress, not purchases:
+
+- `readyCount` = pilot's `unlockedUnbought` (priority augs rep-unlocked but not yet
+  bought, read off pilot's status snapshot, port 7).
 - `runMs` = now − `getResetInfo().lastAugReset`.
-- `stagnantMs` = now − pilot's `lastAugPurchaseTs` (read off pilot's status
-  snapshot, port 7 — see "Cross-cutting: pilot" below); if pilot hasn't
-  purchased anything yet this run (`null`), falls back to `lastAugReset` so
-  stagnancy is measured from run start rather than under-counted.
+- `stagnantMs` = now − pilot's `lastAugUnlockTs` (when the unlocked set last grew);
+  falls back to `lastAugReset` if pilot hasn't reported an unlock yet.
 
 Fires when EITHER:
-- `pending >= LIFECYCLE_MIN_AUGS` (8) **and** `stagnantMs >= LIFECYCLE_STAGNANT_MS`
-  (30 min) — pilot isn't going to reach the next aug soon, so waiting further
-  just delays a reset that's already worth doing; **or**
-- `pending >= 1` **and** `runMs >= LIFECYCLE_MAX_RUN_MS` (12 h) — the run has
-  gone on long enough that even a single pending aug is worth banking.
+- `readyCount >= LIFECYCLE_MIN_AUGS` (8) **and** `stagnantMs >= LIFECYCLE_STAGNANT_MS`
+  (30 min) — enough augs are ready AND rep progress has plateaued (no new unlock),
+  so waiting further gains nothing; **or**
+- `readyCount >= 1` **and** `runMs >= LIFECYCLE_MAX_RUN_MS` (12 h) — the run has
+  gone on long enough that even a single ready aug is worth banking.
 
 **Autonomy guard.** `armed = LIFECYCLE_AUTO_INSTALL || getFlag(ns, "autoInstall", false)`.
 `LIFECYCLE_AUTO_INSTALL` is a hardcoded `false` constant — **never shipped
@@ -86,6 +88,13 @@ alert line. **No purchase, no flag write, no reset call** happens on that path.
    but the flag-setting and timeout code is in place now per the plan, so
    the stocks manager (when built) only needs to honor `liquidate` and publish
    the ack; lifecycle's side of the protocol needs no future changes.
+0.5. **`batchBuyAugs`** — the actual aug purchase, done now that money is about to
+   become worthless. Gathers every rep-unlocked, not-owned aug across joined
+   factions; buys the **priority tier** (`config/aug-priority.js`) first, then the
+   rest, each **most-expensive-first** by live price (the ~1.9× ramp compounds
+   against later buys, so dear ones go first), re-scanning after each purchase
+   (a buy can satisfy another aug's `getAugmentationPrereq`). Returns the count
+   bought (logged). NeuroFlux is excluded — it's the next step.
 1. **`dumpNeuroflux`** — finds the joined faction with the highest current
    `getFactionRep`, then loops `purchaseAugmentation(faction, 'NeuroFlux Governor')`
    until it returns `false` (rep or money exhausted).
@@ -136,23 +145,18 @@ Purely observational: reads `ns.getServer('w0r1d_d43m0n')` and reports
 ```
 
 Dashboard (`src/dashboard.js`) and the tail renderer (`src/lib/tail-ui.js`) each
-add a `lifecycle` manager row (pending augs, run age, stagnant time,
-auto-install state), plus two alert lines: "Recommend aug install: `<reason>`"
-when `recommendInstall` is set, and "BitNode completable — run
-utils/finish-bn.js `<nextBN>`" when `bnCompletable` is set.
+add a `lifecycle` manager row (augs ready, run age, no-unlock time, auto-install
+state), plus two alert lines: "Recommend aug install: `<reason>`" when
+`recommendInstall` is set, and "BitNode completable — run utils/finish-bn.js
+`<nextBN>`" when `bnCompletable` is set.
 
-## Cross-cutting: pilot's `lastAugPurchaseTs`
+## Cross-cutting: pilot's unlock signals
 
-`managers/pilot.js` now tracks `lastAugPurchaseTs` (a plain closure variable in
-`main`, set to `Date.now()` whenever `phaseAugs` reports
-`augsPurchasedThisTick > 0`) and publishes it in its status snapshot (port 7).
-This is the only change to pilot this build makes — a one-line addition to
-`buildStatus`'s return object, read by lifecycle's `computeDecision` as the
-`stagnantMs` signal. Like pilot's other per-process closures (ladder
-challenger/streak), it deliberately lives in memory rather than the flag port:
-a fresh pilot process after a reset correctly starts with "never purchased
-this run" (`null`), which lifecycle's fallback (`lastAugReset`) already
-handles correctly.
+`managers/pilot.js` publishes `unlockedUnbought` (count of rep-unlocked, unbought
+priority augs) and `lastAugUnlockTs` (when that set last grew) in its status
+snapshot (port 7). `computeDecision` reads both as the install trigger. Both derive
+from pilot's per-process state (a fresh pilot after a reset correctly starts with
+"nothing unlocked yet", and `computeDecision` falls back to `lastAugReset`).
 
 ## Companion scripts
 
@@ -224,7 +228,7 @@ type the BitNode number themselves, every time.
   and tuning one threshold would silently interact with the other's
   contribution. Two named, independently-tunable conditions read more clearly
   and debug more easily.
-- **Storing `lastAugPurchaseTs` in the flag port instead of pilot's status
+- **Storing pilot's unlock signals in the flag port instead of its status
   snapshot**: rejected — the arbitration protocol already establishes "publish
   in your own status snapshot, others read via `readStatus`" as the
   cross-manager convention (no new channel needed), and the flag port is
