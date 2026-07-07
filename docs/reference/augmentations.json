@@ -1,0 +1,2312 @@
+[
+  {
+    "name": "ADR-V1 Pheromone Gene",
+    "factions": [
+      "Tian Di Hui",
+      "The Syndicate",
+      "NWO",
+      "MegaCorp",
+      "Four Sigma"
+    ],
+    "price": 17500000.0,
+    "repReq": 3750.0,
+    "prereqs": [],
+    "mults": {
+      "charisma_exp": 1.05,
+      "faction_rep": 1.1,
+      "company_rep": 1.1
+    },
+    "special": null
+  },
+  {
+    "name": "ADR-V2 Pheromone Gene",
+    "factions": [
+      "Silhouette",
+      "Four Sigma",
+      "Bachman & Associates",
+      "Clarke Incorporated"
+    ],
+    "price": 550000000.0,
+    "repReq": 62500.0,
+    "prereqs": [],
+    "mults": {
+      "charisma": 1.1,
+      "faction_rep": 1.2,
+      "company_rep": 1.2
+    },
+    "special": null
+  },
+  {
+    "name": "Artificial Bio-neural Network Implant",
+    "factions": [
+      "BitRunners",
+      "Fulcrum Secret Technologies"
+    ],
+    "price": 3000000000.0,
+    "repReq": 275000.0,
+    "prereqs": [],
+    "mults": {
+      "hacking": 1.12,
+      "hacking_speed": 1.03,
+      "hacking_money": 1.15
+    },
+    "special": null
+  },
+  {
+    "name": "Artificial Synaptic Potentiation",
+    "factions": [
+      "The Black Hand",
+      "NiteSec"
+    ],
+    "price": 80000000.0,
+    "repReq": 6250.0,
+    "prereqs": [],
+    "mults": {
+      "hacking_exp": 1.05,
+      "hacking_speed": 1.02,
+      "hacking_chance": 1.05
+    },
+    "special": null
+  },
+  {
+    "name": "Augmented Targeting I",
+    "factions": [
+      "Slum Snakes",
+      "The Dark Army",
+      "The Syndicate",
+      "Sector-12",
+      "Ishima",
+      "OmniTek Incorporated",
+      "Kuai Gong International",
+      "Blade Industries"
+    ],
+    "price": 15000000.0,
+    "repReq": 5000.0,
+    "prereqs": [],
+    "mults": {
+      "dexterity": 1.1
+    },
+    "special": null
+  },
+  {
+    "name": "Augmented Targeting II",
+    "factions": [
+      "The Dark Army",
+      "The Syndicate",
+      "Sector-12",
+      "OmniTek Incorporated",
+      "Kuai Gong International",
+      "Blade Industries"
+    ],
+    "price": 42500000.0,
+    "repReq": 8750.0,
+    "prereqs": [
+      "Augmented Targeting I"
+    ],
+    "mults": {
+      "dexterity": 1.2
+    },
+    "special": null
+  },
+  {
+    "name": "Augmented Targeting III",
+    "factions": [
+      "The Dark Army",
+      "The Syndicate",
+      "OmniTek Incorporated",
+      "Kuai Gong International",
+      "Blade Industries",
+      "The Covenant"
+    ],
+    "price": 115000000.0,
+    "repReq": 27500.0,
+    "prereqs": [
+      "Augmented Targeting II",
+      "Augmented Targeting I"
+    ],
+    "mults": {
+      "dexterity": 1.3
+    },
+    "special": null
+  },
+  {
+    "name": "BLADE-51b Tesla Armor",
+    "factions": [
+      "Bladeburners"
+    ],
+    "price": 1375000000.0,
+    "repReq": 12500.0,
+    "prereqs": [],
+    "mults": {
+      "strength": 1.04,
+      "defense": 1.04,
+      "dexterity": 1.04,
+      "agility": 1.04,
+      "bladeburner_stamina_gain": 1.02,
+      "bladeburner_success_chance": 1.03
+    },
+    "special": "isSpecial (Bladeburner); base of the BLADE-51b Tesla Armor upgrade chain"
+  },
+  {
+    "name": "BLADE-51b Tesla Armor: Energy Shielding Upgrade",
+    "factions": [
+      "Bladeburners"
+    ],
+    "price": 5500000000.0,
+    "repReq": 21250.0,
+    "prereqs": [
+      "BLADE-51b Tesla Armor"
+    ],
+    "mults": {
+      "defense": 1.05,
+      "bladeburner_success_chance": 1.06
+    },
+    "special": "Special augmentation"
+  },
+  {
+    "name": "BLADE-51b Tesla Armor: IPU Upgrade",
+    "factions": [
+      "Bladeburners"
+    ],
+    "price": 1100000000.0,
+    "repReq": 15000.0,
+    "prereqs": [
+      "BLADE-51b Tesla Armor"
+    ],
+    "mults": {
+      "bladeburner_analysis": 1.15,
+      "bladeburner_success_chance": 1.02
+    },
+    "special": "Special augmentation"
+  },
+  {
+    "name": "BLADE-51b Tesla Armor: Omnibeam Upgrade",
+    "factions": [
+      "Bladeburners"
+    ],
+    "price": 27500000000.0,
+    "repReq": 62500.0,
+    "prereqs": [
+      "BLADE-51b Tesla Armor: Unibeam Upgrade"
+    ],
+    "mults": {
+      "bladeburner_success_chance": 1.1
+    },
+    "special": "Special augmentation"
+  },
+  {
+    "name": "BLADE-51b Tesla Armor: Power Cells Upgrade",
+    "factions": [
+      "Bladeburners"
+    ],
+    "price": 2750000000.0,
+    "repReq": 18750.0,
+    "prereqs": [
+      "BLADE-51b Tesla Armor"
+    ],
+    "mults": {
+      "bladeburner_max_stamina": 1.05,
+      "bladeburner_stamina_gain": 1.02,
+      "bladeburner_success_chance": 1.05
+    },
+    "special": "Special augmentation"
+  },
+  {
+    "name": "BLADE-51b Tesla Armor: Unibeam Upgrade",
+    "factions": [
+      "Bladeburners"
+    ],
+    "price": 16500000000.0,
+    "repReq": 31250.0,
+    "prereqs": [
+      "BLADE-51b Tesla Armor"
+    ],
+    "mults": {
+      "bladeburner_success_chance": 1.08
+    },
+    "special": "Special augmentation"
+  },
+  {
+    "name": "BigD's Big ... Brain",
+    "factions": [],
+    "price": Infinity,
+    "repReq": Infinity,
+    "prereqs": [],
+    "mults": {
+      "hacking": 2,
+      "hacking_exp": 2,
+      "hacking_speed": 2,
+      "hacking_money": 2,
+      "hacking_grow": 2,
+      "hacking_chance": 2,
+      "strength": 2,
+      "strength_exp": 2,
+      "defense": 2,
+      "defense_exp": 2,
+      "dexterity": 2,
+      "dexterity_exp": 2,
+      "agility": 2,
+      "agility_exp": 2,
+      "charisma": 2,
+      "charisma_exp": 2,
+      "faction_rep": 2,
+      "company_rep": 2,
+      "crime_success": 2,
+      "crime_money": 2,
+      "work_money": 2,
+      "hacknet_node_money": 2,
+      "hacknet_node_purchase_cost": 0.5,
+      "hacknet_node_ram_cost": 0.5,
+      "hacknet_node_core_cost": 0.5,
+      "hacknet_node_level_cost": 0.5,
+      "bladeburner_max_stamina": 2,
+      "bladeburner_stamina_gain": 2,
+      "bladeburner_analysis": 2,
+      "bladeburner_success_chance": 2
+    },
+    "special": "Special augmentation\nGrants starting money: 1e12\nGrants programs: bruteSsh, ftpCrack, relaySmtp, httpWorm, sqlInject, deepScan1, deepScan2, serverProfiler, autoLink, formulas"
+  },
+  {
+    "name": "Bionic Arms",
+    "factions": [
+      "Tetrads"
+    ],
+    "price": 275000000.0,
+    "repReq": 62500.0,
+    "prereqs": [],
+    "mults": {
+      "strength": 1.3,
+      "dexterity": 1.3
+    },
+    "special": null
+  },
+  {
+    "name": "Bionic Legs",
+    "factions": [
+      "Speakers For The Dead",
+      "The Syndicate",
+      "Kuai Gong International",
+      "OmniTek Incorporated",
+      "Blade Industries"
+    ],
+    "price": 375000000.0,
+    "repReq": 150000.0,
+    "prereqs": [],
+    "mults": {
+      "agility": 1.6
+    },
+    "special": null
+  },
+  {
+    "name": "Bionic Spine",
+    "factions": [
+      "Speakers For The Dead",
+      "The Syndicate",
+      "Kuai Gong International",
+      "OmniTek Incorporated",
+      "Blade Industries"
+    ],
+    "price": 125000000.0,
+    "repReq": 45000.0,
+    "prereqs": [],
+    "mults": {
+      "strength": 1.15,
+      "defense": 1.15,
+      "dexterity": 1.15,
+      "agility": 1.15
+    },
+    "special": null
+  },
+  {
+    "name": "BitRunners Neurolink",
+    "factions": [
+      "BitRunners"
+    ],
+    "price": 4375000000.0,
+    "repReq": 875000.0,
+    "prereqs": [],
+    "mults": {
+      "hacking": 1.15,
+      "hacking_exp": 1.2,
+      "hacking_chance": 1.1,
+      "hacking_speed": 1.05
+    },
+    "special": "Grants programs: FTPCrack.exe, relaySMTP.exe"
+  },
+  {
+    "name": "BitWire",
+    "factions": [
+      "CyberSec",
+      "NiteSec"
+    ],
+    "price": 10000000.0,
+    "repReq": 3750.0,
+    "prereqs": [],
+    "mults": {
+      "hacking": 1.05
+    },
+    "special": null
+  },
+  {
+    "name": "Blade's Runners",
+    "factions": [
+      "Bladeburners"
+    ],
+    "price": 8250000000.0,
+    "repReq": 20000.0,
+    "prereqs": [],
+    "mults": {
+      "agility": 1.05,
+      "bladeburner_max_stamina": 1.05,
+      "bladeburner_stamina_gain": 1.05
+    },
+    "special": "isSpecial (Bladeburner)"
+  },
+  {
+    "name": "BrachiBlades",
+    "factions": [
+      "The Syndicate"
+    ],
+    "price": 90000000.0,
+    "repReq": 12500.0,
+    "prereqs": [],
+    "mults": {
+      "strength": 1.15,
+      "defense": 1.15,
+      "crime_success": 1.1,
+      "crime_money": 1.15
+    },
+    "special": null
+  },
+  {
+    "name": "CRTX42-AA Gene Modification",
+    "factions": [
+      "NiteSec"
+    ],
+    "price": 225000000.0,
+    "repReq": 45000.0,
+    "prereqs": [],
+    "mults": {
+      "hacking": 1.08,
+      "hacking_exp": 1.15
+    },
+    "special": null
+  },
+  {
+    "name": "CashRoot Starter Kit",
+    "factions": [
+      "Sector-12"
+    ],
+    "price": 125000000.0,
+    "repReq": 12500.0,
+    "prereqs": [],
+    "mults": {},
+    "special": "Grants starting money: 1e6\nGrants programs: bruteSsh"
+  },
+  {
+    "name": "Combat Rib I",
+    "factions": [
+      "Slum Snakes",
+      "The Dark Army",
+      "The Syndicate",
+      "Volhaven",
+      "Ishima",
+      "OmniTek Incorporated",
+      "Kuai Gong International",
+      "Blade Industries"
+    ],
+    "price": 23750000.0,
+    "repReq": 7500.0,
+    "prereqs": [],
+    "mults": {
+      "strength": 1.1,
+      "defense": 1.1
+    },
+    "special": null
+  },
+  {
+    "name": "Combat Rib II",
+    "factions": [
+      "The Dark Army",
+      "The Syndicate",
+      "Volhaven",
+      "OmniTek Incorporated",
+      "Kuai Gong International",
+      "Blade Industries"
+    ],
+    "price": 65000000.0,
+    "repReq": 18750.0,
+    "prereqs": [
+      "Combat Rib I"
+    ],
+    "mults": {
+      "strength": 1.14,
+      "defense": 1.14
+    },
+    "special": null
+  },
+  {
+    "name": "Combat Rib III",
+    "factions": [
+      "The Dark Army",
+      "The Syndicate",
+      "OmniTek Incorporated",
+      "Kuai Gong International",
+      "Blade Industries",
+      "The Covenant"
+    ],
+    "price": 120000000.0,
+    "repReq": 35000.0,
+    "prereqs": [
+      "Combat Rib II",
+      "Combat Rib I"
+    ],
+    "mults": {
+      "strength": 1.18,
+      "defense": 1.18
+    },
+    "special": null
+  },
+  {
+    "name": "CordiARC Fusion Reactor",
+    "factions": [
+      "MegaCorp"
+    ],
+    "price": 5000000000.0,
+    "repReq": 1125000.0,
+    "prereqs": [],
+    "mults": {
+      "strength": 1.35,
+      "strength_exp": 1.35,
+      "defense": 1.35,
+      "defense_exp": 1.35,
+      "dexterity": 1.35,
+      "dexterity_exp": 1.35,
+      "agility": 1.35,
+      "agility_exp": 1.35
+    },
+    "special": null
+  },
+  {
+    "name": "Cranial Signal Processors - Gen I",
+    "factions": [
+      "CyberSec",
+      "NiteSec"
+    ],
+    "price": 70000000.0,
+    "repReq": 10000.0,
+    "prereqs": [],
+    "mults": {
+      "hacking": 1.05,
+      "hacking_speed": 1.01
+    },
+    "special": null
+  },
+  {
+    "name": "Cranial Signal Processors - Gen II",
+    "factions": [
+      "CyberSec",
+      "NiteSec"
+    ],
+    "price": 125000000.0,
+    "repReq": 18750.0,
+    "prereqs": [
+      "Cranial Signal Processors - Gen I"
+    ],
+    "mults": {
+      "hacking": 1.07,
+      "hacking_speed": 1.02,
+      "hacking_chance": 1.05
+    },
+    "special": null
+  },
+  {
+    "name": "Cranial Signal Processors - Gen III",
+    "factions": [
+      "NiteSec",
+      "The Black Hand",
+      "BitRunners"
+    ],
+    "price": 550000000.0,
+    "repReq": 50000.0,
+    "prereqs": [
+      "Cranial Signal Processors - Gen II",
+      "Cranial Signal Processors - Gen I"
+    ],
+    "mults": {
+      "hacking": 1.09,
+      "hacking_speed": 1.02,
+      "hacking_money": 1.15
+    },
+    "special": null
+  },
+  {
+    "name": "Cranial Signal Processors - Gen IV",
+    "factions": [
+      "The Black Hand",
+      "BitRunners"
+    ],
+    "price": 1100000000.0,
+    "repReq": 125000.0,
+    "prereqs": [
+      "Cranial Signal Processors - Gen III",
+      "Cranial Signal Processors - Gen II",
+      "Cranial Signal Processors - Gen I"
+    ],
+    "mults": {
+      "hacking_speed": 1.02,
+      "hacking_money": 1.2,
+      "hacking_grow": 1.25
+    },
+    "special": null
+  },
+  {
+    "name": "Cranial Signal Processors - Gen V",
+    "factions": [
+      "BitRunners"
+    ],
+    "price": 2250000000.0,
+    "repReq": 250000.0,
+    "prereqs": [
+      "Cranial Signal Processors - Gen IV",
+      "Cranial Signal Processors - Gen III",
+      "Cranial Signal Processors - Gen II",
+      "Cranial Signal Processors - Gen I"
+    ],
+    "mults": {
+      "hacking": 1.3,
+      "hacking_money": 1.25,
+      "hacking_grow": 1.75
+    },
+    "special": null
+  },
+  {
+    "name": "DataJack",
+    "factions": [
+      "BitRunners",
+      "The Black Hand",
+      "NiteSec",
+      "Chongqing",
+      "NewTokyo"
+    ],
+    "price": 450000000.0,
+    "repReq": 112500.0,
+    "prereqs": [],
+    "mults": {
+      "hacking_money": 1.25
+    },
+    "special": null
+  },
+  {
+    "name": "DermaForce Particle Barrier",
+    "factions": [
+      "Volhaven"
+    ],
+    "price": 50000000.0,
+    "repReq": 15000.0,
+    "prereqs": [],
+    "mults": {
+      "defense": 1.4,
+      "charisma": 1.05
+    },
+    "special": null
+  },
+  {
+    "name": "ECorp HVMind Implant",
+    "factions": [
+      "ECorp"
+    ],
+    "price": 5500000000.0,
+    "repReq": 1500000.0,
+    "prereqs": [],
+    "mults": {
+      "hacking_grow": 3
+    },
+    "special": null
+  },
+  {
+    "name": "EMS-4 Recombination",
+    "factions": [
+      "Bladeburners"
+    ],
+    "price": 275000000.0,
+    "repReq": 2500.0,
+    "prereqs": [],
+    "mults": {
+      "bladeburner_stamina_gain": 1.02,
+      "bladeburner_analysis": 1.05,
+      "bladeburner_success_chance": 1.03
+    },
+    "special": "Special augmentation"
+  },
+  {
+    "name": "Eloquence Module",
+    "factions": [
+      "Speakers For The Dead"
+    ],
+    "price": 250000000.0,
+    "repReq": 25000.0,
+    "prereqs": [],
+    "mults": {
+      "charisma": 1.05,
+      "crime_success": 1.1,
+      "work_money": 1.2
+    },
+    "special": null
+  },
+  {
+    "name": "Embedded Netburner Module",
+    "factions": [
+      "BitRunners",
+      "The Black Hand",
+      "NiteSec",
+      "ECorp",
+      "MegaCorp",
+      "Fulcrum Secret Technologies",
+      "NWO",
+      "Blade Industries"
+    ],
+    "price": 250000000.0,
+    "repReq": 15000.0,
+    "prereqs": [],
+    "mults": {
+      "hacking": 1.08
+    },
+    "special": null
+  },
+  {
+    "name": "Embedded Netburner Module Analyze Engine",
+    "factions": [
+      "ECorp",
+      "MegaCorp",
+      "Fulcrum Secret Technologies",
+      "NWO",
+      "Daedalus",
+      "The Covenant",
+      "Illuminati"
+    ],
+    "price": 6000000000.0,
+    "repReq": 625000.0,
+    "prereqs": [
+      "Embedded Netburner Module"
+    ],
+    "mults": {
+      "hacking_speed": 1.1
+    },
+    "special": null
+  },
+  {
+    "name": "Embedded Netburner Module Core Implant",
+    "factions": [
+      "BitRunners",
+      "The Black Hand",
+      "ECorp",
+      "MegaCorp",
+      "Fulcrum Secret Technologies",
+      "NWO",
+      "Blade Industries"
+    ],
+    "price": 2500000000.0,
+    "repReq": 175000.0,
+    "prereqs": [
+      "Embedded Netburner Module"
+    ],
+    "mults": {
+      "hacking": 1.07,
+      "hacking_exp": 1.07,
+      "hacking_speed": 1.03,
+      "hacking_money": 1.1,
+      "hacking_chance": 1.03
+    },
+    "special": null
+  },
+  {
+    "name": "Embedded Netburner Module Core V2 Upgrade",
+    "factions": [
+      "BitRunners",
+      "ECorp",
+      "MegaCorp",
+      "Fulcrum Secret Technologies",
+      "NWO",
+      "Blade Industries",
+      "OmniTek Incorporated",
+      "Kuai Gong International"
+    ],
+    "price": 4500000000.0,
+    "repReq": 1000000.0,
+    "prereqs": [
+      "Embedded Netburner Module Core Implant",
+      "Embedded Netburner Module"
+    ],
+    "mults": {
+      "hacking": 1.08,
+      "hacking_exp": 1.15,
+      "hacking_speed": 1.05,
+      "hacking_money": 1.3,
+      "hacking_chance": 1.05
+    },
+    "special": null
+  },
+  {
+    "name": "Embedded Netburner Module Core V3 Upgrade",
+    "factions": [
+      "ECorp",
+      "MegaCorp",
+      "Fulcrum Secret Technologies",
+      "NWO",
+      "Daedalus",
+      "The Covenant",
+      "Illuminati"
+    ],
+    "price": 7500000000.0,
+    "repReq": 1750000.0,
+    "prereqs": [
+      "Embedded Netburner Module Core V2 Upgrade",
+      "Embedded Netburner Module Core Implant",
+      "Embedded Netburner Module"
+    ],
+    "mults": {
+      "hacking": 1.1,
+      "hacking_exp": 1.25,
+      "hacking_speed": 1.05,
+      "hacking_money": 1.4,
+      "hacking_chance": 1.1
+    },
+    "special": null
+  },
+  {
+    "name": "Embedded Netburner Module Direct Memory Access Upgrade",
+    "factions": [
+      "ECorp",
+      "MegaCorp",
+      "Fulcrum Secret Technologies",
+      "NWO",
+      "Daedalus",
+      "The Covenant",
+      "Illuminati"
+    ],
+    "price": 7000000000.0,
+    "repReq": 1000000.0,
+    "prereqs": [
+      "Embedded Netburner Module"
+    ],
+    "mults": {
+      "hacking_money": 1.4,
+      "hacking_chance": 1.2
+    },
+    "special": null
+  },
+  {
+    "name": "Enhanced Myelin Sheathing",
+    "factions": [
+      "Fulcrum Secret Technologies",
+      "BitRunners",
+      "The Black Hand"
+    ],
+    "price": 1375000000.0,
+    "repReq": 100000.0,
+    "prereqs": [],
+    "mults": {
+      "hacking": 1.08,
+      "hacking_exp": 1.1,
+      "hacking_speed": 1.03
+    },
+    "special": null
+  },
+  {
+    "name": "Enhanced Social Interaction Implant",
+    "factions": [
+      "Bachman & Associates",
+      "NWO",
+      "Clarke Incorporated",
+      "OmniTek Incorporated",
+      "Four Sigma"
+    ],
+    "price": 1375000000.0,
+    "repReq": 375000.0,
+    "prereqs": [],
+    "mults": {
+      "charisma": 1.6,
+      "charisma_exp": 1.6
+    },
+    "special": null
+  },
+  {
+    "name": "EsperTech Bladeburner Eyewear",
+    "factions": [
+      "Bladeburners"
+    ],
+    "price": 165000000.0,
+    "repReq": 1250.0,
+    "prereqs": [],
+    "mults": {
+      "dexterity": 1.05,
+      "bladeburner_success_chance": 1.03
+    },
+    "special": "Special augmentation"
+  },
+  {
+    "name": "FocusWire",
+    "factions": [
+      "Bachman & Associates",
+      "Clarke Incorporated",
+      "Four Sigma",
+      "Kuai Gong International"
+    ],
+    "price": 900000000.0,
+    "repReq": 75000.0,
+    "prereqs": [],
+    "mults": {
+      "hacking_exp": 1.05,
+      "strength_exp": 1.05,
+      "defense_exp": 1.05,
+      "dexterity_exp": 1.05,
+      "agility_exp": 1.05,
+      "charisma_exp": 1.05,
+      "company_rep": 1.1,
+      "work_money": 1.2
+    },
+    "special": null
+  },
+  {
+    "name": "GOLEM Serum",
+    "factions": [
+      "Bladeburners"
+    ],
+    "price": 11000000000.0,
+    "repReq": 31250.0,
+    "prereqs": [],
+    "mults": {
+      "strength": 1.07,
+      "defense": 1.07,
+      "dexterity": 1.07,
+      "agility": 1.07,
+      "bladeburner_stamina_gain": 1.05
+    },
+    "special": "Special augmentation"
+  },
+  {
+    "name": "Glibness Enhancement",
+    "factions": [
+      "Tetrads",
+      "Bladeburners"
+    ],
+    "price": 2500000000.0,
+    "repReq": 40500.0,
+    "prereqs": [],
+    "mults": {
+      "charisma_exp": 1.2,
+      "company_rep": 1.1
+    },
+    "special": null
+  },
+  {
+    "name": "Golden Tongue Module",
+    "factions": [
+      "Speakers For The Dead"
+    ],
+    "price": 125000000.0,
+    "repReq": 125000.0,
+    "prereqs": [],
+    "mults": {
+      "charisma": 1.1,
+      "charisma_exp": 1.3
+    },
+    "special": null
+  },
+  {
+    "name": "Graphene Bionic Arms Upgrade",
+    "factions": [
+      "The Dark Army"
+    ],
+    "price": 3750000000.0,
+    "repReq": 500000.0,
+    "prereqs": [
+      "Bionic Arms"
+    ],
+    "mults": {
+      "strength": 1.85,
+      "dexterity": 1.85
+    },
+    "special": null
+  },
+  {
+    "name": "Graphene Bionic Legs Upgrade",
+    "factions": [
+      "MegaCorp",
+      "ECorp",
+      "Fulcrum Secret Technologies"
+    ],
+    "price": 4500000000.0,
+    "repReq": 750000.0,
+    "prereqs": [
+      "Bionic Legs"
+    ],
+    "mults": {
+      "agility": 2.5
+    },
+    "special": null
+  },
+  {
+    "name": "Graphene Bionic Spine Upgrade",
+    "factions": [
+      "Fulcrum Secret Technologies",
+      "ECorp"
+    ],
+    "price": 6000000000.0,
+    "repReq": 1625000.0,
+    "prereqs": [
+      "Bionic Spine"
+    ],
+    "mults": {
+      "strength": 1.6,
+      "defense": 1.6,
+      "dexterity": 1.6,
+      "agility": 1.6
+    },
+    "special": null
+  },
+  {
+    "name": "Graphene Bone Lacings",
+    "factions": [
+      "Fulcrum Secret Technologies",
+      "The Covenant"
+    ],
+    "price": 4250000000.0,
+    "repReq": 1125000.0,
+    "prereqs": [],
+    "mults": {
+      "strength": 1.7,
+      "defense": 1.7
+    },
+    "special": null
+  },
+  {
+    "name": "Graphene BrachiBlades Upgrade",
+    "factions": [
+      "Speakers For The Dead"
+    ],
+    "price": 2500000000.0,
+    "repReq": 225000.0,
+    "prereqs": [
+      "BrachiBlades"
+    ],
+    "mults": {
+      "strength": 1.4,
+      "defense": 1.4,
+      "crime_success": 1.1,
+      "crime_money": 1.3
+    },
+    "special": null
+  },
+  {
+    "name": "Hacknet Node CPU Architecture Neural-Upload",
+    "factions": [
+      "Netburners"
+    ],
+    "price": 11000000.0,
+    "repReq": 3750.0,
+    "prereqs": [],
+    "mults": {
+      "hacknet_node_money": 1.15,
+      "hacknet_node_purchase_cost": 0.85
+    },
+    "special": null
+  },
+  {
+    "name": "Hacknet Node Cache Architecture Neural-Upload",
+    "factions": [
+      "Netburners"
+    ],
+    "price": 5500000.0,
+    "repReq": 2500.0,
+    "prereqs": [],
+    "mults": {
+      "hacknet_node_money": 1.1,
+      "hacknet_node_level_cost": 0.85
+    },
+    "special": null
+  },
+  {
+    "name": "Hacknet Node Core Direct-Neural Interface",
+    "factions": [
+      "Netburners"
+    ],
+    "price": 60000000.0,
+    "repReq": 12500.0,
+    "prereqs": [],
+    "mults": {
+      "hacknet_node_money": 1.45
+    },
+    "special": null
+  },
+  {
+    "name": "Hacknet Node Kernel Direct-Neural Interface",
+    "factions": [
+      "Netburners"
+    ],
+    "price": 40000000.0,
+    "repReq": 7500.0,
+    "prereqs": [],
+    "mults": {
+      "hacknet_node_money": 1.25
+    },
+    "special": null
+  },
+  {
+    "name": "Hacknet Node NIC Architecture Neural-Upload",
+    "factions": [
+      "Netburners"
+    ],
+    "price": 4500000.0,
+    "repReq": 1875.0,
+    "prereqs": [],
+    "mults": {
+      "hacknet_node_money": 1.1,
+      "hacknet_node_purchase_cost": 0.9
+    },
+    "special": null
+  },
+  {
+    "name": "HemoRecirculator",
+    "factions": [
+      "Tetrads",
+      "The Dark Army",
+      "The Syndicate"
+    ],
+    "price": 45000000.0,
+    "repReq": 10000.0,
+    "prereqs": [],
+    "mults": {
+      "strength": 1.08,
+      "defense": 1.08,
+      "dexterity": 1.08,
+      "agility": 1.08,
+      "charisma": 1.08
+    },
+    "special": null
+  },
+  {
+    "name": "Hydroflame Left Arm",
+    "factions": [
+      "NWO"
+    ],
+    "price": 2500000000000.0,
+    "repReq": 1250000.0,
+    "prereqs": [],
+    "mults": {
+      "strength": 2.8
+    },
+    "special": null
+  },
+  {
+    "name": "HyperSight Corneal Implant",
+    "factions": [
+      "Blade Industries",
+      "Kuai Gong International"
+    ],
+    "price": 2750000000.0,
+    "repReq": 150000.0,
+    "prereqs": [],
+    "mults": {
+      "hacking_speed": 1.03,
+      "hacking_money": 1.1,
+      "dexterity": 1.4,
+      "charisma": 1.03
+    },
+    "special": null
+  },
+  {
+    "name": "Hyperion Plasma Cannon V1",
+    "factions": [
+      "Bladeburners"
+    ],
+    "price": 2750000000.0,
+    "repReq": 12500.0,
+    "prereqs": [],
+    "mults": {
+      "bladeburner_success_chance": 1.06
+    },
+    "special": "Special augmentation"
+  },
+  {
+    "name": "Hyperion Plasma Cannon V2",
+    "factions": [
+      "Bladeburners"
+    ],
+    "price": 5500000000.0,
+    "repReq": 25000.0,
+    "prereqs": [
+      "Hyperion Plasma Cannon V1"
+    ],
+    "mults": {
+      "bladeburner_success_chance": 1.08
+    },
+    "special": "Special augmentation"
+  },
+  {
+    "name": "I.N.T.E.R.L.I.N.K.E.D",
+    "factions": [
+      "Bladeburners"
+    ],
+    "price": 5500000000.0,
+    "repReq": 25000.0,
+    "prereqs": [],
+    "mults": {
+      "strength_exp": 1.05,
+      "defense_exp": 1.05,
+      "dexterity_exp": 1.05,
+      "agility_exp": 1.05,
+      "bladeburner_max_stamina": 1.1
+    },
+    "special": "Special augmentation"
+  },
+  {
+    "name": "INFRARET Enhancement",
+    "factions": [
+      "Ishima"
+    ],
+    "price": 30000000.0,
+    "repReq": 7500.0,
+    "prereqs": [],
+    "mults": {
+      "dexterity": 1.1,
+      "crime_success": 1.25,
+      "crime_money": 1.1
+    },
+    "special": null
+  },
+  {
+    "name": "LuminCloaking-V1 Skin Implant",
+    "factions": [
+      "Slum Snakes",
+      "Tetrads"
+    ],
+    "price": 5000000.0,
+    "repReq": 1500.0,
+    "prereqs": [],
+    "mults": {
+      "agility": 1.05,
+      "charisma": 1.03,
+      "crime_money": 1.1
+    },
+    "special": null
+  },
+  {
+    "name": "LuminCloaking-V2 Skin Implant",
+    "factions": [
+      "Slum Snakes",
+      "Tetrads"
+    ],
+    "price": 30000000.0,
+    "repReq": 5000.0,
+    "prereqs": [
+      "LuminCloaking-V1 Skin Implant"
+    ],
+    "mults": {
+      "defense": 1.1,
+      "agility": 1.1,
+      "charisma_exp": 1.1,
+      "crime_money": 1.25
+    },
+    "special": null
+  },
+  {
+    "name": "Magnetism Amplifier",
+    "factions": [
+      "The Black Hand",
+      "The Dark Army"
+    ],
+    "price": 250000000.0,
+    "repReq": 15000.0,
+    "prereqs": [],
+    "mults": {
+      "charisma": 1.05,
+      "company_rep": 1.1
+    },
+    "special": null
+  },
+  {
+    "name": "NEMEAN Subdermal Weave",
+    "factions": [
+      "The Syndicate",
+      "Fulcrum Secret Technologies",
+      "Illuminati",
+      "Daedalus",
+      "The Covenant"
+    ],
+    "price": 3250000000.0,
+    "repReq": 875000.0,
+    "prereqs": [],
+    "mults": {
+      "defense": 2.2
+    },
+    "special": null
+  },
+  {
+    "name": "Nanofiber Weave",
+    "factions": [
+      "The Dark Army",
+      "The Syndicate",
+      "OmniTek Incorporated",
+      "Blade Industries",
+      "Tian Di Hui",
+      "Speakers For The Dead",
+      "Fulcrum Secret Technologies"
+    ],
+    "price": 125000000.0,
+    "repReq": 37500.0,
+    "prereqs": [],
+    "mults": {
+      "strength": 1.2,
+      "defense": 1.2,
+      "charisma": 1.05
+    },
+    "special": null
+  },
+  {
+    "name": "Neotra",
+    "factions": [
+      "Blade Industries"
+    ],
+    "price": 2875000000.0,
+    "repReq": 562500.0,
+    "prereqs": [],
+    "mults": {
+      "strength": 1.55,
+      "defense": 1.55,
+      "charisma": 1.55
+    },
+    "special": null
+  },
+  {
+    "name": "Neural Accelerator",
+    "factions": [
+      "BitRunners"
+    ],
+    "price": 1750000000.0,
+    "repReq": 200000.0,
+    "prereqs": [],
+    "mults": {
+      "hacking": 1.1,
+      "hacking_exp": 1.15,
+      "hacking_money": 1.2
+    },
+    "special": null
+  },
+  {
+    "name": "Neural Wit Amplifier",
+    "factions": [
+      "Slum Snakes",
+      "BitRunners"
+    ],
+    "price": 10000000.0,
+    "repReq": 5000.0,
+    "prereqs": [],
+    "mults": {
+      "charisma": 1.03,
+      "charisma_exp": 1.05,
+      "company_rep": 1.05
+    },
+    "special": null
+  },
+  {
+    "name": "Neural-Retention Enhancement",
+    "factions": [
+      "NiteSec"
+    ],
+    "price": 250000000.0,
+    "repReq": 20000.0,
+    "prereqs": [],
+    "mults": {
+      "hacking_exp": 1.25
+    },
+    "special": null
+  },
+  {
+    "name": "Neuralstimulator",
+    "factions": [
+      "The Black Hand",
+      "Chongqing",
+      "Sector-12",
+      "NewTokyo",
+      "Aevum",
+      "Ishima",
+      "Volhaven",
+      "Bachman & Associates",
+      "Clarke Incorporated",
+      "Four Sigma"
+    ],
+    "price": 3000000000.0,
+    "repReq": 50000.0,
+    "prereqs": [],
+    "mults": {
+      "hacking_exp": 1.12,
+      "hacking_speed": 1.02,
+      "hacking_chance": 1.1
+    },
+    "special": null
+  },
+  {
+    "name": "Neuregen Gene Modification",
+    "factions": [
+      "Chongqing"
+    ],
+    "price": 375000000.0,
+    "repReq": 37500.0,
+    "prereqs": [],
+    "mults": {
+      "hacking_exp": 1.4
+    },
+    "special": null
+  },
+  {
+    "name": "NeuroFlux Governor",
+    "factions": [],
+    "price": 750000,
+    "repReq": 500,
+    "prereqs": [],
+    "mults": {
+      "hacking": 1.01,
+      "hacking_exp": 1.01,
+      "hacking_speed": 1.01,
+      "hacking_money": 1.01,
+      "hacking_grow": 1.01,
+      "hacking_chance": 1.01,
+      "strength": 1.01,
+      "strength_exp": 1.01,
+      "defense": 1.01,
+      "defense_exp": 1.01,
+      "dexterity": 1.01,
+      "dexterity_exp": 1.01,
+      "agility": 1.01,
+      "agility_exp": 1.01,
+      "charisma": 1.01,
+      "charisma_exp": 1.01,
+      "crime_success": 1.01,
+      "crime_money": 1.01,
+      "faction_rep": 1.01,
+      "company_rep": 1.01,
+      "hacknet_node_money": 1.01,
+      "work_money": 1.01,
+      "work_rep": 1.01,
+      "work": 1.01
+    },
+    "special": "Infinitely repeatable (+1% per level, modified by CONSTANTS.Donations)"
+  },
+  {
+    "name": "Neuronal Densification",
+    "factions": [
+      "Clarke Incorporated"
+    ],
+    "price": 1375000000.0,
+    "repReq": 187500.0,
+    "prereqs": [],
+    "mults": {
+      "hacking": 1.15,
+      "hacking_exp": 1.1,
+      "hacking_speed": 1.03
+    },
+    "special": null
+  },
+  {
+    "name": "Neuroreceptor Management Implant",
+    "factions": [
+      "Tian Di Hui"
+    ],
+    "price": 550000000.0,
+    "repReq": 75000.0,
+    "prereqs": [],
+    "mults": {},
+    "special": "Removes the penalty for not being focused while working (faction/company work at full rate without focus). No stat multipliers."
+  },
+  {
+    "name": "Neurotrainer I",
+    "factions": [
+      "CyberSec",
+      "Aevum"
+    ],
+    "price": 4000000.0,
+    "repReq": 1000.0,
+    "prereqs": [],
+    "mults": {
+      "hacking_exp": 1.1,
+      "strength_exp": 1.1,
+      "defense_exp": 1.1,
+      "dexterity_exp": 1.1,
+      "agility_exp": 1.1,
+      "charisma_exp": 1.1
+    },
+    "special": null
+  },
+  {
+    "name": "Neurotrainer II",
+    "factions": [
+      "BitRunners",
+      "NiteSec"
+    ],
+    "price": 45000000.0,
+    "repReq": 10000.0,
+    "prereqs": [],
+    "mults": {
+      "hacking_exp": 1.15,
+      "strength_exp": 1.15,
+      "defense_exp": 1.15,
+      "dexterity_exp": 1.15,
+      "agility_exp": 1.15,
+      "charisma_exp": 1.15
+    },
+    "special": null
+  },
+  {
+    "name": "Neurotrainer III",
+    "factions": [
+      "NWO",
+      "Four Sigma"
+    ],
+    "price": 130000000.0,
+    "repReq": 25000.0,
+    "prereqs": [],
+    "mults": {
+      "hacking_exp": 1.2,
+      "strength_exp": 1.2,
+      "defense_exp": 1.2,
+      "dexterity_exp": 1.2,
+      "agility_exp": 1.2,
+      "charisma_exp": 1.2
+    },
+    "special": null
+  },
+  {
+    "name": "Nuoptimal Nootropic Injector Implant",
+    "factions": [
+      "Tian Di Hui",
+      "Volhaven",
+      "NewTokyo",
+      "Chongqing",
+      "Clarke Incorporated",
+      "Four Sigma",
+      "Bachman & Associates"
+    ],
+    "price": 20000000.0,
+    "repReq": 5000.0,
+    "prereqs": [],
+    "mults": {
+      "charisma": 1.03,
+      "company_rep": 1.2
+    },
+    "special": null
+  },
+  {
+    "name": "NutriGen Implant",
+    "factions": [
+      "NewTokyo"
+    ],
+    "price": 2500000.0,
+    "repReq": 6250.0,
+    "prereqs": [],
+    "mults": {
+      "strength_exp": 1.2,
+      "defense_exp": 1.2,
+      "dexterity_exp": 1.2,
+      "agility_exp": 1.2
+    },
+    "special": null
+  },
+  {
+    "name": "ORION-MKIV Shoulder",
+    "factions": [
+      "Bladeburners"
+    ],
+    "price": 550000000.0,
+    "repReq": 6250.0,
+    "prereqs": [],
+    "mults": {
+      "strength": 1.05,
+      "defense": 1.05,
+      "dexterity": 1.05,
+      "bladeburner_success_chance": 1.04
+    },
+    "special": "Special augmentation"
+  },
+  {
+    "name": "OmniTek InfoLoad",
+    "factions": [
+      "OmniTek Incorporated"
+    ],
+    "price": 2875000000.0,
+    "repReq": 625000.0,
+    "prereqs": [],
+    "mults": {
+      "hacking": 1.2,
+      "hacking_exp": 1.25
+    },
+    "special": null
+  },
+  {
+    "name": "PC Direct-Neural Interface",
+    "factions": [
+      "Four Sigma",
+      "OmniTek Incorporated",
+      "ECorp",
+      "Blade Industries"
+    ],
+    "price": 3750000000.0,
+    "repReq": 375000.0,
+    "prereqs": [],
+    "mults": {
+      "hacking": 1.08,
+      "company_rep": 1.3
+    },
+    "special": null
+  },
+  {
+    "name": "PC Direct-Neural Interface NeuroNet Injector",
+    "factions": [
+      "Fulcrum Secret Technologies"
+    ],
+    "price": 7500000000.0,
+    "repReq": 1500000.0,
+    "prereqs": [
+      "PC Direct-Neural Interface"
+    ],
+    "mults": {
+      "hacking": 1.1,
+      "hacking_speed": 1.05,
+      "company_rep": 2
+    },
+    "special": null
+  },
+  {
+    "name": "PC Direct-Neural Interface Optimization Submodule",
+    "factions": [
+      "Fulcrum Secret Technologies",
+      "ECorp",
+      "Blade Industries"
+    ],
+    "price": 4500000000.0,
+    "repReq": 500000.0,
+    "prereqs": [
+      "PC Direct-Neural Interface"
+    ],
+    "mults": {
+      "hacking": 1.1,
+      "company_rep": 1.75
+    },
+    "special": null
+  },
+  {
+    "name": "PCMatrix",
+    "factions": [
+      "Aevum"
+    ],
+    "price": 2000000000.0,
+    "repReq": 100000.0,
+    "prereqs": [],
+    "mults": {
+      "charisma": 1.0777,
+      "charisma_exp": 1.0777,
+      "faction_rep": 1.0777,
+      "company_rep": 1.0777,
+      "crime_success": 1.0777,
+      "crime_money": 1.0777,
+      "work_money": 1.777
+    },
+    "special": "Grants programs: deepScan1, autoLink"
+  },
+  {
+    "name": "Photosynthetic Cells",
+    "factions": [
+      "Kuai Gong International"
+    ],
+    "price": 2750000000.0,
+    "repReq": 562500.0,
+    "prereqs": [],
+    "mults": {
+      "strength": 1.4,
+      "defense": 1.4,
+      "agility": 1.4,
+      "charisma": 1.2
+    },
+    "special": null
+  },
+  {
+    "name": "Power Recirculation Core",
+    "factions": [
+      "Tetrads",
+      "The Dark Army",
+      "The Syndicate",
+      "NWO"
+    ],
+    "price": 180000000.0,
+    "repReq": 25000.0,
+    "prereqs": [],
+    "mults": {
+      "hacking": 1.05,
+      "hacking_exp": 1.1,
+      "strength": 1.05,
+      "strength_exp": 1.1,
+      "defense": 1.05,
+      "defense_exp": 1.1,
+      "dexterity": 1.05,
+      "dexterity_exp": 1.1,
+      "agility": 1.05,
+      "agility_exp": 1.1,
+      "charisma": 1.05,
+      "charisma_exp": 1.1
+    },
+    "special": null
+  },
+  {
+    "name": "QLink",
+    "factions": [
+      "Illuminati"
+    ],
+    "price": 25000000000000.0,
+    "repReq": 1875000.0,
+    "prereqs": [],
+    "mults": {
+      "hacking": 1.75,
+      "hacking_speed": 2,
+      "hacking_chance": 2.5,
+      "hacking_money": 4
+    },
+    "special": null
+  },
+  {
+    "name": "SPTN-97 Gene Modification",
+    "factions": [
+      "The Covenant"
+    ],
+    "price": 4875000000.0,
+    "repReq": 1250000.0,
+    "prereqs": [],
+    "mults": {
+      "hacking": 1.15,
+      "strength": 1.75,
+      "defense": 1.75,
+      "dexterity": 1.75,
+      "agility": 1.75
+    },
+    "special": null
+  },
+  {
+    "name": "SmartJaw",
+    "factions": [
+      "Bachman & Associates"
+    ],
+    "price": 2750000000.0,
+    "repReq": 375000.0,
+    "prereqs": [],
+    "mults": {
+      "charisma": 1.5,
+      "charisma_exp": 1.5,
+      "faction_rep": 1.25,
+      "company_rep": 1.25
+    },
+    "special": null
+  },
+  {
+    "name": "SmartSonar Implant",
+    "factions": [
+      "Slum Snakes"
+    ],
+    "price": 75000000.0,
+    "repReq": 22500.0,
+    "prereqs": [],
+    "mults": {
+      "dexterity": 1.1,
+      "dexterity_exp": 1.15,
+      "crime_money": 1.25
+    },
+    "special": null
+  },
+  {
+    "name": "SoA - Beauty of Aphrodite",
+    "factions": [
+      "Shadows of Anarchy"
+    ],
+    "price": 1000000.0,
+    "repReq": 10000.0,
+    "prereqs": [],
+    "mults": {
+      "charisma": 1.1
+    },
+    "special": "Special augmentation"
+  },
+  {
+    "name": "SoA - Chaos of Dionysus",
+    "factions": [
+      "Shadows of Anarchy"
+    ],
+    "price": 1000000.0,
+    "repReq": 10000.0,
+    "prereqs": [],
+    "mults": {},
+    "special": "Special augmentation"
+  },
+  {
+    "name": "SoA - Flood of Poseidon",
+    "factions": [
+      "Shadows of Anarchy"
+    ],
+    "price": 1000000.0,
+    "repReq": 10000.0,
+    "prereqs": [],
+    "mults": {},
+    "special": "Special augmentation"
+  },
+  {
+    "name": "SoA - Hunt of Artemis",
+    "factions": [
+      "Shadows of Anarchy"
+    ],
+    "price": 1000000.0,
+    "repReq": 10000.0,
+    "prereqs": [],
+    "mults": {},
+    "special": "Special augmentation"
+  },
+  {
+    "name": "SoA - Knowledge of Apollo",
+    "factions": [
+      "Shadows of Anarchy"
+    ],
+    "price": 1000000.0,
+    "repReq": 10000.0,
+    "prereqs": [],
+    "mults": {},
+    "special": "Special augmentation"
+  },
+  {
+    "name": "SoA - Might of Ares",
+    "factions": [
+      "Shadows of Anarchy"
+    ],
+    "price": 1000000.0,
+    "repReq": 10000.0,
+    "prereqs": [],
+    "mults": {},
+    "special": "Special augmentation"
+  },
+  {
+    "name": "SoA - Trickery of Hermes",
+    "factions": [
+      "Shadows of Anarchy"
+    ],
+    "price": 1000000.0,
+    "repReq": 10000.0,
+    "prereqs": [],
+    "mults": {},
+    "special": "Special augmentation"
+  },
+  {
+    "name": "SoA - Wisdom of Athena",
+    "factions": [
+      "Shadows of Anarchy"
+    ],
+    "price": 1000000.0,
+    "repReq": 10000.0,
+    "prereqs": [],
+    "mults": {},
+    "special": "Special augmentation"
+  },
+  {
+    "name": "SoA - phyzical WKS harmonizer",
+    "factions": [
+      "Shadows of Anarchy"
+    ],
+    "price": 1000000.0,
+    "repReq": 10000.0,
+    "prereqs": [],
+    "mults": {},
+    "special": "isSpecial (Shadows of Anarchy infiltration): makes infiltration easier/more productive \u2014 longer timers, higher rewards, reduced damage."
+  },
+  {
+    "name": "Social Dynamics Processor",
+    "factions": [
+      "MegaCorp",
+      "ECorp",
+      "OmniTek Incorporated"
+    ],
+    "price": 1200000000.0,
+    "repReq": 225000.0,
+    "prereqs": [],
+    "mults": {
+      "charisma": 1.1,
+      "company_rep": 1.3
+    },
+    "special": null
+  },
+  {
+    "name": "Social Negotiation Assistant (S.N.A)",
+    "factions": [
+      "Tian Di Hui"
+    ],
+    "price": 30000000.0,
+    "repReq": 6250.0,
+    "prereqs": [],
+    "mults": {
+      "charisma_exp": 1.15,
+      "faction_rep": 1.15,
+      "company_rep": 1.15,
+      "work_money": 1.1
+    },
+    "special": null
+  },
+  {
+    "name": "Speech Enhancement",
+    "factions": [
+      "Tian Di Hui",
+      "Speakers For The Dead",
+      "Four Sigma",
+      "Kuai Gong International",
+      "Clarke Incorporated",
+      "Bachman & Associates"
+    ],
+    "price": 12500000.0,
+    "repReq": 2500.0,
+    "prereqs": [],
+    "mults": {
+      "charisma": 1.1,
+      "company_rep": 1.1
+    },
+    "special": null
+  },
+  {
+    "name": "Speech Processor Implant",
+    "factions": [
+      "Tian Di Hui",
+      "Chongqing",
+      "Sector-12",
+      "NewTokyo",
+      "Aevum",
+      "Ishima",
+      "Volhaven",
+      "Silhouette"
+    ],
+    "price": 50000000.0,
+    "repReq": 7500.0,
+    "prereqs": [],
+    "mults": {
+      "charisma": 1.2
+    },
+    "special": null
+  },
+  {
+    "name": "Stanek's Gift - Awakening",
+    "factions": [
+      "ChurchOfTheMachineGod"
+    ],
+    "price": 0.0,
+    "repReq": 1000000.0,
+    "prereqs": [
+      "Stanek's Gift - Genesis"
+    ],
+    "mults": {},
+    "special": "Special augmentation\nStanek's Gift augmentation Stanek's Gift aug: applies a small PENALTY multiplier (~0.9\u20131.0x, value shown as 'withGift / withoutGift' in source) to nearly all stats \u2014 the tradeoff for the Stanek grid. Not a normal-buy aug."
+  },
+  {
+    "name": "Stanek's Gift - Genesis",
+    "factions": [
+      "ChurchOfTheMachineGod"
+    ],
+    "price": 0.0,
+    "repReq": 0.0,
+    "prereqs": [],
+    "mults": {
+      "hacking": 0.9,
+      "hacking_exp": 0.9,
+      "hacking_speed": 0.9,
+      "hacking_money": 0.9,
+      "hacking_grow": 0.9,
+      "hacking_chance": 0.9,
+      "strength": 0.9,
+      "strength_exp": 0.9,
+      "defense": 0.9,
+      "defense_exp": 0.9,
+      "dexterity": 0.9,
+      "dexterity_exp": 0.9,
+      "agility": 0.9,
+      "agility_exp": 0.9,
+      "charisma": 0.9,
+      "charisma_exp": 0.9,
+      "faction_rep": 0.9,
+      "company_rep": 0.9,
+      "crime_success": 0.9,
+      "crime_money": 0.9,
+      "work_money": 0.9,
+      "hacknet_node_money": 0.9,
+      "hacknet_node_purchase_cost": 1.1,
+      "hacknet_node_ram_cost": 1.1,
+      "hacknet_node_core_cost": 1.1,
+      "hacknet_node_level_cost": 1.1
+    },
+    "special": "Special augmentation\nStanek's Gift augmentation"
+  },
+  {
+    "name": "Stanek's Gift - Serenity",
+    "factions": [
+      "ChurchOfTheMachineGod"
+    ],
+    "price": 0.0,
+    "repReq": 100000000.0,
+    "prereqs": [
+      "Stanek's Gift - Awakening",
+      "Stanek's Gift - Genesis"
+    ],
+    "mults": {},
+    "special": "Special augmentation\nStanek's Gift augmentation Stanek's Gift aug: applies a small PENALTY multiplier (~0.9\u20131.0x, value shown as 'withGift / withoutGift' in source) to nearly all stats \u2014 the tradeoff for the Stanek grid. Not a normal-buy aug."
+  },
+  {
+    "name": "Synaptic Enhancement Implant",
+    "factions": [
+      "CyberSec",
+      "Aevum"
+    ],
+    "price": 7500000.0,
+    "repReq": 2000.0,
+    "prereqs": [],
+    "mults": {
+      "hacking_speed": 1.03
+    },
+    "special": null
+  },
+  {
+    "name": "Synfibril Muscle",
+    "factions": [
+      "Kuai Gong International",
+      "Fulcrum Secret Technologies",
+      "Speakers For The Dead",
+      "NWO",
+      "The Covenant",
+      "Daedalus",
+      "Illuminati",
+      "Blade Industries"
+    ],
+    "price": 1125000000.0,
+    "repReq": 437500.0,
+    "prereqs": [],
+    "mults": {
+      "strength": 1.3,
+      "defense": 1.3
+    },
+    "special": null
+  },
+  {
+    "name": "Synthetic Heart",
+    "factions": [
+      "Kuai Gong International",
+      "Fulcrum Secret Technologies",
+      "Speakers For The Dead",
+      "NWO",
+      "The Covenant",
+      "Daedalus",
+      "Illuminati"
+    ],
+    "price": 2875000000.0,
+    "repReq": 750000.0,
+    "prereqs": [],
+    "mults": {
+      "strength": 1.5,
+      "agility": 1.5,
+      "charisma": 1.3
+    },
+    "special": null
+  },
+  {
+    "name": "TITN-41 Gene-Modification Injection",
+    "factions": [
+      "Silhouette"
+    ],
+    "price": 190000000.0,
+    "repReq": 25000.0,
+    "prereqs": [],
+    "mults": {
+      "charisma": 1.15,
+      "charisma_exp": 1.15
+    },
+    "special": null
+  },
+  {
+    "name": "The B00ts of Perseus",
+    "factions": [],
+    "price": 1000000.0,
+    "repReq": 10000.0,
+    "prereqs": [
+      "The W1ngs of Icarus"
+    ],
+    "mults": {
+      "dexterity": 1.06,
+      "charisma": 1.06
+    },
+    "special": "Special augmentation"
+  },
+  {
+    "name": "The B1ade of Solomonoff",
+    "factions": [],
+    "price": 1000000.0,
+    "repReq": 10000.0,
+    "prereqs": [
+      "The L4w of Bayes"
+    ],
+    "mults": {
+      "hacking": 1.1,
+      "charisma": 1.1,
+      "company_rep": 1.1
+    },
+    "special": "Special augmentation"
+  },
+  {
+    "name": "The Black Hand",
+    "factions": [
+      "The Black Hand"
+    ],
+    "price": 550000000.0,
+    "repReq": 100000.0,
+    "prereqs": [],
+    "mults": {
+      "hacking": 1.1,
+      "hacking_speed": 1.02,
+      "hacking_money": 1.1,
+      "strength": 1.15,
+      "dexterity": 1.15
+    },
+    "special": null
+  },
+  {
+    "name": "The Blade's Simulacrum",
+    "factions": [
+      "Bladeburners"
+    ],
+    "price": 150000000000.0,
+    "repReq": 1250.0,
+    "prereqs": [],
+    "mults": {},
+    "special": "Special augmentation"
+  },
+  {
+    "name": "The H4mmer of Daedalus",
+    "factions": [],
+    "price": 1000000.0,
+    "repReq": 10000.0,
+    "prereqs": [
+      "The B00ts of Perseus"
+    ],
+    "mults": {
+      "strength": 1.1,
+      "charisma": 1.07
+    },
+    "special": "Special augmentation"
+  },
+  {
+    "name": "The Illustrated Primer",
+    "factions": [
+      "The Dark Army",
+      "The Syndicate"
+    ],
+    "price": 3375000000.0,
+    "repReq": 187500.0,
+    "prereqs": [],
+    "mults": {
+      "charisma": 1.1,
+      "charisma_exp": 1.4
+    },
+    "special": null
+  },
+  {
+    "name": "The L4w of Bayes",
+    "factions": [],
+    "price": 1000000.0,
+    "repReq": 10000.0,
+    "prereqs": [
+      "The St4ff of Asclepius"
+    ],
+    "mults": {
+      "charisma": 1.09,
+      "company_rep": 1.05
+    },
+    "special": "Special augmentation"
+  },
+  {
+    "name": "The Red Pill",
+    "factions": [
+      "Daedalus"
+    ],
+    "price": 0.0,
+    "repReq": 2500000.0,
+    "prereqs": [],
+    "mults": {},
+    "special": "Special augmentation"
+  },
+  {
+    "name": "The Shadow's Simulacrum",
+    "factions": [
+      "The Syndicate",
+      "The Dark Army",
+      "Speakers For The Dead"
+    ],
+    "price": 400000000.0,
+    "repReq": 37500.0,
+    "prereqs": [],
+    "mults": {
+      "faction_rep": 1.15,
+      "company_rep": 1.15
+    },
+    "special": null
+  },
+  {
+    "name": "The St4ff of Asclepius",
+    "factions": [],
+    "price": 1000000.0,
+    "repReq": 10000.0,
+    "prereqs": [
+      "The H4mmer of Daedalus"
+    ],
+    "mults": {
+      "defense": 1.1,
+      "charisma_exp": 1.1
+    },
+    "special": "Special augmentation"
+  },
+  {
+    "name": "The W1ngs of Icarus",
+    "factions": [],
+    "price": 1000000.0,
+    "repReq": 10000.0,
+    "prereqs": [],
+    "mults": {
+      "agility": 1.1,
+      "charisma": 1.05
+    },
+    "special": "Special augmentation"
+  },
+  {
+    "name": "Unstable Circadian Modulator",
+    "factions": [
+      "Speakers for the Dead"
+    ],
+    "price": 5000000000.0,
+    "repReq": 362500.0,
+    "prereqs": [],
+    "mults": {},
+    "special": "Time-based: grants ONE randomly-rotating bonus set (changes hourly) from 7 possibilities (hacking, hacking-skill, combat, charisma, hacknet, work/rep, or crime). Effect is unpredictable \u2014 not a reliable priority pick."
+  },
+  {
+    "name": "Vangelis Virus",
+    "factions": [
+      "Bladeburners"
+    ],
+    "price": 2750000000.0,
+    "repReq": 18750.0,
+    "prereqs": [],
+    "mults": {
+      "dexterity_exp": 1.1,
+      "charisma_exp": 1.1,
+      "bladeburner_analysis": 1.1,
+      "bladeburner_success_chance": 1.04
+    },
+    "special": "Special augmentation"
+  },
+  {
+    "name": "Vangelis Virus 3.0",
+    "factions": [
+      "Bladeburners"
+    ],
+    "price": 11000000000.0,
+    "repReq": 37500.0,
+    "prereqs": [
+      "Vangelis Virus"
+    ],
+    "mults": {
+      "defense_exp": 1.1,
+      "dexterity_exp": 1.1,
+      "charisma_exp": 1.1,
+      "bladeburner_analysis": 1.15,
+      "bladeburner_success_chance": 1.05
+    },
+    "special": "Special augmentation"
+  },
+  {
+    "name": "Wired Reflexes",
+    "factions": [
+      "Tian Di Hui",
+      "Slum Snakes",
+      "Sector-12",
+      "Volhaven",
+      "Aevum",
+      "Ishima",
+      "The Syndicate",
+      "The Dark Army",
+      "Speakers For The Dead"
+    ],
+    "price": 2500000.0,
+    "repReq": 1250.0,
+    "prereqs": [],
+    "mults": {
+      "dexterity": 1.05,
+      "agility": 1.05
+    },
+    "special": null
+  },
+  {
+    "name": "Xanipher",
+    "factions": [
+      "NWO"
+    ],
+    "price": 4250000000.0,
+    "repReq": 875000.0,
+    "prereqs": [],
+    "mults": {
+      "hacking": 1.2,
+      "hacking_exp": 1.15,
+      "strength": 1.2,
+      "strength_exp": 1.15,
+      "defense": 1.2,
+      "defense_exp": 1.15,
+      "dexterity": 1.2,
+      "dexterity_exp": 1.15,
+      "agility": 1.2,
+      "agility_exp": 1.15,
+      "charisma": 1.2,
+      "charisma_exp": 1.15
+    },
+    "special": null
+  },
+  {
+    "name": "Z.O.\u00cb.",
+    "factions": [],
+    "price": 1000000000000.0,
+    "repReq": Infinity,
+    "prereqs": [],
+    "mults": {},
+    "special": "Special augmentation"
+  },
+  {
+    "name": "nextSENS Gene Modification",
+    "factions": [
+      "Clarke Incorporated"
+    ],
+    "price": 1925000000.0,
+    "repReq": 437500.0,
+    "prereqs": [],
+    "mults": {
+      "hacking": 1.2,
+      "strength": 1.2,
+      "defense": 1.2,
+      "dexterity": 1.2,
+      "agility": 1.2,
+      "charisma": 1.2
+    },
+    "special": null
+  },
+  {
+    "name": "violet Congruity Implant",
+    "factions": [],
+    "price": 50000000000000.0,
+    "repReq": Infinity,
+    "prereqs": [],
+    "mults": {},
+    "special": "Removes Entropy virus"
+  }
+]
