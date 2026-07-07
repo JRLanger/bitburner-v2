@@ -12,6 +12,7 @@
  * AUG_BASE_PRICE: base (un-inflated) price per aug. Pilot uses it as a cheap proxy
  * for the money-side of ETA ordering, avoiding a live getAugmentationPrice call
  * (2.5 GB) in its hot path. Lifecycle's actual purchase uses LIVE prices.
+ * (BigD's Big ... Brain is priced Infinity in-game — effectively never affordable.)
  *
  * Pure data, 0-GB import. HAND-EDITABLE to promote/demote augs or tune per-BitNode
  * (the single global list is the documented starting point).
@@ -94,7 +95,7 @@ export const AUG_BASE_PRICE = {
     "Augmented Targeting I": 1.5e+07,
     "Augmented Targeting II": 4.25e+07,
     "Augmented Targeting III": 1.15e+08,
-    "BigD's Big ... Brain": inf,
+    "BigD's Big ... Brain": Infinity,
     "Bionic Arms": 2.75e+08,
     "Bionic Legs": 3.75e+08,
     "Bionic Spine": 1.25e+08,
