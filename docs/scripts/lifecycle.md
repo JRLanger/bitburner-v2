@@ -44,21 +44,24 @@ sleep 60s
 **Install-decision model (`computeDecision`).** Computes each tick:
 
 Because pilot no longer buys augs mid-run (arbitration.md Decision 5 — the batch
-buy happens in this checklist *after* the decision), the trigger is UNLOCK
-progress, not purchases:
+buy happens in this checklist *after* the decision), the trigger is ACQUISITION
+progress: an aug is "ready" only when its rep is met **and** the money to buy it is
+saved. (Rep alone is wrong — forming a gang unlocks nearly every aug's rep at once,
+which would fire an install before the money to buy them exists.)
 
-- `readyCount` = pilot's `unlockedUnbought` (priority augs rep-unlocked but not yet
-  bought, read off pilot's status snapshot, port 7).
+- `readyCount` = pilot's `acquirableNow` (priority augs the reset batch could afford
+  right now, simulating the ~1.9× ramp; rep met AND money saved), port 7.
 - `runMs` = now − `getResetInfo().lastAugReset`.
-- `stagnantMs` = now − pilot's `lastAugUnlockTs` (when the unlocked set last grew);
-  falls back to `lastAugReset` if pilot hasn't reported an unlock yet.
+- `stagnantMs` = now − pilot's `lastAcquireTs` (when `acquirableNow` last grew — via
+  grinding rep OR saving money); falls back to `lastAugReset` if nothing yet.
 
 Fires when EITHER:
 - `readyCount >= LIFECYCLE_MIN_AUGS` (8) **and** `stagnantMs >= LIFECYCLE_STAGNANT_MS`
-  (30 min) — enough augs are ready AND rep progress has plateaued (no new unlock),
-  so waiting further gains nothing; **or**
+  (30 min) — enough augs are affordable AND no new aug has become acquirable for a
+  while, i.e. progress on the binding constraint (money or rep, whichever is greater)
+  has plateaued; **or**
 - `readyCount >= 1` **and** `runMs >= LIFECYCLE_MAX_RUN_MS` (12 h) — the run has
-  gone on long enough that even a single ready aug is worth banking.
+  gone on long enough that even a single affordable aug is worth banking.
 
 **Autonomy guard.** `armed = LIFECYCLE_AUTO_INSTALL || getFlag(ns, "autoInstall", false)`.
 `LIFECYCLE_AUTO_INSTALL` is a hardcoded `false` constant — **never shipped
@@ -150,13 +153,14 @@ state), plus two alert lines: "Recommend aug install: `<reason>`" when
 `recommendInstall` is set, and "BitNode completable — run utils/finish-bn.js
 `<nextBN>`" when `bnCompletable` is set.
 
-## Cross-cutting: pilot's unlock signals
+## Cross-cutting: pilot's acquisition signals
 
-`managers/pilot.js` publishes `unlockedUnbought` (count of rep-unlocked, unbought
-priority augs) and `lastAugUnlockTs` (when that set last grew) in its status
-snapshot (port 7). `computeDecision` reads both as the install trigger. Both derive
-from pilot's per-process state (a fresh pilot after a reset correctly starts with
-"nothing unlocked yet", and `computeDecision` falls back to `lastAugReset`).
+`managers/pilot.js` publishes `acquirableNow` (count of priority augs the reset
+batch could afford now — rep met AND money saved, via a ramp simulation) and
+`lastAcquireTs` (when that count last grew) in its status snapshot (port 7).
+`computeDecision` reads both as the install trigger. Both derive from pilot's
+per-process state (a fresh pilot after a reset correctly starts with "nothing
+acquirable yet", and `computeDecision` falls back to `lastAugReset`).
 
 ## Companion scripts
 

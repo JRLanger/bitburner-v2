@@ -146,12 +146,15 @@ every later purchase while the queued aug provides nothing. Consequences:
    augs > rest) while simulating the price ramp against the budget; then
    PURCHASE the chosen set most-expensive-first (purchase order only affects
    total cost; descending is optimal). Then NF-dump the remainder.
-3. **Lifecycle's stagnation signal changes from purchases to UNLOCKS** — with
-   batching, `lastAugPurchaseTs` never moves mid-run. New decision inputs:
-   `unlockedUnbought` count (pilot reports it) and `lastAugUnlockTs` (pilot
-   reports when a new aug first becomes rep-unlocked). Install when
-   unlockedUnbought >= LIFECYCLE_MIN_AUGS and no NEW unlock for
-   LIFECYCLE_STAGNANT_MS — staleness of progress, not of purchases.
+3. **Lifecycle's stagnation signal is ACQUISITION progress, not purchases or bare
+   rep-unlocks** — with batching, `lastAugPurchaseTs` never moves mid-run, and
+   rep-unlock alone is wrong (a gang unlocks nearly every aug's rep at once, before
+   the money to buy them is saved). Pilot reports `acquirableNow` (priority augs the
+   reset batch could AFFORD now — rep met AND money saved, via a ~1.9× ramp
+   simulation) and `lastAcquireTs` (when that count last grew, from rep OR money).
+   Install when `acquirableNow >= LIFECYCLE_MIN_AUGS` and no growth for
+   `LIFECYCLE_STAGNANT_MS` — the count plateaus only when progress on the binding
+   constraint (money or rep, whichever is greater) stalls.
 
 ## Exceptions to the manager pattern (record once, apply everywhere)
 

@@ -87,11 +87,22 @@ factions joined manually or before pilot ever ran.
 **Phase 4 — augmentations (`phaseAugs`, REPORT-ONLY).** Pilot does **not buy augs
 during the run** (arbitration.md Decision 5): purchased augs are inert until
 install, so buying early only pays the ~1.9× price ramp for no benefit — lifecycle
-batch-buys the whole set at reset. Phase 4 just reports which **priority-tier** augs
-(`config/aug-priority.js` — category Hacking/Special or a `faction_rep` bonus) are
-rep-unlocked but unbought (`unlockedUnbought`), which drives lifecycle's install
-decision (`lastAugUnlockTs`), plus the affordable NeuroFlux level count
-(`nfAffordableLevels`; NF is lifecycle's pre-reset dump, never bought here).
+batch-buys the whole set at reset. Phase 4 reports two counts over the **priority
+tier** (`config/aug-priority.js` — category Hacking/Special or a `faction_rep`
+bonus):
+- `repUnlocked` — augs whose rep requirement is met (grinding progress);
+- `acquirableNow` — how many of those the reset batch could actually **afford right
+  now**, via `countAcquirable`, which simulates the batch (most-expensive-first,
+  each purchase multiplying remaining prices by `AUG_PRICE_RAMP` = 1.9) against
+  current money using base prices from `aug-priority.js`.
+
+`acquirableNow` is the real "ready" metric and drives lifecycle's install decision:
+an aug isn't ready until **both** its rep is met **and** the money to buy it exists,
+so the count grows from rep grinding OR money saving and stalls only when the
+binding constraint stalls. This is what stops a gang's rep windfall (which unlocks
+nearly every aug at once) from firing an install before the money to buy them has
+been saved. Also reports `nfAffordableLevels` (NF is lifecycle's pre-reset dump,
+never bought here).
 
 **Phase 5 — player-activity arbitration ladder (`phaseWork`).** Implements
 `choosePlayerActivity()` from `docs/plans/arbitration.md`: an ordered array of

@@ -90,7 +90,7 @@ Compute each tick, publish in status, and act only when threshold met:
 > sits between freeze and NF dump: buys the priority tier (`config/aug-priority.js`
 > — category-based, not getAugmentationStats) then the rest, each most-expensive-first
 > by live price, re-scanning for prereqs. The install decision now keys off pilot's
-> `unlockedUnbought` / `lastAugUnlockTs` (unlock staleness), not `lastAugPurchaseTs`.
+> `acquirableNow` / `lastAcquireTs` (affordable-AND-unlocked staleness), not `lastAugPurchaseTs`.
 > See `docs/scripts/lifecycle.md` for the shipped behavior.
 
 0. **Liquidate & freeze spending:** set runtime flags `liquidate: true` (stock

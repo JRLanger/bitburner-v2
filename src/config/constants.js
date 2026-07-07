@@ -578,6 +578,12 @@ export const BACKDOOR_TARGETS = [
  *  not purchased here — pilot only reports affordable-level count). */
 export const PILOT_NEUROFLUX = "NeuroFlux Governor";
 
+/** The game multiplies EVERY remaining aug's price by this each time an aug is
+ *  purchased (CONSTANTS.MultipleAugMultiplier). Pilot simulates it to estimate how
+ *  many priority augs the reset batch could actually afford right now (the
+ *  "acquirable" count that drives lifecycle's install decision). */
+export const AUG_PRICE_RAMP = 1.9;
+
 // ── arbitration (docs/plans/arbitration.md) ────────────────────────────────
 //
 // Cross-manager conventions recorded once here so every mechanic manager (gang,

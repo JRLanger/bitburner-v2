@@ -92,14 +92,17 @@ function singularityAvailable(ns) {
 // ── Install-decision model ──────────────────────────────────────────────────
 
 /**
- * readyCount = PRIORITY augs rep-unlocked but not yet bought (pilot's status:
- * `unlockedUnbought`; augs are bought in the batch step AFTER this decision, so the
- * trigger is unlock progress, not purchases). runMs = time since last aug reset.
- * stagnantMs = time since the unlocked set last grew (pilot's `lastAugUnlockTs`).
+ * readyCount = PRIORITY augs the reset batch could AFFORD right now (pilot's
+ * `acquirableNow`: rep met AND money saved, simulating the batch price ramp). Using
+ * affordability — not just rep — is what stops a gang's rep windfall from firing the
+ * install while the money to buy those augs hasn't been saved yet. runMs = time since
+ * last aug reset. stagnantMs = time since readyCount last grew (pilot's
+ * `lastAcquireTs`), which grows from EITHER grinding rep OR saving money, so it
+ * plateaus only when progress on the binding constraint (whichever is greater) stalls.
  *
  * Install when:
  *   readyCount >= LIFECYCLE_MIN_AUGS AND stagnantMs >= LIFECYCLE_STAGNANT_MS
- *     (rep progress has plateaued — no point waiting further), OR
+ *     (no new aug became acquirable for a while — money/rep progress plateaued), OR
  *   readyCount >= 1 AND runMs >= LIFECYCLE_MAX_RUN_MS
  *     (run has gone on long enough that SOME progress beats none).
  */
@@ -107,23 +110,18 @@ function computeDecision(ns) {
     const now = Date.now();
     const runMs = now - ns.getResetInfo().lastAugReset;
 
-    // Pilot no longer buys augs mid-run (arbitration.md Decision 5), so the trigger
-    // is UNLOCK progress, not purchases: how many PRIORITY augs are rep-unlocked and
-    // waiting to be batch-bought, and when that set last grew (lastAugUnlockTs).
     const pilotStatus = readStatus(ns, STATUS_PORT_PILOT);
-    const readyCount = pilotStatus?.unlockedUnbought ?? 0;
-    const lastUnlockTs = pilotStatus?.lastAugUnlockTs ?? null;
-    // No unlock recorded reads as "stagnant since the run started" — conservative.
-    const stagnantMs = now - (lastUnlockTs ?? ns.getResetInfo().lastAugReset);
+    const readyCount = pilotStatus?.acquirableNow ?? 0;
+    const lastAcquireTs = pilotStatus?.lastAcquireTs ?? null;
+    // No acquisition recorded reads as "stagnant since the run started" — conservative.
+    const stagnantMs = now - (lastAcquireTs ?? ns.getResetInfo().lastAugReset);
 
-    // Plateau: enough augs are ready AND no NEW unlock for a while (rep progress has
-    // stalled → nothing more to gain by waiting). Backstop: max run age with ≥1 ready.
     const stagnantTrigger = readyCount >= LIFECYCLE_MIN_AUGS && stagnantMs >= LIFECYCLE_STAGNANT_MS;
     const runLengthTrigger = readyCount >= 1 && runMs >= LIFECYCLE_MAX_RUN_MS;
 
     let reason = null;
-    if (stagnantTrigger) reason = `${readyCount} augs ready, no new unlock ${Math.round(stagnantMs / 60000)}m`;
-    else if (runLengthTrigger) reason = `${readyCount} aug(s) ready, run age ${Math.round(runMs / 3600000)}h`;
+    if (stagnantTrigger) reason = `${readyCount} augs affordable, no progress ${Math.round(stagnantMs / 60000)}m`;
+    else if (runLengthTrigger) reason = `${readyCount} aug(s) affordable, run age ${Math.round(runMs / 3600000)}h`;
 
     return {
         readyCount, runMs, stagnantMs,

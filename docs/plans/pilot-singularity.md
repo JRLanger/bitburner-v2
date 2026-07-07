@@ -135,7 +135,7 @@ main:
 
 > **IMPLEMENTED 2026-07-06 (arbitration.md Decision 5 + ETA plan).** Purchased augs
 > are inert until installed, so all aug buying moved to lifecycle's pre-reset batch.
-> Pilot's phase 4 is now REPORT-ONLY (publishes `unlockedUnbought` + `lastAugUnlockTs`,
+> Pilot's phase 4 is now REPORT-ONLY (publishes `acquirableNow` + `lastAcquireTs`,
 > buys nothing — not even prereqs; lifecycle's batch orders prereqs itself). Faction
 > work grinds toward the lowest-ETA priority aug (`config/aug-priority.js`). See
 > `docs/scripts/pilot.md` for the shipped behavior; the continuous-buy design below

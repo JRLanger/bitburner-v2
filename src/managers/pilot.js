@@ -33,6 +33,7 @@ import {
     FOCUS_STABLE_TICKS,
     STATUS_PORT_PSERVER,
     PILOT_INCOME_EMA_ALPHA,
+    AUG_PRICE_RAMP,
 } from "/config/constants.js";
 import { PRIORITY_AUGS, AUG_BASE_PRICE } from "/config/aug-priority.js";
 import { publishStatus, readStatus } from "/lib/status.js";
@@ -81,9 +82,11 @@ export async function main(ns) {
         // Empirical rep/sec fallback when Formulas.exe isn't owned (single estimate,
         // updated whenever pilot is working a faction).
         rep: { estimate: null, lastRep: null, lastFaction: null, lastTs: null },
-        // Stagnation signal for lifecycle: when the count of rep-unlocked-but-unbought
-        // priority augs last grew (batching means purchases no longer move mid-run).
-        unlock: { knownCount: 0, lastUnlockTs: Date.now() },
+        // Stagnation signal for lifecycle: when the count of ACQUIRABLE priority augs
+        // (rep met AND affordable under the batch ramp) last grew. Growth comes from
+        // unlocking rep OR saving money, so this stalls on whichever is binding —
+        // fixing the "gang unlocks everything at once" false trigger.
+        acquire: { knownCount: 0, lastAcquireTs: Date.now() },
     };
 
     while (true) {
@@ -100,8 +103,8 @@ export async function main(ns) {
         phaseTor(ns, snapshot);
         await phaseBackdoors(ns, snapshot);
         phaseFactions(ns, snapshot);
-        phaseAugs(ns, snapshot);            // report-only: computes unlockedUnbought
-        trackUnlocks(state, snapshot);      // stamp lastUnlockTs when the set grows
+        phaseAugs(ns, snapshot);            // report-only: computes acquirableNow
+        trackAcquire(state, snapshot);      // stamp lastAcquireTs when the set grows
         const workState = phaseWork(ns, snapshot, state);
 
         const status = buildStatus(ns, snapshot, workState, state);
@@ -134,14 +137,15 @@ function sampleIncome(ns, state) {
     inc.lastTs = now;
 }
 
-/** Stamp state.unlock.lastUnlockTs whenever the number of rep-unlocked-but-unbought
- *  priority augs grows — the "new unlock" event lifecycle's install decision uses as
- *  its stagnation signal (see docs/plans/reset-lifecycle.md). */
-function trackUnlocks(state, snap) {
-    const count = snap.unlockedUnbought?.length ?? 0;
-    if (count > state.unlock.knownCount) state.unlock.lastUnlockTs = Date.now();
-    state.unlock.knownCount = count;
-    snap.lastAugUnlockTs = state.unlock.lastUnlockTs;
+/** Stamp state.acquire.lastAcquireTs whenever the ACQUIRABLE priority-aug count
+ *  grows (rep met AND affordable under the ramp) — lifecycle's install stagnation
+ *  signal. Growth from either rep or money, so it stalls on the binding constraint.
+ *  A DROP (money spent elsewhere) doesn't reset the clock — only progress does. */
+function trackAcquire(state, snap) {
+    const count = snap.acquirableNow ?? 0;
+    if (count > state.acquire.knownCount) state.acquire.lastAcquireTs = Date.now();
+    state.acquire.knownCount = count;
+    snap.lastAcquireTs = state.acquire.lastAcquireTs;
 }
 
 /** True if ns.singularity exists and at least one cheap call succeeds. Cheap sanity
@@ -284,14 +288,17 @@ function phaseFactions(ns, snap) {
 // ── Phase 4: augmentations (REPORT-ONLY) ─────────────────────────────────────
 
 /** Pilot no longer buys augs during the run (arbitration.md Decision 5): purchased
- *  augs are inert until install, so buying early only pays the ~1.9x price ramp for
- *  no benefit. lifecycle batch-buys the whole set at reset. Phase 4 just REPORTS
- *  which PRIORITY augs are rep-unlocked-but-unbought (drives lifecycle's install
- *  decision via lastAugUnlockTs) and how many NeuroFlux levels are affordable. */
+ *  augs are inert until install. Phase 4 REPORTS two counts over the priority tier:
+ *   - repUnlocked: augs whose rep requirement is met (grinding progress);
+ *   - acquirableNow: how many of those the reset batch could actually AFFORD right
+ *     now, simulating the ~1.9x per-purchase price ramp against current money.
+ *  acquirableNow is the real "ready" metric — an aug isn't ready until BOTH its rep
+ *  is met AND the money exists, so this grows from rep grinding OR money saving and
+ *  stalls on whichever is binding (fixing the gang-unlocks-everything false trigger). */
 function phaseAugs(ns, snap) {
     const sing = ns.singularity;
     const ownedOrPurchased = new Set(sing.getOwnedAugmentations(true));
-    const unlocked = [];
+    const repMet = [];
     const seen = new Set();
 
     for (const faction of snap.joinedFactions) {
@@ -301,15 +308,32 @@ function phaseAugs(ns, snap) {
             if (ownedOrPurchased.has(aug) || seen.has(aug)) continue;
             if (rep >= sing.getAugmentationRepReq(aug)) {
                 seen.add(aug);
-                unlocked.push(aug);
+                repMet.push(aug);
             }
         }
     }
 
-    snap.unlockedUnbought = unlocked;
+    snap.repUnlocked = repMet.length;
+    snap.acquirableNow = countAcquirable(repMet, snap.money);
     // NeuroFlux affordable-level count: informational only (lifecycle owns the
     // actual dump, since buying early wastes the per-purchase inflation).
     snap.nfAffordableLevels = countAffordableNeuroflux(sing, snap.money);
+}
+
+/** How many of `augs` (rep-met priority aug names) the reset batch could afford now.
+ *  Mirrors lifecycle's batch buy: most-expensive-first, each purchase multiplies the
+ *  remaining augs' prices by AUG_PRICE_RAMP. Uses base prices (aug-priority.js) — a
+ *  cheap proxy; the live buy re-reads real prices. Keeps scanning past a too-dear aug
+ *  since a cheaper one may still fit at the current ramp level. */
+function countAcquirable(augs, money) {
+    const sorted = [...augs].sort((a, b) => (AUG_BASE_PRICE[b] ?? 0) - (AUG_BASE_PRICE[a] ?? 0));
+    let cash = money;
+    let bought = 0;
+    for (const aug of sorted) {
+        const cost = (AUG_BASE_PRICE[aug] ?? 0) * Math.pow(AUG_PRICE_RAMP, bought);
+        if (cost <= cash) { cash -= cost; bought++; }
+    }
+    return bought;
 }
 
 function countAffordableNeuroflux(sing, money) {
@@ -686,16 +710,17 @@ function buildStatus(ns, snap, workState, state) {
         focusOwner: workState.focusOwner,
         augs: {
             purchased: sing.getOwnedAugmentations(true).length,
-            // Priority augs rep-unlocked but not yet bought (lifecycle buys these at reset).
-            unlockedUnbought: snap.unlockedUnbought?.length ?? 0,
+            repUnlocked: snap.repUnlocked ?? 0,   // priority augs with rep met
+            acquirableNow: snap.acquirableNow ?? 0, // ...and affordable under the ramp
             grindTarget: target ? { aug: target.aug, faction: target.faction, etaSec: Math.round(target.eta) } : null,
         },
         nfAffordableLevels: snap.nfAffordableLevels ?? 0,
         incomePerSec: state.income.ema ?? 0,
-        // Read by lifecycle.js (docs/plans/reset-lifecycle.md): count of unlocked-but-
-        // unbought priority augs + when that set last grew, its install stagnation signal.
-        unlockedUnbought: snap.unlockedUnbought?.length ?? 0,
-        lastAugUnlockTs: snap.lastAugUnlockTs ?? null,
+        // Read by lifecycle.js (docs/plans/reset-lifecycle.md): how many priority augs
+        // the reset batch could afford now (rep met AND money saved), + when that count
+        // last grew — its install stagnation signal (stalls on money OR rep, whichever binds).
+        acquirableNow: snap.acquirableNow ?? 0,
+        lastAcquireTs: snap.lastAcquireTs ?? null,
         action: workState.overridden ? "player-controlled — pilot standing by" : `ladder: ${workState.focusOwner}`,
     };
 }
@@ -706,7 +731,7 @@ function renderStatus(ns, s) {
     const W = 52;
     ns.print(`╔═ PILOT ═ ${new Date().toLocaleTimeString()} ${"═".repeat(Math.max(0, W - 19))}`);
     ns.print(`║ Programs ${s.programs.owned}/${s.programs.total}  |  Factions joined ${s.factions}`);
-    ns.print(`║ Backdoors ${s.backdoors.done.length}/${s.backdoors.done.length + s.backdoors.pending.length}  |  Augs installed ${s.augs.purchased}  |  unlocked-unbought ${s.augs.unlockedUnbought}`);
+    ns.print(`║ Backdoors ${s.backdoors.done.length}/${s.backdoors.done.length + s.backdoors.pending.length}  |  Augs installed ${s.augs.purchased}  |  ready ${s.augs.acquirableNow}/${s.augs.repUnlocked} (afford/rep)`);
     ns.print(`╠${"═".repeat(W)}`);
     ns.print(`║ Ladder: ${s.focusOwner ?? "—"}${s.working ? `  (${JSON.stringify(s.working)})` : ""}`);
     if (s.augs.grindTarget) {
