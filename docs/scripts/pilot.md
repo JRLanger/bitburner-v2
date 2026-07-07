@@ -76,13 +76,26 @@ if a hop or the backdoor itself fails. Does **at most one backdoor per tick** �
 keeps ticks short and each install individually observable in the tail/dashboard.
 
 **Phase 3 — faction invites (`phaseFactions`).** `checkFactionInvitations()`;
-auto-joins any invite whose faction is (a) not on `PILOT_JOIN_BLOCKLIST` and (b)
-returns an empty `getFactionEnemies()` list. Anything else (city factions,
-Silhouette, etc. — mutually-exclusive factions always have enemies) is left
-un-joined and surfaced in `pendingInvites` for the player to decide manually;
-the dashboard/tail render it as an alert line. Joined-faction membership comes
-from `ns.getPlayer().factions` — the authoritative list, which also captures
-factions joined manually or before pilot ever ran.
+auto-joins any invite with an empty `getFactionEnemies()` list (CyberSec, the
+hacking groups, …) and not on `PILOT_JOIN_BLOCKLIST`.
+
+**City factions** (`Sector-12, Aevum, Volhaven, Chongqing, New Tokyo, Ishima` —
+mutually exclusive, faction name == city name) are auto-managed: pilot joins one
+when its invite is present **and** no rival is already joined **and** it still
+offers a wanted priority aug (`cityHasWantedAug`). `pursueCityFaction` travels
+(`travelToCity`, gated on affording the $200k fare and on not interrupting manual
+work) to the highest-wanted-aug candidate city to trigger the invite, then **stays
+put** once in a candidate city (waiting on the invite / money requirement) so it
+never oscillates between rivals. Per `getFactionEnemies`, a run can join one
+compatible group — {Sector-12, Aevum}, {Chongqing, New Tokyo, Ishima}, or Volhaven
+solo; across runs, once a city's wanted augs are owned it drops out and a rival
+becomes eligible, so the cities are exhausted one group per run. The pursued city
+shows as `cityTarget` in status. (Note: while abroad, the Sector-12 gym used by the
+crime row is unreachable, so that row falls back to committing crime — harmless.)
+
+Non-city enemy-having factions (Silhouette, etc.) are still left un-joined and
+surfaced in `pendingInvites` for the player. Joined-faction membership comes from
+`ns.getPlayer().factions` — the authoritative list.
 
 **Phase 4 — augmentations (`phaseAugs`, REPORT-ONLY).** Pilot does **not buy augs
 during the run** (arbitration.md Decision 5): purchased augs are inert until

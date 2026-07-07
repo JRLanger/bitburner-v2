@@ -352,7 +352,7 @@ export const HACKNET_MANAGER_RAM = 8.20; // measured in-game (mem managers/hackn
  *  at SF4.2 this becomes ~249 GB, at SF4.1 ~981 GB — below SF4.3, pilot must be
  *  split into per-phase one-shot scripts (the documented RAM fallback in
  *  docs/plans/pilot-singularity.md) and this constant re-measured. */
-export const PILOT_MANAGER_RAM = 77.65; // STALE — re-measure: ETA change dropped aug-buying calls (getAugmentationPrice/Prereq, purchaseAugmentation ~12.5GB) and added getMoneySources + formulas.work.factionGains + fileExists. `mem managers/pilot.js`
+export const PILOT_MANAGER_RAM = 77.65; // STALE — re-measure: dropped aug-buying calls (~12.5GB) and added getMoneySources, formulas.work.factionGains, fileExists, travelToCity (city-faction join). `mem managers/pilot.js`
 /** Estimated (not yet measured in-game — re-measure with `mem managers/lifecycle.js`
  *  once played) from the type defs' documented per-call RAM costs: ~27.75 GB at
  *  SF4.3 (×1 multiplier). Like pilot, only viable as a single script at SF4.3 —
@@ -641,11 +641,13 @@ export const BOOSTER_SCRIPT = "/booster.js";
 
 /** lifecycle's own loop sleep, ms — decision state changes slowly. */
 export const LIFECYCLE_LOOP_SLEEP = 60_000;
-/** Recommend-only by default: lifecycle publishes recommendInstall + reason but
- *  never calls installAugmentations itself until the player arms this (or the
- *  runtime `autoInstall` flag — see utils/auto-install-{on,off}.js). NEVER ship
- *  with this true. */
-export const LIFECYCLE_AUTO_INSTALL = false;
+/** Armed by default: lifecycle runs the pre-reset checklist and installs
+ *  automatically once the decision thresholds are met. Set false (or run
+ *  utils/auto-install-off.js, which clears the runtime `autoInstall` flag) to fall
+ *  back to recommend-only. NOTE: BitNode completion (destroyW0r1dD43m0n) is a
+ *  SEPARATE, still player-only action (utils/finish-bn.js) — only aug installs are
+ *  automatic. `armed = LIFECYCLE_AUTO_INSTALL || getFlag("autoInstall")`. */
+export const LIFECYCLE_AUTO_INSTALL = true;
 /** Minimum purchased-but-not-installed aug count before an install is considered
  *  worthwhile (paired with LIFECYCLE_STAGNANT_MS). */
 export const LIFECYCLE_MIN_AUGS = 8;

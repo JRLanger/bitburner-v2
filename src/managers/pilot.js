@@ -2,8 +2,9 @@
  * managers/pilot.js — Singularity progression manager (Roadmap 3.1).
  *
  * Automates the manual progression loop the player otherwise does by hand: buy
- * TOR + darkweb programs, install backdoors on the story servers, accept "safe"
- * faction invites, and drive player activity via the arbitration ladder (see
+ * TOR + darkweb programs, install backdoors on the story servers, join factions
+ * (including traveling to join a wanted city faction — one rival group per run),
+ * and drive player activity via the arbitration ladder (see
  * docs/plans/arbitration.md) — including grinding faction rep toward the next-best
  * (lowest-ETA) PRIORITY augmentation. Pilot does NOT buy augs (arbitration Decision
  * 5): it reports which are unlocked; lifecycle batch-buys the set at reset. See
@@ -262,27 +263,77 @@ async function phaseBackdoors(ns, snap) {
 
 // ── Phase 3: faction invites ─────────────────────────────────────────────────
 
-/** Auto-join every invite whose faction has NO enemies (city factions and similar
- *  mutually-exclusive factions always have enemies, so they're never auto-joined)
- *  and isn't on the manual blocklist. Everything else surfaces as a pendingInvite
- *  for the player to decide. */
+/** The six mutually-exclusive city factions (faction name == city name, so it
+ *  doubles as the travel destination). They ban each other per getFactionEnemies:
+ *  {Sector-12, Aevum} are compatible, {Chongqing, New Tokyo, Ishima} are compatible,
+ *  Volhaven is solo — so a run can only join one such group. Across runs, once a
+ *  city's wanted augs are owned it stops being a candidate and a rival becomes
+ *  eligible, naturally exhausting the cities one group per run. */
+const CITY_FACTIONS = ["Sector-12", "Aevum", "Volhaven", "Chongqing", "New Tokyo", "Ishima"];
+const TRAVEL_COST = 200_000;
+
+/** Auto-join enemy-free invites (CyberSec, NiteSec, hacking groups, …) and — new —
+ *  city factions when they still offer a wanted priority aug and no rival is already
+ *  joined, traveling to the city if needed to trigger the invite. Non-city
+ *  enemy-having factions still go to `pendingInvites` for the player to decide. */
 function phaseFactions(ns, snap) {
     const sing = ns.singularity;
     const invites = sing.checkFactionInvitations();
     const joined = new Set(snap.joinedFactions);
+    const owned = new Set(sing.getOwnedAugmentations(true));
     const pending = [];
 
     for (const faction of invites) {
+        if (joined.has(faction)) continue;
         if (PILOT_JOIN_BLOCKLIST.includes(faction)) { pending.push(faction); continue; }
         const enemies = sing.getFactionEnemies(faction);
-        if (enemies.length > 0) { pending.push(faction); continue; }
-        if (sing.joinFaction(faction)) {
-            joined.add(faction);
+        if (enemies.length === 0) {
+            if (sing.joinFaction(faction)) joined.add(faction);
+        } else if (CITY_FACTIONS.includes(faction)) {
+            // City faction invite present (we're in its city, reqs met) → join only if
+            // no rival already joined AND it still has a wanted priority aug.
+            if (!enemies.some((e) => joined.has(e)) && cityHasWantedAug(sing, faction, owned)) {
+                if (sing.joinFaction(faction)) joined.add(faction);
+            }
+        } else {
+            pending.push(faction); // other enemy factions: player decides
         }
     }
 
-    snap.pendingInvites = pending;
     snap.joinedFactions = [...joined];
+    snap.pendingInvites = pending;
+    snap.cityTarget = pursueCityFaction(ns, snap, joined, owned);
+}
+
+/** True if a faction still offers a priority aug we don't own (works for factions
+ *  we haven't joined — getAugmentationsFromFaction is informational). */
+function cityHasWantedAug(sing, faction, owned) {
+    return sing.getAugmentationsFromFaction(faction)
+        .some((aug) => PRIORITY_AUGS.has(aug) && !owned.has(aug));
+}
+
+/** Travel toward the best unjoined city faction that still has wanted augs and no
+ *  rival already joined. Stays put once in a candidate city (waiting for the invite /
+ *  money requirement), so it never oscillates between rivals. Respects manual
+ *  override — won't yank the player mid-manual-work. Returns the pursued city (or null). */
+function pursueCityFaction(ns, snap, joined, owned) {
+    const sing = ns.singularity;
+    const candidates = CITY_FACTIONS.filter((cf) =>
+        !joined.has(cf) &&
+        !sing.getFactionEnemies(cf).some((e) => joined.has(e)) &&
+        cityHasWantedAug(sing, cf, owned));
+    if (candidates.length === 0) return null;
+
+    const here = ns.getPlayer().city;
+    if (candidates.includes(here)) return here; // already in a candidate city — wait for invite
+
+    if (snap.isBusy && !isPilotsOwnWork(ns, snap)) return null; // don't interrupt manual work
+    // Travel to the candidate with the most wanted augs (deterministic → no thrash).
+    const best = candidates
+        .map((cf) => ({ cf, n: sing.getAugmentationsFromFaction(cf).filter((a) => PRIORITY_AUGS.has(a) && !owned.has(a)).length }))
+        .sort((a, b) => b.n - a.n)[0].cf;
+    if (ns.getServerMoneyAvailable("home") >= TRAVEL_COST) sing.travelToCity(best);
+    return best;
 }
 
 // ── Phase 4: augmentations (REPORT-ONLY) ─────────────────────────────────────
@@ -706,6 +757,7 @@ function buildStatus(ns, snap, workState, state) {
         backdoors: { done: backdoorDone, pending: backdoorPending },
         factions: snap.joinedFactions.length,
         pendingInvites: snap.pendingInvites ?? [],
+        cityTarget: snap.cityTarget ?? null,
         working: workState.working,
         focusOwner: workState.focusOwner,
         augs: {
@@ -738,6 +790,9 @@ function renderStatus(ns, s) {
         const g = s.augs.grindTarget;
         const eta = Number.isFinite(g.etaSec) ? `${(g.etaSec / 60).toFixed(0)}m` : "∞";
         ns.print(`║ Grinding: ${g.aug} @ ${g.faction} (ETA ${eta})`);
+    }
+    if (s.cityTarget) {
+        ns.print(`║ City faction target: ${s.cityTarget} (travel/join)`);
     }
     if (s.pendingInvites.length > 0) {
         ns.print(`║ ⚠ Pending invites (needs decision): ${s.pendingInvites.join(", ")}`);

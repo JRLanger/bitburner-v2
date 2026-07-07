@@ -64,14 +64,13 @@ Fires when EITHER:
   gone on long enough that even a single affordable aug is worth banking.
 
 **Autonomy guard.** `armed = LIFECYCLE_AUTO_INSTALL || getFlag(ns, "autoInstall", false)`.
-`LIFECYCLE_AUTO_INSTALL` is a hardcoded `false` constant — **never shipped
-true**. The runtime `autoInstall` flag (lives in the shared flag port,
-`lib/flags.js`) is the only way to arm it in practice, toggled by
-`utils/auto-install-on.js` / `auto-install-off.js` (mirroring
-`utils/share-on.js`/`share-off.js`'s exact pattern). Because the flag port is
-wiped on aug/soft reset, arming never carries into the next run by accident —
-the player must re-arm it deliberately every time they want an automatic
-install.
+`LIFECYCLE_AUTO_INSTALL` now ships **`true`** — aug installs run automatically once
+the decision thresholds are met (the intended fully-autonomous progression loop).
+Set the constant `false` (or run `utils/auto-install-off.js`, which clears the
+runtime `autoInstall` flag) to fall back to recommend-only, where lifecycle just
+publishes `recommendInstall` + `reason` and takes no destructive action. **BitNode
+completion stays player-only** regardless — `destroyW0r1dD43m0n` is never automatic
+(only `utils/finish-bn.js`, run by hand); only aug installs are automated here.
 
 When the decision fires but `armed` is false, lifecycle does nothing but
 publish `recommendInstall: true` + a `reason` string — the dashboard/tail
