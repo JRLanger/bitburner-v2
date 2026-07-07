@@ -101,6 +101,61 @@ remaining budget and defers launch (log once) if it doesn't fit — gates stay t
 so it launches when home grows. Launch order = priority order:
 `pserver, contracts, pilot, lifecycle, gang, sleeves, stocks, bladeburner, hacknet, corp, stanek`.
 
+## Decision 4 — Cross-domain priority: ordinal per-BN, never a computed score
+
+(Recorded 2026-07-06 after design discussion; supersedes any reading of this doc
+as inviting a global ROI formula.)
+
+The tempting design — one scalar "ROI" ranking augs vs. pservers vs. gang vs.
+Bladeburner vs. rep — was tried by the player in earlier projects and failed, and
+we believe it fails structurally: cross-domain "benefit" has no common unit, so
+any conversion formula is hidden hand-tuned weights that break whenever BitNode
+multipliers change. Instead:
+
+1. **Money needs no ranking.** It regenerates in seconds; the spend-fraction
+   caps (Decision 2) arbitrate proportionally, and aug purchases move to a
+   single pre-reset batch (see below), removing the largest mid-run money
+   competitor entirely.
+2. **The focus slot is ranked ORDINALLY, per BitNode.** The ladder's order is a
+   hardcoded, human-readable statement per BN (bitnode-strategy.md's
+   ARBITRATION_LADDER_OVERRIDES) — "in BN7 Bladeburner beats faction work" —
+   encoding BN-multiplier knowledge without pretending to compute it.
+3. **Time-to-milestone is the scheduler WITHIN a row, never between rows.**
+   Where units are comparable it works and is already in use: smallest
+   rep-gap picks the faction (pilot row 6), karma-rate math decides whether
+   sleeves need player help (gang plan), EV/sec picks the crime. Between rows
+   the units aren't comparable — don't try.
+4. **`getBitNodeMultipliers` (SF5) refines GATES, not rankings** — e.g. a ~0
+   hacknet-money multiplier keeps the hacknet manager from launching. Binary
+   decisions survive multiplier changes; weighted ones don't.
+
+## Decision 5 — Augmentations: hardcoded priority, single pre-reset batch buy
+
+Purchased augs are INERT until installed (verified in play — they take effect
+only after the install/soft-reset). Therefore buying early is strictly worse
+than buying at reset time: the ~1.9x per-purchase price ramp compounds against
+every later purchase while the queued aug provides nothing. Consequences:
+
+1. **Pilot's phaseAugs becomes report-only** — it publishes unlocked-but-unbought
+   augs (and still buys ONLY prereq augs required to make a priority aug
+   installable). No other mid-run aug purchases.
+2. **Lifecycle gains a checklist step** (before the NeuroFlux dump): select the
+   aug SET by walking `AUG_PRIORITY` (hardcoded ordered list in constants.js —
+   inclusion priority, player-curated; augs absent from the list get a
+   stats-derived tier via getAugmentationStats: hacking-multiplier augs > rep
+   augs > rest) while simulating the price ramp against the budget; then
+   PURCHASE the chosen set most-expensive-first (purchase order only affects
+   total cost; descending is optimal). Then NF-dump the remainder.
+3. **Lifecycle's stagnation signal is ACQUISITION progress, not purchases or bare
+   rep-unlocks** — with batching, `lastAugPurchaseTs` never moves mid-run, and
+   rep-unlock alone is wrong (a gang unlocks nearly every aug's rep at once, before
+   the money to buy them is saved). Pilot reports `acquirableNow` (priority augs the
+   reset batch could AFFORD now — rep met AND money saved, via a ~1.9× ramp
+   simulation) and `lastAcquireTs` (when that count last grew, from rep OR money).
+   Install when `acquirableNow >= LIFECYCLE_MIN_AUGS` and no growth for
+   `LIFECYCLE_STAGNANT_MS` — the count plateaus only when progress on the binding
+   constraint (money or rep, whichever is greater) stalls.
+
 ## Exceptions to the manager pattern (record once, apply everywhere)
 
 The established pattern is gate → independent loop → status port → self-exit.

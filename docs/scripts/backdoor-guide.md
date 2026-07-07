@@ -24,10 +24,12 @@ If the server is visible:
 
 1. Skip with a status line if it's already backdoored, not rooted, or hacking level
    is too low.
-2. Otherwise, BFS from `home` over `ns.scan()` to find the shortest path to the
-   target, then build the command by prefixing `home; ` and chaining `connect <hop>`
-   for every hop after `home`, ending in `backdoor` — the leading `home;` means each
-   line is self-contained and pastable regardless of where the terminal currently is.
+2. Otherwise, build a live `{hostname, parent}` topology via a fresh `ns.scan()` BFS
+   from `home`, then hand it to `lib/netpath.js`'s `findPath` / `buildConnectCommand`
+   to produce the path and the `home; connect …; backdoor` string — the leading
+   `home;` means each line is self-contained and pastable regardless of where the
+   terminal currently is. (The path-finding lives in `netpath.js` so it's shared with
+   `managers/pilot.js`, which auto-installs backdoors; see `docs/scripts/netpath.md`.)
 
 Output goes through `ns.tprint` so it lands in the terminal log, not a tail window —
 there's nothing to watch over time, so a persistent UI isn't useful here.

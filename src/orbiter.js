@@ -70,9 +70,13 @@ import {
     CONTRACTS_MANAGER,
     PSERVER_MANAGER,
     HACKNET_MANAGER,
+    PILOT_MANAGER,
+    LIFECYCLE_MANAGER,
     CONTRACTS_MANAGER_RAM,
     PSERVER_MANAGER_RAM,
     HACKNET_MANAGER_RAM,
+    PILOT_MANAGER_RAM,
+    LIFECYCLE_MANAGER_RAM,
     PSERVER_PREFIX,
     HACKNET_GATE,
     STATUS_PORT_CONTROLLER,
@@ -118,6 +122,8 @@ const PLACED_WORKERS = [...WORKERS, SHARE_WORKER];
 const MANAGERS = [
     { file: PSERVER_MANAGER, ramGB: PSERVER_MANAGER_RAM, gate: () => true },
     { file: CONTRACTS_MANAGER, ramGB: CONTRACTS_MANAGER_RAM, gate: () => true },
+    { file: PILOT_MANAGER, ramGB: PILOT_MANAGER_RAM, gate: pilotGate },
+    { file: LIFECYCLE_MANAGER, ramGB: LIFECYCLE_MANAGER_RAM, gate: pilotGate },
     { file: HACKNET_MANAGER, ramGB: HACKNET_MANAGER_RAM, gate: pserverFleetBuilt },
 ];
 
@@ -519,6 +525,11 @@ export async function main(ns) {
 function discoverAndRoot(ns) {
     const seen = new Set(["home"]);
     const queue = ["home"];
+    // BFS parent of each discovered host, captured for free during the scan already
+    // done here every tick. Stamped into servers.json (via gatherInfo) so pilot.js
+    // can reconstruct a home->target hop path (lib/netpath.js) without re-scanning
+    // the network itself — see docs/plans/pilot-singularity.md phase 2.
+    const parentOf = new Map();
     const result = [];
 
     while (queue.length > 0) {
@@ -526,6 +537,7 @@ function discoverAndRoot(ns) {
         for (const next of ns.scan(host)) {
             if (!seen.has(next)) {
                 seen.add(next);
+                parentOf.set(next, host);
                 queue.push(next);
             }
         }
@@ -535,7 +547,7 @@ function discoverAndRoot(ns) {
         // safety + manager reserve free on it — so batches and prep use its RAM.
         // gatherInfo reports maxMoney 0 for home, so classify never targets it.
         if (host === "home") {
-            result.push(gatherInfo(ns, "home", true));
+            result.push(gatherInfo(ns, "home", true, null));
             continue;
         }
 
@@ -551,7 +563,7 @@ function discoverAndRoot(ns) {
             provisionedThisRun.add(host);
         }
 
-        result.push(gatherInfo(ns, host, rooted));
+        result.push(gatherInfo(ns, host, rooted, parentOf.get(host) ?? null));
     }
 
     return result;
@@ -578,11 +590,16 @@ function provisionWorkers(ns, host) {
     ns.scp(PLACED_WORKERS, host, "home");
 }
 
-/** Collect static / slow-changing fields for a server. */
-function gatherInfo(ns, host, rooted) {
+/** Collect static / slow-changing fields for a server. `parent` (this host's BFS
+ *  predecessor from home, null for home itself) is stamped purely for pilot.js's
+ *  benefit (see lib/netpath.js) — this controller never uses it itself. It is free;
+ *  backdoor state deliberately is NOT stamped here (ns.getServer would add ~2 GB
+ *  to this controller; pilot checks its few targets itself). */
+function gatherInfo(ns, host, rooted, parent) {
     return {
         hostname: host,
         hasRoot: rooted,
+        parent,
         portsRequired: ns.getServerNumPortsRequired(host),
         hackLevelReq: ns.getServerRequiredHackingLevel(host),
         maxMoney: ns.getServerMaxMoney(host),
@@ -808,7 +825,7 @@ function launchManagers(ns, servers) {
             dbg(`  mgr ${m.file}: SUPPRESSED (seen running earlier this run, now gone)`);
             continue; // was running, now gone → stopped/done
         }
-        const gateOpen = m.gate(servers);
+        const gateOpen = m.gate(servers, ns);
         if (gateOpen) {
             const pid = ns.exec(m.file, "home");
             dbg(`  mgr ${m.file}: gate=open exec pid=${pid}`);
@@ -856,6 +873,23 @@ function pserverFleetBuilt(servers) {
         (s) => s.hostname.startsWith(PSERVER_PREFIX) && s.maxRam >= HACKNET_GATE.ramEachGB
     ).length;
     return built >= HACKNET_GATE.serverCount;
+}
+
+/**
+ * Pilot gate: player owns SF4 (ns.singularity.* usable outside BN4) OR the current
+ * run IS BitNode 4 (singularity is free there even at SF4 level 0). getResetInfo is
+ * a cheap top-level NS call (not under singularity), so this costs nothing extra to
+ * check every tick while pilot is still pending. ownedSF is a Map<sfNumber, level>;
+ * a present, >0 entry for key 4 means SF4 is active. If the gate can never pass this
+ * run (no SF4, not BN4), pilot simply stays "pending" forever — launchManagers logs
+ * once (gate=closed) and moves on; later managers behind it in the list still launch.
+ * Takes `ns` (unlike the other gates) because it's the only one that needs a live NS
+ * call rather than pre-gathered topology data — see launchManagers' `m.gate(servers, ns)`.
+ */
+function pilotGate(servers, ns) {
+    const info = ns.getResetInfo();
+    const sf4Level = info.ownedSF.get(4) ?? 0;
+    return sf4Level > 0 || info.currentNode === 4;
 }
 
 // ── Classification ──────────────────────────────────────────────────────────

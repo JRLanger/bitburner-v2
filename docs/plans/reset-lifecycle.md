@@ -86,6 +86,13 @@ Compute each tick, publish in status, and act only when threshold met:
 
 ### Pre-reset checklist (executed once decision fires, in order)
 
+> **IMPLEMENTED 2026-07-06 (arbitration.md Decision 5).** Step 0.5 `batchBuyAugs`
+> sits between freeze and NF dump: buys the priority tier (`config/aug-priority.js`
+> — category-based, not getAugmentationStats) then the rest, each most-expensive-first
+> by live price, re-scanning for prereqs. The install decision now keys off pilot's
+> `acquirableNow` / `lastAcquireTs` (affordable-AND-unlocked staleness), not `lastAugPurchaseTs`.
+> See `docs/scripts/lifecycle.md` for the shipped behavior.
+
 0. **Liquidate & freeze spending:** set runtime flags `liquidate: true` (stock
    manager sells all positions and acks with `liquidated: true` in its status —
    wait for ack, 30 s timeout) and `moneyFloor` high enough to stop all manager

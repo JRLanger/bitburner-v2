@@ -48,3 +48,11 @@ export function setFlag(ns, key, value) {
     flags[key] = value;
     writeFlags(ns, flags);
 }
+
+/** Money every manager must leave untouched (arbitration.md Decision 2): each
+ *  manager subtracts this from its spendable-money read, so lifecycle can freeze
+ *  ALL spending pre-reset by setting the flag to Infinity (structuredClone
+ *  preserves Infinity through the port). 0 when unset = no floor. */
+export function moneyFloor(ns) {
+    return getFlag(ns, "moneyFloor", 0);
+}

@@ -29,8 +29,13 @@ The panel shows, top to bottom:
   column **and its header adapt to the controller's ranking mode** (`rankByIncome`): `$/s`
   when admission is ranking by absolute earning power (RAM-rich), or `$/GB·s` when ranking
   by efficiency (RAM-limited) — so the row order always reads sensibly against the metric.
-- **Scripts row** — one chip per script (controller, contracts, pserver, hacknet, share)
-  with a live/stale/done dot and its headline stat (fleet size, hacknet production, etc.).
+- **Scripts row** — one chip per script (controller, contracts, pserver, hacknet, pilot,
+  lifecycle, share) with a live/stale/done dot and its headline stat (fleet size, hacknet
+  production, pilot's grind target `aug - faction` + acquirable/rep aug counts, lifecycle's
+  augs-ready + auto-install state, etc.). The slow-tick managers (pilot 30s, lifecycle 60s)
+  use higher staleness thresholds (2.5× their own loop) so they aren't falsely flagged
+  "not reporting". Pilot's pending city-faction invites and lifecycle's install
+  recommendation / BitNode-completable state surface as alert lines.
 - **Alerts line** — engine lag, pool nearly full, share paused, or a manager that stopped
   reporting; otherwise "all systems nominal."
 

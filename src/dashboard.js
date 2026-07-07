@@ -20,6 +20,10 @@ import {
     STATUS_PORT_CONTRACTS,
     STATUS_PORT_PSERVER,
     STATUS_PORT_HACKNET,
+    STATUS_PORT_PILOT,
+    STATUS_PORT_LIFECYCLE,
+    PILOT_LOOP_SLEEP,
+    LIFECYCLE_LOOP_SLEEP,
     LOOP_SLEEP,
     SHARE_RAM,
 } from "/config/constants.js";
@@ -28,6 +32,10 @@ import { readStatus } from "/lib/status.js";
 /** Manager stale threshold, ms: the managers loop every 10s, so they need a much
  *  longer grace than the controller before "not reporting" means anything. */
 const MGR_STALE_MS = 25000;
+// Slow-tick managers (pilot 30s, lifecycle 60s) publish less often than the 10s
+// managers the default threshold assumes — stale only past 2.5x their own period.
+const PILOT_STALE_MS = 2.5 * PILOT_LOOP_SLEEP;
+const LIFECYCLE_STALE_MS = 2.5 * LIFECYCLE_LOOP_SLEEP;
 /** Engine-lag alert: same rule the controller's own debug log uses (gap > 2×sleep). */
 const LAG_MS = 2 * LOOP_SLEEP;
 
@@ -51,6 +59,8 @@ export async function main(ns) {
             contracts: readStatus(ns, STATUS_PORT_CONTRACTS),
             pserver: readStatus(ns, STATUS_PORT_PSERVER),
             hacknet: readStatus(ns, STATUS_PORT_HACKNET),
+            pilot: readStatus(ns, STATUS_PORT_PILOT),
+            lifecycle: readStatus(ns, STATUS_PORT_LIFECYCLE),
         };
         // Live title: "Dashboard - <Controller> · <income>/s · <n> tgt".
         const c = snaps.ctrl;
@@ -246,6 +256,21 @@ function renderScripts(snaps, now) {
             ["horizon", `${snaps.hacknet.horizonHrs.toFixed(1)}h`],
             ["next cost", fmtMoney(snaps.hacknet.nextCost)],
         ] : []));
+    rows.push(managerRow("pilot", snaps.pilot, now,
+        snaps.pilot ? [
+            ["programs", `${snaps.pilot.programs.owned}/${snaps.pilot.programs.total}`],
+            ["backdoors", `${snaps.pilot.backdoors.done.length}/${snaps.pilot.backdoors.done.length + snaps.pilot.backdoors.pending.length}`],
+            ["factions", fmtCount(snaps.pilot.factions)],
+            ["ladder", snaps.pilot.focusOwner ?? "—"],
+            ["grinding", snaps.pilot.augs?.grindTarget ? `${snaps.pilot.augs.grindTarget.aug} - ${snaps.pilot.augs.grindTarget.faction}` : "—"],
+        ] : [], PILOT_STALE_MS));
+    rows.push(managerRow("lifecycle", snaps.lifecycle, now,
+        snaps.lifecycle ? [
+            ["augs ready", fmtCount(snaps.lifecycle.readyCount)],
+            ["run age", `${snaps.lifecycle.runHrs.toFixed(1)}h`],
+            ["no-unlock", `${snaps.lifecycle.stagnantMin.toFixed(0)}m`],
+            ["auto-install", snaps.lifecycle.autoInstallArmed ? "ARMED" : "off"],
+        ] : [], LIFECYCLE_STALE_MS));
 
     // Share row: state lives on the controller snapshot, not its own port.
     const shareState = !c ? "off" : c.shareOff ? "paused" : c.shareThreads > 0 ? "live" : "idle";
@@ -265,12 +290,12 @@ function renderScripts(snaps, now) {
  * compact stats line below (`label · value` pairs separated by `|`). `stats` is
  * [[label, value], ...]. Two lines per manager instead of three saves vertical space.
  */
-function managerRow(name, snap, now, stats) {
+function managerRow(name, snap, now, stats, staleMs = MGR_STALE_MS) {
     let dot = "idle", action = "no data yet";
     if (snap) {
         const age = now - (snap.ts || 0);
         const doneish = /done|maxed|exit|exhaust/i.test(snap.action || "");
-        if (age > MGR_STALE_MS) dot = doneish ? "done" : "stale";
+        if (age > staleMs) dot = doneish ? "done" : "stale";
         else dot = "ok";
         action = snap.action || "";
     }
@@ -294,11 +319,20 @@ function renderAlerts(snaps, now) {
         if (c.totalRam > 0 && c.poolFree / c.totalRam < 0.03) alerts.push("Pool nearly full");
         if (c.shareOff) alerts.push("Share manually paused");
     }
-    for (const [name, staleMs] of [["contracts", MGR_STALE_MS], ["pserver", MGR_STALE_MS], ["hacknet", MGR_STALE_MS]]) {
+    for (const [name, staleMs] of [["contracts", MGR_STALE_MS], ["pserver", MGR_STALE_MS], ["hacknet", MGR_STALE_MS], ["pilot", PILOT_STALE_MS], ["lifecycle", LIFECYCLE_STALE_MS]]) {
         const s = snaps[name];
         if (s && now - (s.ts || 0) > staleMs && !/done|maxed|exit|exhaust/i.test(s.action || "")) {
             alerts.push(`${name} not reporting`);
         }
+    }
+    if (snaps.pilot?.pendingInvites?.length > 0) {
+        alerts.push(`Faction invite needs decision: ${snaps.pilot.pendingInvites.join(", ")}`);
+    }
+    if (snaps.lifecycle?.recommendInstall) {
+        alerts.push(`Recommend aug install: ${snaps.lifecycle.reason}`);
+    }
+    if (snaps.lifecycle?.bnCompletable) {
+        alerts.push("BitNode completable — run utils/finish-bn.js <nextBN>");
     }
     if (alerts.length === 0) return `<div class="bb-section bb-alerts bb-alerts-ok"><span class="bb-dot bb-dot-ok"></span>ALL SYSTEMS NOMINAL</div>`;
     return `<div class="bb-section bb-alerts bb-alerts-warn">⚠ ${alerts.join(" · ")}</div>`;

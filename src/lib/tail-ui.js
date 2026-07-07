@@ -18,11 +18,18 @@ import {
     STATUS_PORT_CONTRACTS,
     STATUS_PORT_PSERVER,
     STATUS_PORT_HACKNET,
+    STATUS_PORT_PILOT,
+    STATUS_PORT_LIFECYCLE,
+    PILOT_LOOP_SLEEP,
+    LIFECYCLE_LOOP_SLEEP,
 } from "/config/constants.js";
 import { readStatus } from "/lib/status.js";
 
 /** Manager stale threshold, ms (managers loop every 10s — mirror dashboard.js). */
 const MGR_STALE_MS = 25000;
+// Slow-tick managers publish less often — stale only past 2.5x their own period.
+const PILOT_STALE_MS = 2.5 * PILOT_LOOP_SLEEP;
+const LIFECYCLE_STALE_MS = 2.5 * LIFECYCLE_LOOP_SLEEP;
 /** Inner width of the box (characters after the border glyph). */
 const W = 78;
 
@@ -86,24 +93,33 @@ export function renderTail(ns, snap) {
         `fleet ${s.count}/${s.limit} · ${fmt.ram(s.fleetRam ?? 0)} · next $${fmt.number(s.nextCost ?? 0)}`)}`);
     ns.print(`║ ${mgrLine("hacknet", readStatus(ns, STATUS_PORT_HACKNET), now, (s) =>
         `nodes ${s.nodes}/${s.maxNodes ?? "∞"} · $${fmt.number(s.production ?? 0)}/s · next $${fmt.number(s.nextCost ?? 0)}`)}`);
+    const pilotSnap = readStatus(ns, STATUS_PORT_PILOT);
+    ns.print(`║ ${mgrLine("pilot", pilotSnap, now, (s) =>
+        `programs ${s.programs.owned}/${s.programs.total} · backdoors ${s.backdoors.done.length}/${s.backdoors.done.length + s.backdoors.pending.length} · ladder ${s.focusOwner ?? "—"}`, PILOT_STALE_MS)}`);
+    const lifecycleSnap = readStatus(ns, STATUS_PORT_LIFECYCLE);
+    ns.print(`║ ${mgrLine("lifecycle", lifecycleSnap, now, (s) =>
+        `ready ${s.readyCount} · run ${s.runHrs.toFixed(1)}h · no-unlock ${s.stagnantMin.toFixed(0)}m · auto-install ${s.autoInstallArmed ? "ARMED" : "off"}`, LIFECYCLE_STALE_MS)}`);
 
     // ── Alerts (same rules as dashboard.js renderAlerts) ──
     const alerts = [];
     if (snap.tickGap > 2 * LOOP_SLEEP) alerts.push(`engine lag ${Math.round(snap.tickGap)}ms`);
     if (snap.totalRam > 0 && snap.poolFree / snap.totalRam < 0.03) alerts.push("pool nearly full");
     if (snap.shareOff) alerts.push("share manually paused");
+    if (pilotSnap?.pendingInvites?.length > 0) alerts.push(`faction invite needs decision: ${pilotSnap.pendingInvites.join(", ")}`);
+    if (lifecycleSnap?.recommendInstall) alerts.push(`recommend aug install: ${lifecycleSnap.reason}`);
+    if (lifecycleSnap?.bnCompletable) alerts.push("BitNode completable — run utils/finish-bn.js <nextBN>");
     ns.print(`╠${"═".repeat(W)}`);
     ns.print(alerts.length === 0 ? "║ ✓ all systems nominal" : `║ ⚠ ${alerts.join(" · ")}`);
     ns.print(`╚${"═".repeat(W)}`);
 }
 
 /** One manager line: status glyph + name + key stats (or last action / no data). */
-function mgrLine(name, snap, now, stats) {
+function mgrLine(name, snap, now, stats, staleMs = MGR_STALE_MS) {
     if (!snap) return `· ${name.padEnd(10)} no data yet`;
     const age = now - (snap.ts || 0);
     const doneish = /done|maxed|exit|exhaust/i.test(snap.action || "");
-    const glyph = age <= MGR_STALE_MS ? "●" : doneish ? "◦" : "✕";
-    const suffix = age > MGR_STALE_MS && !doneish ? "  [not reporting]" : "";
+    const glyph = age <= staleMs ? "●" : doneish ? "◦" : "✕";
+    const suffix = age > staleMs && !doneish ? "  [not reporting]" : "";
     let detail;
     try {
         detail = stats(snap);

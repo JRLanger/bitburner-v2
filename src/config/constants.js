@@ -337,6 +337,7 @@ export const HACKNET_GATE = {
 export const CONTRACTS_MANAGER = "/managers/contracts.js";
 export const PSERVER_MANAGER = "/managers/pserver.js";
 export const HACKNET_MANAGER = "/managers/hacknet.js";
+export const PILOT_MANAGER = "/managers/pilot.js";
 
 /**
  * Manager RAM footprints, GB. Hardcoded so booster can
@@ -346,6 +347,18 @@ export const HACKNET_MANAGER = "/managers/hacknet.js";
 export const CONTRACTS_MANAGER_RAM = 16.80; // measured in-game (mem managers/contracts.js): 1.6 base + 0.2 ls + 15 getContract
 export const PSERVER_MANAGER_RAM = 5.85; // measured in-game (mem managers/pserver.js)
 export const HACKNET_MANAGER_RAM = 8.20; // measured in-game (mem managers/hacknet.js)
+/** Measured in-game at SF4.3 (mem managers/pilot.js): 65.65 GB total, ~61 GB of it
+ *  singularity functions. Singularity RAM is multiplied ×16/×4/×1 by SF4 level:
+ *  at SF4.2 this becomes ~249 GB, at SF4.1 ~981 GB — below SF4.3, pilot must be
+ *  split into per-phase one-shot scripts (the documented RAM fallback in
+ *  docs/plans/pilot-singularity.md) and this constant re-measured. */
+export const PILOT_MANAGER_RAM = 77.65; // STALE — re-measure: dropped aug-buying calls (~12.5GB) and added getMoneySources, formulas.work.factionGains, fileExists, travelToCity (city-faction join). `mem managers/pilot.js`
+/** Estimated (not yet measured in-game — re-measure with `mem managers/lifecycle.js`
+ *  once played) from the type defs' documented per-call RAM costs: ~27.75 GB at
+ *  SF4.3 (×1 multiplier). Like pilot, only viable as a single script at SF4.3 —
+ *  at SF4.2 this becomes ~95 GB, at SF4.1 ~365 GB, and would need the same
+ *  per-phase one-shot split pilot's plan documents as its RAM fallback. */
+export const LIFECYCLE_MANAGER_RAM = 27.75; // STALE — batchBuyAugs added getAugmentationsFromFaction/RepReq/Prereq/Price (~15GB). Re-measure `mem managers/lifecycle.js`
 
 /** Loop sleep for the (infrequent-purchase) managers, ms. */
 export const MANAGER_LOOP_SLEEP = 10000;
@@ -444,6 +457,14 @@ export const STATUS_PORT_CONTRACTS = 3;
 export const STATUS_PORT_PSERVER = 4;
 /** hacknet manager status snapshot. */
 export const STATUS_PORT_HACKNET = 5;
+/** pilot (singularity progression) manager status snapshot. */
+export const STATUS_PORT_PILOT = 7;
+/** lifecycle (reset automation) manager status snapshot. */
+export const STATUS_PORT_LIFECYCLE = 8;
+/** stocks manager status snapshot (port reserved per arbitration.md's port map —
+ *  the stocks manager itself doesn't exist yet; lifecycle's liquidation-ack read
+ *  is a no-op until it does, per docs/plans/reset-lifecycle.md checklist step 0). */
+export const STATUS_PORT_STOCKS = 9;
 
 /** Recorded run (aug-reset) durations + last-seen aug-reset timestamp, for hacknet's
  *  ROI horizon. Survives aug installs (a soft reset keeps files); delete on a full
@@ -525,3 +546,124 @@ export const DASHBOARD = "/dashboard.js";
  *  the controller opens its own tail window instead (ns.ui.openTail, 0 GB) — early
  *  home RAM is too scarce to spend on an overlay. */
 export const DASHBOARD_MIN_HOME_RAM_GB = 256;
+
+// ── pilot (singularity progression manager) ────────────────────────────────
+//
+// See docs/plans/pilot-singularity.md. All ns.singularity.* calls require SF4
+// (or BitNode 4) and are RAM-multiplied ×16/×4/×1 by SF4 level, so pilot is a
+// separate slow-tick manager — never imported into booster/orbiter.
+
+/** pilot's own loop sleep, ms. Progression state changes slowly; a slow tick also
+ *  amortizes pilot's high per-call singularity RAM cost. */
+export const PILOT_LOOP_SLEEP = 30_000;
+
+/** Fraction of current money pilot may spend per tick on programs/augs. pserver's
+ *  spending is ROI-driven; pilot's is progression-driven, so it gets its own
+ *  (smaller, flatter) cap — see arbitration.md's money-class table. */
+export const PILOT_SPEND_FRAC = 0.5;
+
+/** Never auto-join these factions (city factions etc. conflict with each other).
+ *  Auto-join is only otherwise safe when getFactionEnemies(f) is empty. Player can
+ *  add names as they learn which factions matter for their build. */
+export const PILOT_JOIN_BLOCKLIST = [];
+
+/** Priority list of "story" servers pilot backdoors, in order. w0r1d_d43m0n is
+ *  deliberately excluded — installing its backdoor is a win-condition action owned
+ *  by the (not-yet-built) lifecycle script, not pilot. */
+export const BACKDOOR_TARGETS = [
+    "CSEC", "avmnite-02h", "I.I.I.I", "run4theh111z", "fulcrumassets",
+];
+
+/** Aug name for the repeatable NeuroFlux Governor (dumped by lifecycle pre-reset,
+ *  not purchased here — pilot only reports affordable-level count). */
+export const PILOT_NEUROFLUX = "NeuroFlux Governor";
+
+/** The game multiplies EVERY remaining aug's price by this each time an aug is
+ *  purchased (CONSTANTS.MultipleAugMultiplier). Pilot simulates it to estimate how
+ *  many priority augs the reset batch could actually afford right now (the
+ *  "acquirable" count that drives lifecycle's install decision). */
+export const AUG_PRICE_RAMP = 1.9;
+
+// ── arbitration (docs/plans/arbitration.md) ────────────────────────────────
+//
+// Cross-manager conventions recorded once here so every mechanic manager (gang,
+// sleeves, bladeburner, stocks, corp, stanek, ...) agrees on the same constants.
+
+/** Consecutive pilot ticks a new ladder assignment must beat the current one
+ *  before choosePlayerActivity() actually switches — anti-thrash hysteresis,
+ *  same philosophy as the controllers' REANCHOR/ramp-down stable-tick guards. */
+export const FOCUS_STABLE_TICKS = 4;
+
+/** EMA smoothing factor for pilot's all-sources income rate (from getMoneySources
+ *  deltas), used in the aug-grind ETA. Higher = more responsive, lower = smoother.
+ *  0.3 tracks real income shifts over a few 30s ticks without jitter. */
+export const PILOT_INCOME_EMA_ALPHA = 0.3;
+
+/** How long sleeves get to cover the remaining karma grind before pilot itself
+ *  steps in with player-driven Homicide (ladder row 2), ms. */
+export const KARMA_PLAYER_ASSIST_HORIZON_MS = 2 * 3600_000;
+
+/** How long faction-rep progress must stall before grafting (ladder row 5) is
+ *  allowed to take over player focus, ms. */
+export const GRAFT_PATIENCE_MS = 30 * 60_000;
+
+/** Per-tick spend cap (fraction of current money) for "mechanic capex" managers
+ *  (gang equipment, sleeve augs/memory, hacknet) — see arbitration.md's money
+ *  class table. */
+export const MECH_SPEND_FRAC = 0.25;
+
+/** Combined RAM budget for ALL mechanic managers running on home, as a fraction
+ *  of home's total RAM. launchManagers checks candidates against remaining budget
+ *  and defers (log once) if a launch wouldn't fit — gates stay true, so it
+ *  launches once home grows enough. */
+export const MANAGER_HOME_RAM_FRAC = 0.25;
+
+// ── lifecycle (reset automation) — docs/plans/reset-lifecycle.md ───────────
+//
+// Closes the outermost loop: decide when installing augmentations is worth it,
+// run the pre-reset checklist, reset, and bring the system back up (boot.js).
+
+/** lifecycle manager script path. */
+export const LIFECYCLE_MANAGER = "/managers/lifecycle.js";
+/** boot.js — post-reset bring-up callback, passed as cbScript to every reset call.
+ *  Bare filename (not a leading-slash path): installAugmentations/softReset/
+ *  destroyW0r1dD43m0n's cbScript parameter is documented as looked up on home
+ *  by bare filename. */
+export const BOOT_SCRIPT = "boot.js";
+/** One-shot grind helper boot.js execs to do the actual Mug/gym/upgradeHomeRam
+ *  loop — see docs/scripts/boot.md "Why a separate grind script" for why boot.js
+ *  itself never calls a singularity function directly. */
+export const BOOT_GRIND_SCRIPT = "/utils/boot-grind.js";
+/** booster.js's on-home path — boot.js execs this once bring-up is done. There
+ *  was no existing path constant for booster (only ORBITER); added here per the
+ *  plan's "exec booster.js" step. */
+export const BOOSTER_SCRIPT = "/booster.js";
+
+/** lifecycle's own loop sleep, ms — decision state changes slowly. */
+export const LIFECYCLE_LOOP_SLEEP = 60_000;
+/** Armed by default: lifecycle runs the pre-reset checklist and installs
+ *  automatically once the decision thresholds are met. Set false (or run
+ *  utils/auto-install-off.js, which clears the runtime `autoInstall` flag) to fall
+ *  back to recommend-only. NOTE: BitNode completion (destroyW0r1dD43m0n) is a
+ *  SEPARATE, still player-only action (utils/finish-bn.js) — only aug installs are
+ *  automatic. `armed = LIFECYCLE_AUTO_INSTALL || getFlag("autoInstall")`. */
+export const LIFECYCLE_AUTO_INSTALL = true;
+/** Minimum purchased-but-not-installed aug count before an install is considered
+ *  worthwhile (paired with LIFECYCLE_STAGNANT_MS). */
+export const LIFECYCLE_MIN_AUGS = 8;
+/** How long aug purchases must have stalled (no new purchase) before pending
+ *  augs alone justify an install, ms. */
+export const LIFECYCLE_STAGNANT_MS = 30 * 60_000;
+/** Max run length before at least 1 pending aug justifies an install regardless
+ *  of stagnation, ms — aligns with the hacknet horizon model. */
+export const LIFECYCLE_MAX_RUN_MS = 12 * 3600_000;
+/** Whether the pre-reset checklist donates leftover money to the highest-favor
+ *  faction (favor ≥ getFavorToDonate()) before installing. */
+export const LIFECYCLE_SPEND_DOWN = true;
+/** Home RAM target boot.js's grind loop upgrades toward (devlog 01). */
+export const BOOT_TARGET_HOME_GB = 32;
+/** Minimum Mug success chance boot.js requires before skipping the gym-training
+ *  pre-step (devlog 01: gym first only helps when Mug's chance is poor). */
+export const BOOT_MUG_MIN_CHANCE = 0.6;
+/** Persistent (survives resets) human-readable lifecycle log file. */
+export const LIFECYCLE_LOG_FILE = "/data/lifecycle-log.txt";

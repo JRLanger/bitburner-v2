@@ -28,6 +28,7 @@ import {
     STATUS_PORT_PSERVER,
 } from "/config/constants.js";
 import { publishStatus } from "/lib/status.js";
+import { moneyFloor } from "/lib/flags.js";
 
 export async function main(ns) {
     ns.disableLog("ALL");
@@ -67,7 +68,9 @@ function step(ns) {
     const limit = ns.cloud.getServerLimit();
     const maxRam = ns.cloud.getRamLimit();
     const income = ns.getTotalScriptIncome()[0]; // $/s across all scripts
-    let money = ns.getServerMoneyAvailable("home");
+    // moneyFloor (lib/flags.js): reserve lifecycle asks all managers to leave
+    // untouched — Infinity during the pre-reset checklist freezes spending entirely.
+    let money = Math.max(0, ns.getServerMoneyAvailable("home") - moneyFloor(ns));
 
     let owned = ns.cloud.getServerNames();
     let fleetRam = owned.reduce((sum, h) => sum + ns.getServerMaxRam(h), 0);
