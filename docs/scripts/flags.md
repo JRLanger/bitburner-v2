@@ -12,6 +12,17 @@ Current flags stored here:
 - `managersSeen` (booster) — list of manager filenames seen running this run, used to
   suppress relaunching a stopped/self-completed manager.
 - `shareOff` (booster + `/utils/share-off.js` / `share-on.js`) — manual pause of RAM-sharing.
+- `moneyFloor` (lifecycle sets it; pserver/hacknet/pilot honor it) — money every spending
+  manager must leave untouched. Lifecycle sets it to `Infinity` in its pre-reset checklist to
+  freeze all spending; the `moneyFloor(ns)` helper returns it (0 when unset). `structuredClone`
+  in `writePort` preserves `Infinity` through the port.
+- `liquidate` (lifecycle → stocks) — reserved liquidation-ack handshake (arbitration Decision 2);
+  no-op until the stocks manager exists.
+- `autoInstall` (`/utils/auto-install-on.js` / `auto-install-off.js`) — arms lifecycle's
+  automatic aug install (OR'd with the `LIFECYCLE_AUTO_INSTALL` constant).
+- `focusOwner` / `pilotWorkSig` (pilot) — the ladder row currently owning player focus
+  (arbitration focus protocol) and a signature of the work pilot itself started (so it can
+  tell its own work from work the player began manually).
 
 ## How it works
 

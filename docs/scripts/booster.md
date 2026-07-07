@@ -16,10 +16,15 @@ extraction via HWGW batching:
   whole fleet is engaged and pool RAM still sits idle, trading efficiency for
   absolute income.
 
-- **Manager orchestration** launches the pserver/contracts/hacknet managers on
-  home, in a fixed dependency order, once each one's gate passes.
+- **Manager orchestration** launches the pserver/contracts/pilot/lifecycle/hacknet
+  managers on home, in a fixed dependency order, once each one's gate passes. `pilot`
+  and `lifecycle` gate on `pilotGate` (SF4 owned or currently in BitNode 4 — the only
+  gate that takes `ns`, since it needs a live `getResetInfo`); if that can never pass
+  this run they stay pending and the others still launch.
 
-It also writes `/data/servers.json` (topology for managers) and refreshes a live
+It also writes `/data/servers.json` (topology for managers — now including each host's
+BFS `parent`, stamped for free during discovery so `pilot` can reconstruct backdoor
+paths via `lib/netpath.js` without re-scanning) and refreshes a live
 status view each tick: the tail window (rendered by `lib/tail-ui.js`) always, plus
 the HTML dashboard overlay when home has at least `DASHBOARD_MIN_HOME_RAM_GB`
 (256 GB) — below that only `ns.ui.openTail()` (0 GB) is used, since early home RAM
