@@ -348,7 +348,19 @@ and fixed:
   bound, frozen at `fill=0/1956`). When the pipeline is empty, health now also
   requires **fireable** security; the loose bound is hysteresis for a *running*
   pipeline, and strictness on an empty one costs nothing (the drop kills zero
-  workers — re-prep is just a weaken wave).
+  workers — re-prep is just a weaken wave). **Variant 3 (stage 10c):** on a tiny
+  fresh-BN pool, admission's marginal fit capped a plan only by the leftover
+  *budget* (a pipeline-total number), so a single batch could cost more than the
+  pool ever has free — the placeable gate then deferred forever at `fill=0`
+  (observed: n00dles, 105.65GB/batch vs a permanent 100GB poolFree), and the
+  phantom reservation pinned `prepFloor` to the whole budget, starving prep too:
+  a total bootstrap deadlock. `BATCH_RAM_CAP_FRAC` (0.25) now caps every admitted
+  plan's per-batch RAM as a fraction of the pool — base admissions refit through
+  the marginal path if their base plan exceeds it, the marginal fit caps at
+  `min(remaining, perBatchCap)`, and the Pass-B up-ramp caps at
+  `min(capacity/conc, perBatchCap)`. The marginal claim is also honest now:
+  `min(remaining, conc × fitted.ramPerBatch)` instead of blanket-claiming the
+  whole remainder. Stable (depends only on poolTotal), inert on large pools.
 - **REANCHOR persistence gate (stage 10).** The instant re-anchor turned planner
   noise into massacres: when f flipped between two values every other tick (see next
   bullet), each downward flip killed the target's entire in-flight pipeline (13–23k

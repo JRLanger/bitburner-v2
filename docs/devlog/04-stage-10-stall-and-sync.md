@@ -94,6 +94,26 @@ protect. Lesson: **two gates with different thresholds define a gap; make sure n
 state can park inside it** — any "wait for X" gate needs a companion path that
 guarantees X eventually happens.
 
+## Addendum (2026-07-07, stage 10c): stall variant 3 — batch bigger than the pool
+
+Fresh BitNode reset: **n00dles** (the only eligible target) frozen at
+`fill=0/312` with `DEFER: ramPerBatch=105.65GB > poolFree=100.00GB` every tick.
+Admission's marginal fit capped the plan by the leftover *budget* (117GB — a
+pipeline-total number), not by what can ever be free at fire time, so the
+placeable gate deferred forever — and the phantom 117GB reservation pinned
+`prepFloor` to the whole budget, starving prep as well. No batching, no prep, no
+income, no pool growth: a complete bootstrap deadlock. The `REFILL_HEADROOM`
+invariant ("a refill always fits") silently assumed one batch costs less than
+the 10% floor — true at PB scale, false on a 130GB fresh-BN pool. Fix:
+`BATCH_RAM_CAP_FRAC` makes the invariant explicit at admission — no plan may
+cost more per batch than 25% of the pool (applied to base admission, the
+marginal fit, and the Pass-B up-ramp; the marginal claim also stopped
+blanket-claiming the whole remaining budget). Lesson: **an invariant that two
+subsystems silently share (admission sizes plans, the fire gate places them)
+must be enforced where plans are made, not just assumed where they're used —
+and always re-check scale assumptions at the extremes (fresh-BN pools are three
+orders of magnitude smaller than the steady state the code grew up in).**
+
 ## Deliberate non-fix
 
 At the RAM-abundant/scarce boundary, tail admission slots can go to a bigger-bank

@@ -52,6 +52,7 @@ import {
     HOME_SAFETY_BUFFER_GB,
     FORMULAS_EXE,
     BATCH_BUDGET_FRAC,
+    BATCH_RAM_CAP_FRAC,
     REFILL_HEADROOM_FRAC,
     RAMP_HYSTERESIS_FRAC,
     RAMP_DOWN_STABLE_TICKS,
@@ -1140,6 +1141,16 @@ function selectBatchers(ns, eligible, poolTotal, player) {
     const effScore = (t) => rankKey(t) * (wasBatching.has(t.hostname) ? 1 + SELECT_KEEP_BIAS : 1);
     const order = [...eligible].sort((a, b) => effScore(b) - effScore(a));
 
+    // PER-BATCH RAM CAP (stall variant 3, mirrors booster). No admitted plan may
+    // cost more per batch than this — batchPhase's placeable gate needs one whole
+    // batch free at fire time, and the REFILL_HEADROOM invariant only guarantees
+    // that while a batch costs less than the floor. On a small pool a plan fitted
+    // to the BUDGET (a pipeline-total number) can exceed what is ever free,
+    // deferring forever at fill=0 while its phantom reservation starves prep
+    // (observed on booster: n00dles 105.65GB/batch vs 100GB poolFree, fresh BN).
+    // Stable tick-to-tick (depends only on poolTotal), so no gate interaction.
+    const perBatchCap = poolTotal * BATCH_RAM_CAP_FRAC;
+
     // Pass A — pack every target at its base (score-optimal) plan.
     const admitted = [];
     let used = 0;
@@ -1147,15 +1158,17 @@ function selectBatchers(ns, eligible, poolTotal, player) {
         if (admitted.length >= MAX_BATCH_TARGETS) break;
         const remaining = budget - used;
         const baseCost = concurrency(t) * t.ramPerBatch;
-        if (remaining >= baseCost) {
+        if (remaining >= baseCost && t.ramPerBatch <= perBatchCap) {
             admitted.push({ t, plan: t, baseCost }); // full base pipeline fits
             used += baseCost;
         } else {
-            // Marginal target: step the hack-% down to fit `remaining`, claim the rest.
-            const fitted = bestHackPct(ns, t, player, remaining);
+            // Marginal target: step the hack-% down to fit `remaining` (and the
+            // per-batch cap), claim the rest.
+            const fitted = bestHackPct(ns, t, player, Math.min(remaining, perBatchCap));
             if (!fitted) continue; // not even the smallest batch fits → try the next
-            admitted.push({ t, plan: { ...t, ...fitted, score: t.score }, baseCost: remaining, capped: true });
-            used += remaining;
+            const claimed = Math.min(remaining, concurrency(t) * fitted.ramPerBatch);
+            admitted.push({ t, plan: { ...t, ...fitted, score: t.score }, baseCost: claimed, capped: true });
+            used += claimed;
         }
     }
 
@@ -1205,7 +1218,9 @@ function selectBatchers(ns, eligible, poolTotal, player) {
                     }
                 } else {
                     rampDownSince.delete(t.hostname);
-                    ramped = maximizeHackPct(ns, t, player, capacity / conc, t.f);
+                    // Per-batch cap also bounds the ramp: a ramped plan too big
+                    // to ever fire is worse than a smaller one that flows.
+                    ramped = maximizeHackPct(ns, t, player, Math.min(capacity / conc, perBatchCap), t.f);
                     if (ramped) rampPlan.set(t.hostname, ramped);
                 }
             } else {
