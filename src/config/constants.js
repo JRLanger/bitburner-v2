@@ -131,6 +131,21 @@ export const BATCH_BUDGET_FRAC = 0.90;
 /** Fraction of total pool RAM kept free as a hard refill floor. Tune in-game. */
 export const REFILL_HEADROOM_FRAC = 1 - BATCH_BUDGET_FRAC; // 0.10
 
+// The refill-floor invariant above only guarantees a refill FITS while one batch
+// costs less than the floor — on a fresh-BN pool a single low-level batch can
+// cost ~80% of the whole pool, and admission's marginal fit capped it only by
+// the leftover BUDGET (a pipeline-total number), not by what can ever be free
+// at fire time. Observed deadlock (stall variant 3): n00dles admitted with a
+// 105.65GB batch against a permanent 100GB poolFree — placeable gate defers
+// forever at fill=0/312, the phantom reservation pins prepFloor to the whole
+// budget, prep starves, no income, pool never grows. This cap makes the
+// invariant explicit at admission: no plan may cost more per batch than this
+// fraction of the pool (an empty pipeline always has ≳75% of the pool free, so
+// one batch is always placeable, and a few can overlap). Only binds on small
+// early pools; at PB scale it is never the limiting factor.
+/** Max single-batch RAM as a fraction of total pool RAM. */
+export const BATCH_RAM_CAP_FRAC = 0.25;
+
 // A starved target's launch clock can fall a full pipeline behind; without a cap
 // it dumps the entire backlog (hundreds of batches) in one tick, spiking RAM and
 // re-starving the pool. Steady state only needs ~1 launch per couple of ticks, so
