@@ -10,10 +10,12 @@
  * persistent alert (never auto-acts) when the BitNode is completable.
  *
  * Manager-pattern script, launched by booster/orbiter (launchManagers) once the
- * same SF4 gate pilot uses passes. Ticks slowly (LIFECYCLE_LOOP_SLEEP = 60s) —
- * install-worthiness changes over minutes/hours, not seconds, and every
- * ns.singularity.* call here carries the same ×16/4/1 SF4 RAM multiplier pilot's
- * plan documents, so infrequent calls matter for RAM just as much as for pilot.
+ * same SF4 gate pilot uses passes. Ticks slowly (LIFECYCLE_LOOP_SLEEP = 60s)
+ * because install-worthiness changes over minutes/hours, not seconds — tick rate
+ * has NO effect on RAM (RAM is charged per distinct ns function referenced; see
+ * docs/reference/game-mechanics.md). What does cost RAM is each distinct
+ * ns.singularity.* function this file references (×16/4/1 by SF4 level), so the
+ * singularity surface here is kept minimal.
  *
  * AUTONOMY GUARD: LIFECYCLE_AUTO_INSTALL defaults false. When neither that
  * constant NOR the runtime `autoInstall` flag (armed via
@@ -35,11 +37,15 @@ import {
     LIFECYCLE_MAX_RUN_MS,
     LIFECYCLE_SPEND_DOWN,
     LIFECYCLE_LOG_FILE,
+    LIFECYCLE_DEBUG,
+    LIFECYCLE_DEBUG_LOG,
     BOOT_SCRIPT,
+    DONATE_SLOP,
 } from "/config/constants.js";
 import { PRIORITY_AUGS } from "/config/aug-priority.js";
 import { publishStatus, readStatus } from "/lib/status.js";
-import { getFlag, setFlag } from "/lib/flags.js";
+import { getFlag, setFlag, moneyFloor, clearReservation } from "/lib/flags.js";
+import { debugLog } from "/lib/debug-log.js";
 
 /** How long runChecklist waits for the stocks manager to ack liquidation before
  *  proceeding anyway (arbitration.md Decision 2.3). No-op today — no stocks
@@ -63,6 +69,8 @@ export async function main(ns) {
 
         const decision = computeDecision(ns);
         const armed = LIFECYCLE_AUTO_INSTALL || getFlag(ns, "autoInstall", false);
+
+        if (LIFECYCLE_DEBUG) logTick(ns, decision, armed);
 
         if (decision.shouldInstall && armed) {
             await runChecklist(ns, decision);
@@ -101,10 +109,20 @@ function singularityAvailable(ns) {
  * plateaus only when progress on the binding constraint (whichever is greater) stalls.
  *
  * Install when:
+ *   redPillReady (The Red Pill is rep-met) — install ASAP to claim it, OR
  *   readyCount >= LIFECYCLE_MIN_AUGS AND stagnantMs >= LIFECYCLE_STAGNANT_MS
  *     (no new aug became acquirable for a while — money/rep progress plateaued), OR
+ *   readyCount >= 1 AND !grindPending AND stagnantMs >= LIFECYCLE_STAGNANT_MS
+ *     (PLATEAU: pilot is done grinding REAL augs — priority AND non-priority — so
+ *     workSource has descended to NeuroFlux; acquirableNow hasn't grown for a
+ *     stagnation window, so MIN_AUGS can never be reached; install the small batch
+ *     rather than wait), OR
  *   readyCount >= 1 AND runMs >= LIFECYCLE_MAX_RUN_MS
  *     (run has gone on long enough that SOME progress beats none).
+ *
+ * grindPending here means "pilot is still grinding toward a real aug" — its
+ * workSource is priority OR non-priority. Once it descends to neuroflux/none, both
+ * aug tiers are exhausted and the plateau trigger can fire.
  */
 function computeDecision(ns) {
     const now = Date.now();
@@ -115,17 +133,30 @@ function computeDecision(ns) {
     const lastAcquireTs = pilotStatus?.lastAcquireTs ?? null;
     // No acquisition recorded reads as "stagnant since the run started" — conservative.
     const stagnantMs = now - (lastAcquireTs ?? ns.getResetInfo().lastAugReset);
+    // Pilot still grinding a real aug (priority or non-priority tier)? Once it falls
+    // through to NeuroFlux ("neuroflux"/"none"/absent), both aug tiers are exhausted.
+    const src = pilotStatus?.workSource ?? null;
+    const grindPending = src === "priority" || src === "non-priority";
+    const redPillReady = pilotStatus?.redPillReady === true;
 
+    const redPillTrigger = redPillReady; // claim The Red Pill as soon as it's rep-met
     const stagnantTrigger = readyCount >= LIFECYCLE_MIN_AUGS && stagnantMs >= LIFECYCLE_STAGNANT_MS;
+    // Plateau: no real aug left to grind AND acquirableNow hasn't grown for a full
+    // stagnation window (so money isn't unlocking more either) — installing even a
+    // small batch beats holding out for MIN_AUGS/MAX_RUN that can never arrive.
+    const plateauTrigger = readyCount >= 1 && !grindPending && stagnantMs >= LIFECYCLE_STAGNANT_MS;
     const runLengthTrigger = readyCount >= 1 && runMs >= LIFECYCLE_MAX_RUN_MS;
 
     let reason = null;
-    if (stagnantTrigger) reason = `${readyCount} augs affordable, no progress ${Math.round(stagnantMs / 60000)}m`;
+    if (redPillTrigger) reason = `The Red Pill is ready — installing to claim it`;
+    else if (stagnantTrigger) reason = `${readyCount} augs affordable, no progress ${Math.round(stagnantMs / 60000)}m`;
+    else if (plateauTrigger) reason = `${readyCount} aug(s) ready, nothing left to grind — ${Math.round(stagnantMs / 60000)}m`;
     else if (runLengthTrigger) reason = `${readyCount} aug(s) affordable, run age ${Math.round(runMs / 3600000)}h`;
 
     return {
-        readyCount, runMs, stagnantMs,
-        shouldInstall: stagnantTrigger || runLengthTrigger,
+        readyCount, runMs, stagnantMs, grindPending, redPillReady,
+        redPillTrigger, stagnantTrigger, plateauTrigger, runLengthTrigger,
+        shouldInstall: redPillTrigger || stagnantTrigger || plateauTrigger || runLengthTrigger,
         reason,
     };
 }
@@ -152,12 +183,21 @@ async function runChecklist(ns, decision) {
 }
 
 /**
- * Step 0.5: buy the whole aug set NOW, when money is about to become worthless.
- * Priority tier (aug-priority.js: Hacking/Special/faction-rep augs) first, then the
- * rest — each tier most-expensive-first, because the game inflates every aug's price
- * ~1.9x per purchase, so buying the dear ones first avoids inflating them further.
- * Only rep-unlocked, prereq-satisfied augs are buyable; we re-scan after each buy
- * since a purchase can satisfy another aug's prereq. Returns count bought.
+ * Step 0.5: buy the aug set NOW, when money is about to become worthless. Priority
+ * tier (aug-priority.js: Hacking/Special/faction-rep augs) first, most-expensive-
+ * first — the game inflates every aug's price ~1.9x per purchase, so buying the dear
+ * ones first avoids inflating them further. Only rep-unlocked, prereq-satisfied augs
+ * are buyable; we re-scan after each buy since a purchase can satisfy another aug's
+ * prereq.
+ *
+ * CASCADE (matches pilot's grind order): while ANY priority aug is still rep-LOCKED
+ * at a joined faction — i.e. the priority tier isn't finished — the NON-priority tier
+ * is skipped and leftover money flows to dumpNeuroflux (a NF level beats a combat aug
+ * while hacking augs are still the goal). ONCE no priority aug is rep-locked anywhere,
+ * the priority tier is exhausted, so the rest tier opens: priority → non-priority → NF.
+ * Priority augs' prereqs are always kept buyable even if a prereq is non-priority.
+ * The Red Pill is a priority aug, so it's bought here as soon as it's rep-met. Returns
+ * count bought.
  */
 function batchBuyAugs(ns) {
     const sing = ns.singularity;
@@ -171,6 +211,30 @@ function batchBuyAugs(ns) {
             if (aug === "NeuroFlux Governor" || owned.has(aug) || buyable.has(aug)) continue;
             if (rep >= sing.getAugmentationRepReq(aug)) buyable.set(aug, faction);
         }
+    }
+
+    // Is any priority aug still rep-LOCKED (unowned, and rep-met at NO joined faction,
+    // so not in `buyable`)? While one is, we're still pursuing the priority tier.
+    let priorityRemaining = false;
+    for (const faction of ns.getPlayer().factions) {
+        for (const aug of sing.getAugmentationsFromFaction(faction)) {
+            if (PRIORITY_AUGS.has(aug) && !owned.has(aug) && !buyable.has(aug)) { priorityRemaining = true; break; }
+        }
+        if (priorityRemaining) break;
+    }
+
+    // Priority tier not yet finished → drop non-priority augs (but keep any that are a
+    // transitive prereq of a priority aug so priority augs gated behind a non-priority
+    // prereq still install). Once priority is exhausted, keep the whole set.
+    if (priorityRemaining) {
+        const keep = new Set();
+        const addWithPrereqs = (aug) => {
+            if (keep.has(aug)) return;
+            keep.add(aug);
+            for (const p of sing.getAugmentationPrereq(aug)) addWithPrereqs(p);
+        };
+        for (const aug of buyable.keys()) if (PRIORITY_AUGS.has(aug)) addWithPrereqs(aug);
+        for (const aug of [...buyable.keys()]) if (!keep.has(aug)) buyable.delete(aug);
     }
 
     let bought = 0;
@@ -211,6 +275,11 @@ function batchBuyAugs(ns) {
  */
 async function liquidateAndFreeze(ns) {
     setFlag(ns, "moneyFloor", FREEZE_MONEY_FLOOR);
+    // Ledger honesty: the Infinity floor above already blocks every spender, so this
+    // is not load-bearing for the freeze itself — but this very checklist is about to
+    // spend the reserved money (batchBuyAugs/dumpNeuroflux), so the entry should not
+    // linger describing money that's already gone.
+    clearReservation(ns, "augBatch");
     setFlag(ns, "liquidate", true);
 
     const start = Date.now();
@@ -226,10 +295,47 @@ async function liquidateAndFreeze(ns) {
 }
 
 /**
- * Step 1: loop purchaseAugmentation(faction, 'NeuroFlux Governor') on the
- * highest-rep JOINED faction until it returns false (rep or money exhausted).
- * Deliberately lifecycle's job, not pilot's — buying NF early just wastes the
- * per-purchase inflation on levels bought before a reset was imminent.
+ * Smallest donation (dollars) that yields >= repNeeded reputation at the current
+ * player mults. Prefers the exact in-game formula (Formulas.exe) via binary
+ * search — repFromDonation is not necessarily linear/invertible in closed form
+ * across game versions, so search rather than assume — and falls back to the
+ * verified closed form when Formulas.exe isn't owned (or the API throws, e.g. a
+ * removed/renamed function): favor gates the ABILITY to donate, it does not
+ * scale the rep-per-dollar conversion, so `amount = repNeeded * 1e6 /
+ * faction_rep` holds regardless of favor. repNeeded <= 0 needs no donation.
+ */
+function donationForRep(ns, repNeeded) {
+    if (repNeeded <= 0) return 0;
+    if (ns.fileExists("Formulas.exe", "home")) {
+        try {
+            const player = ns.getPlayer();
+            let lo = 0;
+            let hi = repNeeded * 1e6;
+            // Double hi until it clears the target, bounded so a pathological
+            // multiplier can't spin forever (30 doublings + 30 bisection steps).
+            for (let i = 0; i < 30 && ns.formulas.reputation.repFromDonation(hi, player) < repNeeded; i++) hi *= 2;
+            for (let i = 0; i < 30; i++) {
+                const mid = (lo + hi) / 2;
+                if (ns.formulas.reputation.repFromDonation(mid, player) >= repNeeded) hi = mid;
+                else lo = mid;
+            }
+            return hi;
+        } catch {
+            // fall through to closed form
+        }
+    }
+    return (repNeeded * 1e6) / ns.getPlayer().mults.faction_rep;
+}
+
+/**
+ * Step 1: convert money into the MAXIMUM number of NeuroFlux levels, on the
+ * highest-rep JOINED faction, instead of stopping at the rep cap and handing the
+ * rest to spendDown blind. Each iteration closes exactly the current level's rep
+ * gap with a sized donation (donationForRep, padded by DONATE_SLOP for rounding)
+ * before buying — so money that used to sit idle once rep ran out now buys
+ * additional levels, up to whatever the wallet can afford. Deliberately
+ * lifecycle's job, not pilot's — buying NF early just wastes the per-purchase
+ * inflation on levels bought before a reset was imminent.
  */
 function dumpNeuroflux(ns) {
     const sing = ns.singularity;
@@ -244,17 +350,54 @@ function dumpNeuroflux(ns) {
         if (rep > bestRep) { bestFaction = f; bestRep = rep; }
     }
 
+    const donateThreshold = ns.getFavorToDonate ? ns.getFavorToDonate() : 150;
+    const canDonate = sing.getFactionFavor(bestFaction) >= donateThreshold;
+
     let bought = 0;
-    while (sing.purchaseAugmentation(bestFaction, NF)) bought++;
-    ns.print(`NeuroFlux dump: bought ${bought} level(s) from ${bestFaction}.`);
+    let totalDonated = 0;
+    for (let i = 0; i < 1000; i++) {
+        let price, repReq;
+        try {
+            price = sing.getAugmentationPrice(NF);
+            repReq = sing.getAugmentationRepReq(NF);
+        } catch {
+            break;
+        }
+        const gap = Math.max(0, repReq - sing.getFactionRep(bestFaction));
+        const money = ns.getServerMoneyAvailable("home");
+
+        if (gap === 0) {
+            if (price > money || !sing.purchaseAugmentation(bestFaction, NF)) break;
+            bought++;
+        } else if (canDonate) {
+            const donation = donationForRep(ns, gap) * DONATE_SLOP;
+            if (price + donation > money) break; // can't afford unlock + buy → stop
+            sing.donateToFaction(bestFaction, donation);
+            totalDonated += donation;
+            if (!sing.purchaseAugmentation(bestFaction, NF)) break;
+            bought++;
+        } else {
+            break; // rep-capped and can't donate
+        }
+    }
+    ns.print(
+        `NeuroFlux dump: bought ${bought} level(s) from ${bestFaction}` +
+        (totalDonated > 0 ? ` (donated $${ns.format.number(totalDonated)}).` : `.`)
+    );
     return bought;
 }
 
 /**
- * Step 2 (LIFECYCLE_SPEND_DOWN): money is meaningless post-reset, so donate
- * whatever's left to the highest-favor faction if its favor already clears
- * getFavorToDonate() (donating below that threshold wastes the money for very
- * little rep — the game scales rep-per-dollar with favor).
+ * Step 2 (LIFECYCLE_SPEND_DOWN): runs after dumpNeuroflux's donate-exact-then-buy
+ * loop, so by construction whatever money is left here cannot unlock and buy
+ * another NF level (dumpNeuroflux would have spent it if it could). That residual
+ * has no more purchases to make, but donating it isn't wasted: an install wipes
+ * money AND reputation, but NOT favor (docs/reference/game-mechanics.md), so
+ * every dollar donated here banks PERSISTENT favor for future runs at this
+ * faction — the entire reason this step exists. Donate to the highest-favor
+ * faction if its favor already clears getFavorToDonate() (donating below that
+ * threshold wastes the money for very little rep — the game scales rep-per-dollar
+ * with favor).
  */
 function spendDown(ns) {
     if (!LIFECYCLE_SPEND_DOWN) return 0;
@@ -301,6 +444,39 @@ function logRun(ns, info) {
         `augsOwned=${augCount} | augsBought=${info.augsBought} | nfBought=${info.nfBought} | donated=${info.donated} | ` +
         `moneyAtReset=${Math.round(money)}\n`;
     ns.write(LIFECYCLE_LOG_FILE, line, "a");
+}
+
+// ── Debug logging ─────────────────────────────────────────────────────────────
+
+/** One rolling debug line per tick showing every install-decision input and which
+ *  triggers fired — so "augs ready but never installs" is diagnosable from the log.
+ *  Also logs freshness of pilot's status (a stale/absent port read makes readyCount
+ *  and grindPending both read as 0/false). Gated by LIFECYCLE_DEBUG. */
+function logTick(ns, decision, armed) {
+    const pilot = readStatus(ns, STATUS_PORT_PILOT);
+    const pilotAgeMs = pilot?.ts ? Date.now() - pilot.ts : null;
+    debugLog(ns, LIFECYCLE_DEBUG_LOG, {
+        armed: armed ? 1 : 0,
+        install: decision.shouldInstall ? 1 : 0,
+        reason: decision.reason ?? "-",
+        ready: decision.readyCount,
+        grindPending: decision.grindPending ? 1 : 0,
+        redPill: decision.redPillReady ? 1 : 0,
+        src: pilot?.workSource ?? "-",
+        stagMin: Math.round(decision.stagnantMs / 60000),
+        runHr: Math.round(decision.runMs / 36000) / 100,
+        tRedPill: decision.redPillTrigger ? 1 : 0,
+        tStag: decision.stagnantTrigger ? 1 : 0,
+        tPlateau: decision.plateauTrigger ? 1 : 0,
+        tRun: decision.runLengthTrigger ? 1 : 0,
+        minAugs: LIFECYCLE_MIN_AUGS,
+        stagCfgMin: Math.round(LIFECYCLE_STAGNANT_MS / 60000),
+        maxRunHr: Math.round(LIFECYCLE_MAX_RUN_MS / 36000) / 100,
+        pilotAgeMs: pilotAgeMs ?? "-",
+        pilotGrind: pilot?.augs?.grindTarget ? `${pilot.augs.grindTarget.aug}@${pilot.augs.grindTarget.faction}` : "-",
+        pilotWork: pilot?.augs?.workTarget ? `${pilot.augs.workTarget.aug}@${pilot.augs.workTarget.faction}` : "-",
+        floor: moneyFloor(ns),
+    });
 }
 
 // ── Part C: BitNode completion (always player-consented) ───────────────────

@@ -16,6 +16,13 @@ Current flags stored here:
   manager must leave untouched. Lifecycle sets it to `Infinity` in its pre-reset checklist to
   freeze all spending; the `moneyFloor(ns)` helper returns it (0 when unset). `structuredClone`
   in `writePort` preserves `Infinity` through the port.
+- `reservations` (docs/plans/wallet-reservations.md, added 2026-07-13) — a map of
+  `key -> {amount, owner, reason, ts}` earmarking money for a specific future purchase
+  (currently one key: pilot's `augBatch`, the simulated cost of the augs the reset batch
+  could currently afford). `moneyFloor(ns)` now returns the frozen floor flag **plus** the
+  live sum of fresh reservations, so every spender that already computes
+  `money = raw - moneyFloor(ns)` treats reserved money as untouchable with zero code
+  changes of its own.
 - `liquidate` (lifecycle → stocks) — reserved liquidation-ack handshake (arbitration Decision 2);
   no-op until the stocks manager exists.
 - `autoInstall` (`/utils/auto-install-on.js` / `auto-install-off.js`) — arms lifecycle's
@@ -39,6 +46,26 @@ would tax every importer for the full cost (see the import note in the booster d
 `JSON.stringify` is needed**. Each helper's read-modify-write is synchronous (no `await`),
 so it is atomic against other scripts under Netscript's cooperative scheduling.
 
+**Reservation ledger** (docs/plans/wallet-reservations.md). `setReservation(ns, key, amount,
+owner, reason)` upserts one entry under `flags.reservations[key]`, stamping `ts = Date.now()`;
+`clearReservation(ns, key)` removes one entry outright (a no-op if absent); `reservationsTotal(ns)`
+sums every entry whose `ts` is still within `RESERVATION_TTL_MS` (5 min, `config/constants.js`) of
+now, silently treating older entries as 0 without deleting them. `moneyFloor(ns)` is now
+`getFlag(ns, "moneyFloor", 0) + reservationsTotal(ns)` — the frozen floor and the live
+reservation total are additive, and `Infinity` in the frozen floor still dominates everything
+regardless of what's reserved.
+
+**Single writer per key.** Only one script ever writes a given reservation key — pilot owns
+`augBatch` — so two scripts never race the same entry, and a writer must refresh its own entry
+every tick it wants the reservation to keep counting (a dead writer's entry simply ages out, see
+below). Because each key has exactly one writer, the read-modify-write in `setReservation`/
+`clearReservation` needs no cross-script locking beyond the existing atomic-per-call guarantee.
+
+This is why every existing spender (pserver, hacknet, pilot's own programs/donations/home-RAM)
+respects reservations with **zero changes to its own code**: each already computes
+`money = raw - moneyFloor(ns)` (arbitration.md Decision 2), and `moneyFloor` now folds the
+reservation total in transparently.
+
 ## Why it's built this way
 
 **Ports are wiped on game restart AND on aug/soft reset** (verified in-game). That makes
@@ -51,6 +78,16 @@ let an interim hacking-level reset-detector be deleted. See `docs/devlog/02-boos
 
 A single shared object on one port (rather than one port per flag) keeps all runtime flags
 discoverable in one place and leaves the rest of the port-number space free.
+
+**TTL enforced read-side, not by a pruning process.** `reservationsTotal` simply ignores
+stale entries rather than deleting them, so a writer that dies (crashes, gets killed, or is
+just a stale pilot process after a restart) has its reservation silently stop counting after
+`RESERVATION_TTL_MS` with no separate cleanup pass to keep in sync with writers — the same
+"no reset detection required" philosophy as the port-wipe design above, applied to a
+shorter, in-run timescale. **Cross-run staleness is a non-issue by construction**: the whole
+flag port — reservations included — is wiped on every reset (same as `managersSeen`), so a
+reservation can never survive from one run into the next; the TTL only ever has to catch a
+dead writer *within* a run.
 
 ## Alternatives considered
 

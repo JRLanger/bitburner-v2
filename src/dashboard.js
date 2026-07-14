@@ -253,7 +253,7 @@ function renderScripts(snaps, now) {
         snaps.hacknet ? [
             ["nodes", `${snaps.hacknet.nodes}/${snaps.hacknet.maxNodes ?? "∞"}`],
             ["production", fmtMoney(snaps.hacknet.production) + "/s"],
-            ["horizon", `${snaps.hacknet.horizonHrs.toFixed(1)}h`],
+            ["horizon", fmtDur(snaps.hacknet.horizonHrs * 3600_000)],
             ["next cost", fmtMoney(snaps.hacknet.nextCost)],
         ] : []));
     rows.push(managerRow("pilot", snaps.pilot, now,
@@ -262,13 +262,17 @@ function renderScripts(snaps, now) {
             ["backdoors", `${snaps.pilot.backdoors.done.length}/${snaps.pilot.backdoors.done.length + snaps.pilot.backdoors.pending.length}`],
             ["factions", fmtCount(snaps.pilot.factions)],
             ["ladder", snaps.pilot.focusOwner ?? "—"],
-            ["grinding", snaps.pilot.augs?.grindTarget ? `${snaps.pilot.augs.grindTarget.aug} - ${snaps.pilot.augs.grindTarget.faction}` : "—"],
+            ["grinding", (() => { const g = snaps.pilot.augs?.workTarget ?? snaps.pilot.augs?.grindTarget; return g ? `${g.aug} - ${g.faction}` : "—"; })()],
+            // wallet-reservations.md: money earmarked for the acquirable aug batch.
+            ["reserved", snaps.pilot.reservedForAugs > 0 ? fmtMoney(snaps.pilot.reservedForAugs) : "—"],
+            // home-ram.md: current home RAM and the next upgrade's live cost.
+            ["home RAM", snaps.pilot.homeRam ? `${fmtRam(snaps.pilot.homeRam.gb)}${snaps.pilot.homeRam.nextCost != null ? ` (next ${fmtMoney(snaps.pilot.homeRam.nextCost)})` : ""}` : "—"],
         ] : [], PILOT_STALE_MS));
     rows.push(managerRow("lifecycle", snaps.lifecycle, now,
         snaps.lifecycle ? [
             ["augs ready", fmtCount(snaps.lifecycle.readyCount)],
-            ["run age", `${snaps.lifecycle.runHrs.toFixed(1)}h`],
-            ["no-unlock", `${snaps.lifecycle.stagnantMin.toFixed(0)}m`],
+            ["run age", fmtDur(snaps.lifecycle.runHrs * 3600_000)],
+            ["no-unlock", fmtDur(snaps.lifecycle.stagnantMin * 60_000)],
             ["auto-install", snaps.lifecycle.autoInstallArmed ? "ARMED" : "off"],
         ] : [], LIFECYCLE_STALE_MS));
 
@@ -315,7 +319,7 @@ function renderAlerts(snaps, now) {
     const alerts = [];
     if (!c) alerts.push("Controller offline");
     else {
-        if (c.tickGap > LAG_MS) alerts.push(`Engine lag: tick gap ${Math.round(c.tickGap)}ms`);
+        if (c.tickGap > LAG_MS) alerts.push(`Engine lag: tick gap ${c.tickGap < 1000 ? `${Math.round(c.tickGap)}ms` : fmtDur(c.tickGap)}`);
         if (c.totalRam > 0 && c.poolFree / c.totalRam < 0.03) alerts.push("Pool nearly full");
         if (c.shareOff) alerts.push("Share manually paused");
     }
@@ -388,7 +392,9 @@ function capitalize(s) {
     return s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
 }
 
-/** Compact duration: "45s" / "1m23s" / "1h04m". */
+/** Compact clock-style duration for short spans (batch times): "45s" / "1m23s" /
+ *  "1h04m". Use fmtDur instead for long, coarse spans (run age, horizons) where a
+ *  single decimal unit reads better. */
 function fmtTime(ms) {
     if (ms == null || !isFinite(ms)) return "—";
     const s = Math.round(ms / 1000);
@@ -397,15 +403,35 @@ function fmtTime(ms) {
     return `${Math.floor(s / 3600)}h${Math.floor((s % 3600) / 60).toString().padStart(2, "0")}m`;
 }
 
-/** Compact RAM: MB / GB / TB / PB (input is GB, the Bitburner unit). */
+/** Coarse duration in the largest sensible unit, one decimal, trailing ".0" dropped:
+ *  "45s" / "18m" / "1.5h" / "2.3d". For long spans (run age, no-unlock, ROI horizon)
+ *  where the goal is a readable magnitude, not clock precision — so 90 minutes reads
+ *  as "1.5h", not "90m". */
+function fmtDur(ms) {
+    if (ms == null || !isFinite(ms)) return "—";
+    const s = Math.abs(ms) / 1000;
+    const unit = (val, u) => `${Math.round(val * 10) / 10}${u}`; // 2 → "2", 1.5 → "1.5"
+    if (s < 60) return `${Math.round(s)}s`;
+    const m = s / 60;
+    if (m < 60) return unit(m, "m");
+    const h = m / 60;
+    if (h < 24) return unit(h, "h");
+    return unit(h / 24, "d");
+}
+
+/** Compact RAM: MB / GB / TB / PB / EB (input is GB, the Bitburner unit). Scales in
+ *  BINARY (÷1024) — Bitburner RAM is always a power of two, so 33554432GB is exactly
+ *  32PB (32 × 1024²), not 33.55PB. */
 function fmtRam(gb) {
     if (gb == null || !isFinite(gb)) return "0GB";
     const neg = gb < 0 ? "-" : "";
     gb = Math.abs(gb);
-    if (gb >= 1e6) return `${neg}${(gb / 1e6).toFixed(2)}PB`;
-    if (gb >= 1e3) return `${neg}${(gb / 1e3).toFixed(2)}TB`;
+    const K = 1024;
+    if (gb >= K * K * K) return `${neg}${(gb / (K * K * K)).toFixed(2)}EB`;
+    if (gb >= K * K) return `${neg}${(gb / (K * K)).toFixed(2)}PB`;
+    if (gb >= K) return `${neg}${(gb / K).toFixed(2)}TB`;
     if (gb >= 1) return `${neg}${gb.toFixed(0)}GB`;
-    return `${neg}${(gb * 1024).toFixed(0)}MB`;
+    return `${neg}${(gb * K).toFixed(0)}MB`;
 }
 
 // ── Styles ───────────────────────────────────────────────────────────────────

@@ -32,7 +32,8 @@ WS_GUID       = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"  # RFC 6455
 # PULL (jogo -> disco): arquivos lidos do jogo via getFile e espelhados em
 # game-logs/ na raiz do projeto, para inspecionar logs de debug sem abrir o jogo.
 # Mão contrária do push e fora de src/, então nunca colide com a sincronização.
-PULL_FILES    = ("data/booster-debug.txt", "data/orbiter-debug.txt", "data/servers.json")
+PULL_FILES    = ("data/booster-debug.txt", "data/orbiter-debug.txt",
+                 "data/pilot-debug.txt", "data/lifecycle-debug.txt", "data/servers.json")
 PULL_DIR      = Path(__file__).resolve().parents[2] / "game-logs"
 PULL_INTERVAL = 15.0                        # s entre leituras do jogo
 

@@ -23,6 +23,18 @@ Karma: `ns.getPlayer().karma` (needs −54,000 to create a gang outside BN2).
 
 ## Phase 0 — formation (before `inGang()`)
 
+> **Amended 2026-07-13 (arbitration Decision 1/4 amendments):** the player-assist
+> karma grind (ladder row 2) no longer waits for faction-work to have nothing to
+> do — grind rows compete by **weighted ETA** (`effectiveEta = ETA /
+> GRIND_WEIGHTS[row]`; karma weight 1.5 favors it). The gang manager must publish
+> its **karma ETA** with its `focusRequest` (remaining karma ÷ measured player
+> karma rate, sleeves' share subtracted) and be **progress-tolerant**: focus
+> arrives in stretches interleaved with other grinds, so keep publishing the
+> request until `inGang()`. Homicide-chance training (train combat stats until
+> `getCrimeChance("Homicide") >= KARMA_HOMICIDE_MIN_CHANCE`) is handled INSIDE
+> pilot's row 2, mirroring its crime-row train-or-commit pattern — not by the
+> stat-training row (see docs/plans/faction-prereqs-training.md).
+
 - In BN2: karma requirement is waived — `createGang(GANG_FACTION)` as soon as the
   faction is joined (pilot handles joining; gang manager publishes
   `focusRequest: none`, just waits).

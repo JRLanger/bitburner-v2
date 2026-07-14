@@ -83,6 +83,20 @@ export const PILOT_AUG_PRICE_HORIZON = 1.0;  // buy only if affordable now
 export const PILOT_NEUROFLUX = 'NeuroFlux Governor';
 ```
 
+> **Amended 2026-07-13 — three follow-up plans extend pilot:**
+> 1. **`phaseHomeRam`** (docs/plans/home-ram.md): perpetual home-RAM upgrading,
+>    inserted between phaseTor and phaseAugs; fraction gate
+>    `HOME_RAM_SPEND_FRAC`, buys from unreserved money only.
+> 2. **Faction-prereq planner + stat-training row** (docs/plans/
+>    faction-prereqs-training.md): `computeFactionPlans` inside phaseFactions
+>    (via `getFactionInviteRequirements`) and ladder row 5 `stat-training`.
+> 3. **Reservations** (docs/plans/wallet-reservations.md): phaseAugs writes the
+>    `augBatch` reservation from `countAcquirable`'s simulated batch cost; the
+>    snapshot gains a `moneyForAugs` field (frozen-floor-only) to avoid the
+>    reservation shrinking itself.
+> Each adds singularity functions → re-measure `mem managers/pilot.js` and update
+> `PILOT_MANAGER_RAM` (already flagged STALE) after every one.
+
 ## Main loop pseudocode
 
 ```

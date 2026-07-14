@@ -30,6 +30,25 @@ its status port field `focusRequest` (see protocol below).
 
 ### `choosePlayerActivity()` — the priority ladder
 
+> **Amended 2026-07-13 — grind-class weighted-ETA selection.** Strict top-row-wins
+> starves lower grinds (rep grinding would monopolize focus and gang formation
+> would stall). Rows are now tagged `class: "gate" | "grind"`. **Gates** (row 1
+> bootstrap, manual override, row 3 BN6/7 bladeburner) still preempt absolutely, in
+> ladder order. Among applicable **grind** rows (2 karma, 4 company-work, 5
+> stat-training, 6 faction-work, 8 crime-fallback), the winner is the lowest
+> `effectiveEta = ETA / GRIND_WEIGHTS[row]` — each grind row exposes an ETA to its
+> milestone (rep gap ÷ rep rate, karma gap ÷ karma rate, stat gap ÷ gain rate;
+> crime-fallback = ∞ baseline). A grind whose RAW ETA exceeds
+> `GRIND_ETA_SKIP_MS` (default 8 h) is skipped whenever another grind is
+> applicable — a days-long rep grind yields to karma/training. Unknown ETA (no
+> rate sample yet) is treated as `GRIND_ETA_SKIP_MS` (eligible, not favored).
+> `FOCUS_STABLE_TICKS` hysteresis unchanged (damps ETA noise). See the Decision 4
+> amendment: this is time-to-milestone comparison *within the grind class*, with
+> hand-tunable ordinal-ish weights — still no cross-domain money-ROI score.
+> New constants: `GRIND_WEIGHTS = { "karma-grind": 1.5, "company-work": 1.0,
+> "stat-training": 1.0, "faction-work": 1.0, "crime-fallback": 0.5 }`,
+> `GRIND_ETA_SKIP_MS = 8 * 3600_000`.
+
 Runs each pilot tick, replacing the plan's original phase 5. Top-most applicable
 wins. Manual override still applies: if the player started work themselves, pilot
 never touches it (existing rule — pilot only replaces work it started).
@@ -40,7 +59,7 @@ never touches it (existing rule — pilot only replaces work it started).
 | 2 | **Karma grind (Homicide)** | gang manager requests it (BN2/SF2, no gang, karma > −54000) **and** sleeves can't cover the remaining karma in `KARMA_PLAYER_ASSIST_HORIZON_MS` | Gang is the biggest income unlock in gang-capable BNs; sleeves grind karma in parallel and are preferred (they don't cost player time) |
 | 3 | **Bladeburner action** | bladeburner manager's `focusRequest` set **and** current BN is 6/7 (Bladeburner is the win condition there) | In BN6/7 Bladeburner rank IS progression; outside 6/7 it ranks below faction work (row 6) |
 | 4 | **Company work** | a needed faction (one holding a wanted aug) requires company rep for its invite, per `getFactionInviteRequirements` | Unblocks otherwise-unreachable augs (megacorp factions) |
-| 5 | **Grafting** | grafting manager requests, and no rep-locked aug is reachable within `GRAFT_PATIENCE_MS` | Grafting is a money-for-time trade used only when faction grinding has stalled |
+| 5 | **Stat training** (added 2026-07-13, see docs/plans/faction-prereqs-training.md) / **Grafting** | a training demand exists (faction skill prereq, homicide-chance support) / grafting manager requests and no rep-locked aug reachable within `GRAFT_PATIENCE_MS` | Training unblocks invites & the gang path; grafting order within 4–6 revisited when its manager lands |
 | 6 | **Faction work** | any rep-locked wanted aug exists (pilot's cheapest-gap heuristic, unchanged) | Default progression activity |
 | 7 | **Bladeburner action (non-BN6/7)** | bladeburner manager requests and rows 1–6 idle | Passive rank/skill accumulation when nothing better |
 | 8 | **Crime (Heist)** | nothing above applies and money < gang/pserver wish-list | Money fallback |
@@ -62,6 +81,19 @@ Ladder position is data, not code: implement as an ordered array of
 - `setFocus(false)` always (never steal the game window), per the pilot plan.
 
 ## Decision 2 — Money: budget classes + liquidation protocol
+
+> **Amended 2026-07-13 — reservations (virtual wallet), see
+> docs/plans/wallet-reservations.md.** `moneyFloor(ns)` is generalized to
+> **frozen floor + live reservations**: a `reservations` map on the flag port
+> (`{key: {amount, owner, reason, ts}}`, single writer per key, read-side TTL
+> `RESERVATION_TTL_MS`). Pilot reserves the simulated cost of the acquirable aug
+> batch (`augBatch`), so pserver/hacknet/donations/home-RAM can no longer spend
+> money that would un-ready an aug — with zero changes to their buy paths, since
+> they all already subtract `moneyFloor`. **No spender may raid a reservation**
+> (user decision 2026-07-13); lifecycle clears `augBatch` at checklist step 0.
+> Also note: home-RAM upgrading (docs/plans/home-ram.md) joins the Progression
+> spend class (`HOME_RAM_SPEND_FRAC = 0.5`, gate not score) — it is a money
+> spender, not a focus row.
 
 Keep the existing decentralized pattern (each manager caps its own spending) — a
 central ledger is over-engineering while money regenerates in seconds. But make the
@@ -125,11 +157,26 @@ multipliers change. Instead:
    rep-gap picks the faction (pilot row 6), karma-rate math decides whether
    sleeves need player help (gang plan), EV/sec picks the crime. Between rows
    the units aren't comparable — don't try.
+
+   > **Amended 2026-07-13:** one sanctioned extension — among **grind-class**
+   > ladder rows the unit IS comparable (time to each row's milestone), so the
+   > weighted-ETA selection in Decision 1's amendment is allowed:
+   > `effectiveEta = ETA / GRIND_WEIGHTS[row]`, plus the `GRIND_ETA_SKIP_MS`
+   > skip rule. The weights are hand-tuned ordinal bias, not a computed
+   > cross-domain score; money-ROI comparisons between domains remain forbidden.
 4. **`getBitNodeMultipliers` (SF5) refines GATES, not rankings** — e.g. a ~0
    hacknet-money multiplier keeps the hacknet manager from launching. Binary
    decisions survive multiplier changes; weighted ones don't.
 
 ## Decision 5 — Augmentations: hardcoded priority, single pre-reset batch buy
+
+> **Amended 2026-07-10:** the reset batch buys on a **cascade** matching pilot's
+> grind order: **priority tier first**; the **rest (combat/social) tier is skipped
+> while any priority aug is still rep-locked** (leftover → NeuroFlux dump, a NF level
+> beating a combat aug while hacking augs are the goal), and **opens only once the
+> priority tier is exhausted** (no priority aug rep-locked anywhere). Then
+> priority → non-priority → NeuroFlux. **The Red Pill** is bought as soon as it's
+> rep-met, and lifecycle installs ASAP to claim it (`redPillReady`).
 
 Purchased augs are INERT until installed (verified in play — they take effect
 only after the install/soft-reset). Therefore buying early is strictly worse
