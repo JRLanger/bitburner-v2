@@ -49,19 +49,35 @@ progress: an aug is "ready" only when its rep is met **and** the money to buy it
 saved. (Rep alone is wrong — forming a gang unlocks nearly every aug's rep at once,
 which would fire an install before the money to buy them exists.)
 
-- `readyCount` = pilot's `acquirableNow` (priority augs the reset batch could afford
-  right now, simulating the ~1.9× ramp; rep met AND money saved), port 7.
+- `readyCount` = pilot's `acquirableNow` (augs the reset batch could afford right now,
+  rep met AND money saved; **once every real aug is owned, this becomes the count of
+  rep+money-ready NeuroFlux levels** — so NF farming still fires installs), port 7.
 - `runMs` = now − `getResetInfo().lastAugReset`.
 - `stagnantMs` = now − pilot's `lastAcquireTs` (when `acquirableNow` last grew — via
   grinding rep OR saving money); falls back to `lastAugReset` if nothing yet.
 
-Fires when EITHER:
+Fires when ANY of:
+- **Red Pill:** pilot's `redPillReady` is true (**The Red Pill** is rep-met and
+  unbought) — install ASAP to claim it. It's the BitNode win-enabler; there's no
+  reason to let it sit. `batchBuyAugs` buys it (a priority aug); **or**
 - `readyCount >= LIFECYCLE_MIN_AUGS` (8) **and** `stagnantMs >= LIFECYCLE_STAGNANT_MS`
   (30 min) — enough augs are affordable AND no new aug has become acquirable for a
   while, i.e. progress on the binding constraint (money or rep, whichever is greater)
   has plateaued; **or**
+- **plateau:** `readyCount >= 1` **and** `!grindPending` **and** `stagnantMs >=
+  LIFECYCLE_STAGNANT_MS` — pilot is done grinding **real augs** (both priority and
+  non-priority tiers exhausted, so its published `workSource` has descended to
+  `neuroflux`/`none`) and `acquirableNow` hasn't grown for a stagnation window, so
+  money isn't unlocking more either. `MIN_AUGS` can never be reached, so a small
+  batch is banked rather than idling to the 12 h cap; **or**
 - `readyCount >= 1` **and** `runMs >= LIFECYCLE_MAX_RUN_MS` (12 h) — the run has
   gone on long enough that even a single affordable aug is worth banking.
+
+`grindPending` = pilot is still grinding toward a real aug (its `workSource` is
+`priority` or `non-priority`). `readyCount` (= pilot's `acquirableNow`) counts exactly
+what `batchBuyAugs` would buy now: priority rep-met augs always, plus non-priority
+rep-met augs once the priority tier is exhausted (so non-priority augs can still fire
+an install).
 
 **Autonomy guard.** `armed = LIFECYCLE_AUTO_INSTALL || getFlag(ns, "autoInstall", false)`.
 `LIFECYCLE_AUTO_INSTALL` now ships **`true`** — aug installs run automatically once
@@ -82,7 +98,9 @@ alert line. **No purchase, no flag write, no reset call** happens on that path.
    manager — pserver, hacknet, pilot — subtracts `moneyFloor(ns)` from its
    spendable-money read via `lib/flags.js`, wired in with this change per
    `docs/plans/arbitration.md` Decision 2; Infinity survives the port because
-   `writePort` structured-clones rather than JSON-serializes) and flag `liquidate: true`, then
+   `writePort` structured-clones rather than JSON-serializes), **clears the
+   `augBatch` reservation** (`clearReservation(ns, "augBatch")`,
+   docs/plans/wallet-reservations.md), and sets flag `liquidate: true`, then
    polls `STATUS_PORT_STOCKS` (port 9, reserved but currently unpublished — no
    stocks manager exists yet) for `{liquidated: true}` up to
    `LIQUIDATE_ACK_TIMEOUT_MS` (30 s), proceeding regardless once it elapses.
@@ -90,22 +108,53 @@ alert line. **No purchase, no flag write, no reset call** happens on that path.
    but the flag-setting and timeout code is in place now per the plan, so
    the stocks manager (when built) only needs to honor `liquidate` and publish
    the ack; lifecycle's side of the protocol needs no future changes.
+   Clearing `augBatch` here isn't load-bearing for the freeze itself — the
+   `Infinity` floor already blocks every spender regardless of the reservation
+   total — but this checklist is about to spend the money that entry describes
+   (`batchBuyAugs`, next step), so the ledger shouldn't keep describing money
+   that's already gone. The port wipe at install clears it again anyway; this
+   is purely ledger hygiene for the (rare) recommend-only/observe-then-abort path.
 0.5. **`batchBuyAugs`** — the actual aug purchase, done now that money is about to
    become worthless. Gathers every rep-unlocked, not-owned aug across joined
-   factions; buys the **priority tier** (`config/aug-priority.js`) first, then the
-   rest, each **most-expensive-first** by live price (the ~1.9× ramp compounds
-   against later buys, so dear ones go first), re-scanning after each purchase
-   (a buy can satisfy another aug's `getAugmentationPrereq`). Returns the count
-   bought (logged). NeuroFlux is excluded — it's the next step.
-1. **`dumpNeuroflux`** — finds the joined faction with the highest current
-   `getFactionRep`, then loops `purchaseAugmentation(faction, 'NeuroFlux Governor')`
-   until it returns `false` (rep or money exhausted).
-2. **`spendDown`** (gated by `LIFECYCLE_SPEND_DOWN = true`) — finds the joined
-   faction with the highest `getFactionFavor`; if that favor is at or above
-   `getFavorToDonate()` (hardcoded 150 fallback if unavailable, matching
-   pilot's `startFactionWork` pattern), donates all remaining home money to it.
-   Below that threshold, does nothing (donating too early wastes money for
-   very little rep).
+   factions; buys the **priority tier** (`config/aug-priority.js`) **most-expensive-
+   first** by live price (the ~1.9× ramp compounds against later buys, so dear ones
+   go first), re-scanning after each purchase (a buy can satisfy another aug's
+   `getAugmentationPrereq`). Returns the count bought (logged). NeuroFlux is
+   excluded — it's the next step.
+   The **rest tier** (combat/social/etc.) buys on a **cascade**: it's skipped **while
+   any priority aug is still rep-locked** at a joined faction (the priority tier isn't
+   finished — leftover money flows to the NeuroFlux dump, where a NF level beats a
+   combat aug while hacking augs are still the goal). **Once no priority aug is
+   rep-locked** anywhere (priority exhausted), the rest tier opens and is bought after
+   the priority augs (still most-expensive-first). This mirrors pilot's grind order
+   (priority → non-priority → NeuroFlux). Priority augs gated behind a non-priority
+   prereq always install (prereqs are kept buyable). **The Red Pill** is a priority
+   aug, so it's bought here the moment it's rep-met.
+1. **`dumpNeuroflux`** — donate-exact-then-buy (docs/plans/donation-sizing.md), not the old
+   plain buy-until-rep-cap loop. Finds the joined faction with the highest current
+   `getFactionRep`, then loops (bounded, 1000 iterations): read NF's live `price`
+   (`getAugmentationPrice`) and `repReq` (`getAugmentationRepReq`, both reflecting the ~1.14×
+   per-level ramp), compute the current rep `gap`. If `gap` is already 0, just buy
+   (`purchaseAugmentation`); otherwise, **if** favor ≥ `getFavorToDonate()`
+   (`canDonate`, checked once up front), donate exactly `donationForRep(gap) * DONATE_SLOP`
+   to close the gap and then buy; if the combined donation+price exceeds available money, or
+   favor is below threshold and a gap remains, the loop stops. Net effect: instead of
+   "buy until rep runs out, then hand the rest to `spendDown`", money is converted into the
+   **maximum number of NF levels** the wallet can fund, each unlocked by an exactly-sized
+   donation rather than an oversized one. Returns the count bought (and the total donated,
+   both logged and folded into `logRun`'s line).
+2. **`spendDown`** (gated by `LIFECYCLE_SPEND_DOWN = true`) — runs *after* `dumpNeuroflux`'s
+   donate-exact-then-buy loop, so by construction whatever money survives to this step
+   **cannot** unlock and buy another NF level (`dumpNeuroflux` would already have spent it if
+   it could). That residual has no more purchases available to it, but donating it still isn't
+   wasted: an install wipes money **and** reputation, but **not favor**
+   (`docs/reference/game-mechanics.md`), so every dollar donated here banks persistent favor
+   for *future* runs at that faction — the entire reason this step exists, and the reason it's
+   documented as "residual → persistent favor" rather than the older "money is worthless at
+   reset so just dump it" framing. Finds the joined faction with the highest `getFactionFavor`;
+   if that favor is at or above `getFavorToDonate()` (hardcoded 150 fallback if unavailable,
+   matching pilot's `startFactionWork` pattern), donates all remaining home money to it. Below
+   that threshold, does nothing (donating too early wastes money for very little rep).
 3. **`recordRunDuration`** — computes `now - lastAugReset` for the lifecycle
    log **without touching `/data/bn-durations.json`**: hacknet's
    `computeHorizon()` already appends the finished run's duration itself on its
@@ -171,6 +220,18 @@ acquirable yet", and `computeDecision` falls back to `lastAugReset`).
   `ns.singularity.destroyW0r1dD43m0n(nextBN, BOOT_SCRIPT)`. This is the only
   code path in the whole project that can end a BitNode — lifecycle only ever
   points at it via the alert, never invokes it.
+
+## Debug log (`LIFECYCLE_DEBUG` → `/data/lifecycle-debug.txt`)
+
+When `LIFECYCLE_DEBUG` (constants.js) is true, each tick appends a rolling
+`key=value` line (last 400 kept) via `lib/debug-log.js`: `install`, `reason`,
+`ready` (readyCount), `grindPending`, `redPill` (redPillReady), `src` (pilot's
+grind tier), `stagMin`, `runHr`, the four trigger flags
+(`tRedPill`/`tStag`/`tPlateau`/`tRun`), the configured thresholds, `pilotAgeMs` (staleness of
+pilot's port read — a stale read zeroes `ready`/`grindPending`), pilot's
+`grind`/`work` targets, and `floor` (moneyFloor). View with `nano
+/data/lifecycle-debug.txt`; newest lines last. read/write are 0-GB. Set the constant
+false to silence.
 
 ## Why it's built this way
 

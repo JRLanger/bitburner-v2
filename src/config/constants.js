@@ -367,13 +367,13 @@ export const HACKNET_MANAGER_RAM = 8.20; // measured in-game (mem managers/hackn
  *  at SF4.2 this becomes ~249 GB, at SF4.1 ~981 GB — below SF4.3, pilot must be
  *  split into per-phase one-shot scripts (the documented RAM fallback in
  *  docs/plans/pilot-singularity.md) and this constant re-measured. */
-export const PILOT_MANAGER_RAM = 77.65; // STALE — re-measure: dropped aug-buying calls (~12.5GB) and added getMoneySources, formulas.work.factionGains, fileExists, travelToCity (city-faction join). `mem managers/pilot.js`
+export const PILOT_MANAGER_RAM = 77.65; // STALE — re-measure: dropped aug-buying calls (~12.5GB); added getMoneySources, formulas.work.factionGains, fileExists, travelToCity, and (2026-07-13) upgradeHomeRam, getUpgradeHomeRamCost, getFactionInviteRequirements, universityCourse, formulas.reputation.repFromDonation. `mem managers/pilot.js`
 /** Estimated (not yet measured in-game — re-measure with `mem managers/lifecycle.js`
  *  once played) from the type defs' documented per-call RAM costs: ~27.75 GB at
  *  SF4.3 (×1 multiplier). Like pilot, only viable as a single script at SF4.3 —
  *  at SF4.2 this becomes ~95 GB, at SF4.1 ~365 GB, and would need the same
  *  per-phase one-shot split pilot's plan documents as its RAM fallback. */
-export const LIFECYCLE_MANAGER_RAM = 27.75; // STALE — batchBuyAugs added getAugmentationsFromFaction/RepReq/Prereq/Price (~15GB). Re-measure `mem managers/lifecycle.js`
+export const LIFECYCLE_MANAGER_RAM = 27.75; // STALE — batchBuyAugs added getAugmentationsFromFaction/RepReq/Prereq/Price (~15GB); donation sizing (2026-07-13) added fileExists + formulas.reputation.repFromDonation. Re-measure `mem managers/lifecycle.js`
 
 /** Loop sleep for the (infrequent-purchase) managers, ms. */
 export const MANAGER_LOOP_SLEEP = 10000;
@@ -564,12 +564,13 @@ export const DASHBOARD_MIN_HOME_RAM_GB = 256;
 
 // ── pilot (singularity progression manager) ────────────────────────────────
 //
-// See docs/plans/pilot-singularity.md. All ns.singularity.* calls require SF4
-// (or BitNode 4) and are RAM-multiplied ×16/×4/×1 by SF4 level, so pilot is a
-// separate slow-tick manager — never imported into booster/orbiter.
+// See docs/plans/pilot-singularity.md. All ns.singularity.* functions require SF4
+// (or BitNode 4) and their RAM cost is ×16/×4/×1 by SF4 level — charged per
+// distinct function referenced per script (see docs/reference/game-mechanics.md),
+// so pilot is a separate manager, never imported into booster/orbiter.
 
-/** pilot's own loop sleep, ms. Progression state changes slowly; a slow tick also
- *  amortizes pilot's high per-call singularity RAM cost. */
+/** pilot's own loop sleep, ms. Progression state changes slowly — a fast tick
+ *  buys nothing (and tick rate has no RAM effect; see game-mechanics.md). */
 export const PILOT_LOOP_SLEEP = 30_000;
 
 /** Fraction of current money pilot may spend per tick on programs/augs. pserver's
@@ -598,6 +599,33 @@ export const PILOT_NEUROFLUX = "NeuroFlux Governor";
  *  many priority augs the reset batch could actually afford right now (the
  *  "acquirable" count that drives lifecycle's install decision). */
 export const AUG_PRICE_RAMP = 1.9;
+
+// ── home RAM upgrading (docs/plans/home-ram.md) ─────────────────────────────
+
+/** Fraction of pilot's spendable money (post floor+reservations) a single home-RAM
+ *  upgrade may cost — same Progression spend class as pilot's other buys. Never
+ *  raids the aug-batch reservation (that money is already excluded via moneyFloor). */
+export const HOME_RAM_SPEND_FRAC = 0.5;
+
+/** Stop upgrading home RAM at this size — escape hatch only; the game caps home
+ *  RAM on its own, so Infinity = "no artificial limit". */
+export const HOME_RAM_MAX_GB = Infinity;
+
+// ── donation sizing (docs/plans/donation-sizing.md) ─────────────────────────
+
+/** Multiply every sized donation by this to absorb rounding, so one donation
+ *  reliably closes the rep gap it was computed for. */
+export const DONATE_SLOP = 1.001;
+
+// ── faction prereqs + stat training (docs/plans/faction-prereqs-training.md) ─
+
+/** Train demanded stats to requirement × this buffer, so a stat that drifts or a
+ *  re-check race doesn't flap the training row on/off at the boundary. */
+export const TRAIN_STAT_BUFFER = 1.05;
+
+/** Gang/karma path (docs/plans/gang.md): pilot's karma row trains combat stats
+ *  until Homicide's success chance clears this bar before grinding karma. */
+export const KARMA_HOMICIDE_MIN_CHANCE = 0.5;
 
 // ── arbitration (docs/plans/arbitration.md) ────────────────────────────────
 //
@@ -632,6 +660,31 @@ export const MECH_SPEND_FRAC = 0.25;
  *  and defers (log once) if a launch wouldn't fit — gates stay true, so it
  *  launches once home grows enough. */
 export const MANAGER_HOME_RAM_FRAC = 0.25;
+
+/** Reservation entries (lib/flags.js virtual wallet — docs/plans/
+ *  wallet-reservations.md) older than this stop counting toward moneyFloor().
+ *  Read-side TTL: if the writer dies, its hold releases itself; live writers
+ *  refresh `ts` every tick. */
+export const RESERVATION_TTL_MS = 5 * 60_000;
+
+/** Weighted-ETA grind arbitration (arbitration.md Decision 1/4 amendments,
+ *  2026-07-13): among applicable GRIND-class ladder rows, the winner is the
+ *  lowest effectiveEta = ETA / weight. Weights are hand-tuned ordinal bias
+ *  (favor karma over rep grinding, disfavor pure money crime) — NOT a computed
+ *  cross-domain score. */
+export const GRIND_WEIGHTS = {
+    "karma-grind": 1.5,
+    "company-work": 1.0,
+    "stat-training": 1.0,
+    "faction-work": 1.0,
+    "crime-fallback": 0.5,
+};
+
+/** A grind row whose RAW ETA exceeds this is skipped whenever another applicable
+ *  grind's raw ETA is under it — a days-long rep grind yields the focus slot to
+ *  karma/training. Unknown ETA (no rate sample yet) is treated as exactly this
+ *  value: eligible, not favored. */
+export const GRIND_ETA_SKIP_MS = 8 * 3600_000;
 
 // ── lifecycle (reset automation) — docs/plans/reset-lifecycle.md ───────────
 //
@@ -675,6 +728,9 @@ export const LIFECYCLE_MAX_RUN_MS = 12 * 3600_000;
 /** Whether the pre-reset checklist donates leftover money to the highest-favor
  *  faction (favor ≥ getFavorToDonate()) before installing. */
 export const LIFECYCLE_SPEND_DOWN = true;
+/** The Red Pill: the Special aug (from Daedalus) that makes w0r1d_d43m0n reachable.
+ *  Lifecycle installs ASAP once it's rep-met (redPillReady) to claim it. */
+export const RED_PILL_AUG = "The Red Pill";
 /** Home RAM target boot.js's grind loop upgrades toward (devlog 01). */
 export const BOOT_TARGET_HOME_GB = 32;
 /** Minimum Mug success chance boot.js requires before skipping the gym-training
@@ -682,3 +738,11 @@ export const BOOT_TARGET_HOME_GB = 32;
 export const BOOT_MUG_MIN_CHANCE = 0.6;
 /** Persistent (survives resets) human-readable lifecycle log file. */
 export const LIFECYCLE_LOG_FILE = "/data/lifecycle-log.txt";
+/** Per-tick diagnostic logging (lib/debug-log.js). When true, pilot and lifecycle
+ *  each append a rolling key=value trace of every decision input to their debug
+ *  file — used to see WHY they pick a grind target / (don't) install. Set false to
+ *  silence once behavior is confirmed. read/write are 0-GB, so this costs no RAM. */
+export const PILOT_DEBUG = true;
+export const LIFECYCLE_DEBUG = true;
+export const PILOT_DEBUG_LOG = "/data/pilot-debug.txt";
+export const LIFECYCLE_DEBUG_LOG = "/data/lifecycle-debug.txt";

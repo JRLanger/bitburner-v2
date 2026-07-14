@@ -7,8 +7,13 @@ docs for offline reference while writing scripts.
 It is **not** specific to this project — it does not describe any of our own scripts,
 architecture, or strategy. For that, see [`../devlog/`](../devlog/).
 
+One exception: `game-mechanics.md` **is** project-maintained — a short list of
+engine behaviors every script must get right (static RAM model, reset semantics,
+aug price ramps). Read it before writing or reviewing scripts.
+
 Contents:
 
+- `game-mechanics.md` — **project-maintained**: engine rules scripts must get right
 - `index.md` — top-level docs index
 - `help/` — getting started, FAQ, tools
 - `basic/` — core game mechanics (hacking, servers, scripts, stock market, etc.)

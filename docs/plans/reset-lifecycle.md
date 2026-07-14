@@ -88,10 +88,25 @@ Compute each tick, publish in status, and act only when threshold met:
 
 > **IMPLEMENTED 2026-07-06 (arbitration.md Decision 5).** Step 0.5 `batchBuyAugs`
 > sits between freeze and NF dump: buys the priority tier (`config/aug-priority.js`
-> — category-based, not getAugmentationStats) then the rest, each most-expensive-first
-> by live price, re-scanning for prereqs. The install decision now keys off pilot's
-> `acquirableNow` / `lastAcquireTs` (affordable-AND-unlocked staleness), not `lastAugPurchaseTs`.
+> — category-based, not getAugmentationStats) most-expensive-first by live price,
+> re-scanning for prereqs. **Amended 2026-07-10:** rest tier buys on a **cascade** —
+> skipped while any priority aug is still rep-locked (leftover → NF dump), opening
+> only once the priority tier is exhausted (priority → non-priority → NeuroFlux). The
+> install decision keys off pilot's `acquirableNow` / `lastAcquireTs`
+> (affordable-AND-unlocked staleness), plus `workSource` (still grinding a real aug?)
+> and `redPillReady` (install ASAP to claim **The Red Pill**).
 > See `docs/scripts/lifecycle.md` for the shipped behavior.
+
+> **Amended 2026-07-13 (docs/plans/donation-sizing.md):** steps 1–2 are resized.
+> Step 1's NF dump becomes a **donate-exact-then-buy loop**: when the faction's
+> favor clears `getFavorToDonate()`, each NF level's remaining rep gap is closed
+> with a donation sized via `donationForRep(gap)` (Formulas
+> `reputation.repFromDonation` inverse, closed-form fallback) before buying — so
+> money converts into the maximum number of NF levels instead of stopping at the
+> rep cap. Step 2's spend-down stays LAST and its rationale is corrected: rep is
+> wiped at install but **favor persists**, so donating the true residual banks
+> favor (not "banking rep for next run"). Step 0 additionally clears the
+> `augBatch` reservation (docs/plans/wallet-reservations.md).
 
 0. **Liquidate & freeze spending:** set runtime flags `liquidate: true` (stock
    manager sells all positions and acks with `liquidated: true` in its status —

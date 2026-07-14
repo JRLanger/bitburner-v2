@@ -11,10 +11,13 @@
  * docs/plans/pilot-singularity.md and docs/scripts/pilot.md.
  *
  * Independent slow-tick loop, launched on home by booster/orbiter (see MANAGERS
- * in each controller) once the SF4 gate passes. Every ns.singularity.* call is
- * RAM-multiplied ×16/×4/×1 by SF4 level, so this script deliberately: (a) never
- * gets imported into booster/orbiter, (b) ticks slowly (PILOT_LOOP_SLEEP), and
- * (c) calls as few distinct singularity functions per tick as the phases need.
+ * in each controller) once the SF4 gate passes. RAM note (see
+ * docs/reference/game-mechanics.md): script RAM is charged per DISTINCT ns
+ * function referenced in the source — call frequency and tick rate are
+ * irrelevant. So the RAM discipline here is (a) never import this file into
+ * booster/orbiter (each singularity function would be re-charged there, ×16/×4/×1
+ * by SF4 level), and (b) keep the set of distinct singularity functions minimal.
+ * The slow tick (PILOT_LOOP_SLEEP) is purely for CPU and observability.
  *
  * Arbitration: pilot is the ONLY script that ever starts/stops player work
  * (Decision 1, arbitration.md) — no other manager calls workForFaction/commitCrime/
@@ -30,16 +33,26 @@ import {
     PILOT_JOIN_BLOCKLIST,
     BACKDOOR_TARGETS,
     PILOT_NEUROFLUX,
+    RED_PILL_AUG,
     SERVERS_JSON,
     FOCUS_STABLE_TICKS,
     STATUS_PORT_PSERVER,
     PILOT_INCOME_EMA_ALPHA,
     AUG_PRICE_RAMP,
+    PILOT_DEBUG,
+    PILOT_DEBUG_LOG,
+    HOME_RAM_SPEND_FRAC,
+    HOME_RAM_MAX_GB,
+    DONATE_SLOP,
+    TRAIN_STAT_BUFFER,
+    GRIND_WEIGHTS,
+    GRIND_ETA_SKIP_MS,
 } from "/config/constants.js";
 import { PRIORITY_AUGS, AUG_BASE_PRICE } from "/config/aug-priority.js";
 import { publishStatus, readStatus } from "/lib/status.js";
-import { getFlag, setFlag, moneyFloor } from "/lib/flags.js";
+import { getFlag, setFlag, moneyFloor, setReservation, clearReservation } from "/lib/flags.js";
 import { findPath } from "/lib/netpath.js";
+import { debugLog } from "/lib/debug-log.js";
 
 /** Crime selection for ladder rows 1 (bootstrap) and 8 (money fallback) is
  *  CHANCE-AWARE: pick the best expected-$/sec crime (money × chance ÷ time) from
@@ -62,9 +75,41 @@ const GYM_LOCATION = "Powerhouse Gym";
 const COMBAT_SKILLS = [
     ["strength", "str"], ["defense", "def"], ["dexterity", "dex"], ["agility", "agi"],
 ];
+/** Sector-12's university (LocationNameEnumType.Sector12RothmanUniversity). Any
+ *  university works; this one is reachable from the same starting city as
+ *  GYM_LOCATION. universityCourse returns false if unreachable — the training
+ *  row's maintain() just retries next tick (no dedicated travel in v1). */
+const UNIVERSITY_LOCATION = "Rothman University";
+/** UniversityClassType enum values used for training-demand rows
+ *  (faction-prereqs-training.md): charisma -> Leadership, hacking -> Algorithms. */
+const UNIVERSITY_COURSE_BY_STAT = { charisma: "Leadership", hacking: "Algorithms" };
+/** Hand-curated list of "classic" requirement-gated factions worth pursuing via
+ *  the prereq planner (faction-prereqs-training.md). No Netscript API enumerates
+ *  ALL faction names (verified against NetscriptDefinitions.d.ts: FactionName is a
+ *  closed enum type, not something a getter returns as a list) short of exhaustively
+ *  listing the enum itself, so this is that list, kept here (not aug-priority.js,
+ *  which has no faction mapping) so the player can add/remove factions as they learn
+ *  which augs matter for their build. City factions are handled separately by the
+ *  existing CITY_FACTIONS/pursueCityFaction travel logic and are NOT repeated here. */
+const PLANNED_FACTIONS = [
+    "CyberSec", "NiteSec", "The Black Hand", "BitRunners", "Daedalus", "The Covenant",
+    "Illuminati", "Tetrads", "Slum Snakes", "Tian Di Hui", "Netburners",
+    "Bachman & Associates", "ECorp", "MegaCorp", "KuaiGong International", "Four Sigma",
+    "NWO", "Blade Industries", "OmniTek Incorporated", "Fulcrum Secret Technologies",
+    "Clarke Incorporated", "Speakers for the Dead", "The Dark Army", "The Syndicate",
+    "Silhouette",
+];
 /** Below this much home RAM, nothing else in the pipeline works yet — see
  *  arbitration.md ladder row 1. */
 const BOOTSTRAP_HOME_RAM_GB = 32;
+/** NeuroFlux Governor per-level scaling: each level multiplies BOTH its price and its
+ *  rep requirement by this factor. Long-standing Bitburner constant (base $750k / 500
+ *  rep, ×1.14 per level — see docs/reference/augmentations.md). VERIFY in-game if NF
+ *  ready-counts look off. Used only to simulate how many NF levels are rep+money-ready
+ *  (countReadyNeuroflux); the actual buy loop in lifecycle re-reads live prices. */
+const NF_LEVEL_MULT = 1.14;
+/** Loop cap for the NF ready-count simulation (bounds the while loop). */
+const NF_READY_CAP = 1000;
 
 export async function main(ns) {
     ns.disableLog("ALL");
@@ -92,6 +137,16 @@ export async function main(ns) {
         // travel back to Sector-12 (for the crime-row gym) once city joins are done,
         // without disturbing a city the PLAYER chose manually.
         travel: { awayForCity: false },
+        // home-ram.md: per-process count of home-RAM upgrades bought (dashboard only).
+        homeRamBought: 0,
+        // faction-prereqs-training.md: computeFactionPlans' output, refreshed at the
+        // end of phaseFactions each tick — { training, backdoors, company, byFaction }.
+        // phaseBackdoors runs BEFORE phaseFactions in the tick loop, so it reads last
+        // tick's plans; one tick of staleness is harmless here.
+        plans: { training: [], backdoors: [], company: [], byFaction: [] },
+        // Empirical stat-gain rate (stat units/sec) for the currently ladder-trained
+        // stat, sampled the same way as state.rep's empirical rep-rate fallback.
+        train: { lastStat: null, lastVal: null, lastTs: null, rate: null },
     };
 
     while (true) {
@@ -106,7 +161,8 @@ export async function main(ns) {
         sampleIncome(ns, state);
 
         phaseTor(ns, snapshot);
-        await phaseBackdoors(ns, snapshot);
+        phaseHomeRam(ns, snapshot, state);  // home-ram.md: after TOR, before augs report
+        await phaseBackdoors(ns, snapshot, state);
         phaseFactions(ns, snapshot, state);
         phaseAugs(ns, snapshot);            // report-only: computes acquirableNow
         trackAcquire(state, snapshot);      // stamp lastAcquireTs when the set grows
@@ -115,6 +171,8 @@ export async function main(ns) {
         const status = buildStatus(ns, snapshot, workState, state);
         renderStatus(ns, status);
         publishStatus(ns, STATUS_PORT_PILOT, status);
+
+        if (PILOT_DEBUG) logTick(ns, snapshot, workState, state);
 
         await ns.sleep(PILOT_LOOP_SLEEP);
     }
@@ -166,16 +224,27 @@ function singularityAvailable(ns) {
 
 // ── State snapshot ───────────────────────────────────────────────────────────
 
-/** One place that calls the expensive singularity getters, so every phase this
- *  tick works off a single consistent read instead of re-querying (and re-paying
- *  RAM/CPU for) the same data repeatedly. */
+/** One place that calls the singularity getters, so every phase this tick works
+ *  off a single consistent read instead of re-querying the same data repeatedly
+ *  (consistency + CPU; repeat calls have no RAM effect — game-mechanics.md). */
 function gatherState(ns) {
     const sing = ns.singularity;
+    const moneyRaw = ns.getServerMoneyAvailable("home");
+    const floor = moneyFloor(ns);
     return {
         // moneyFloor (lib/flags.js): reserve lifecycle asks all managers to leave
         // untouched — Infinity during the pre-reset checklist freezes spending
         // entirely. Subtracted at the snapshot so every phase's spend cap sees it.
-        money: Math.max(0, ns.getServerMoneyAvailable("home") - moneyFloor(ns)),
+        money: Math.max(0, moneyRaw - floor),
+        // wallet-reservations.md: the aug-batch reservation IS money computed from THIS
+        // field (phaseAugs/countAcquirable/countReadyNeuroflux use it, nothing else
+        // does). It subtracts only the FROZEN floor (raw flag), never the live
+        // reservation total moneyFloor() now includes — feeding fully-floored money
+        // into the aug simulation would count pilot's own reservation against itself
+        // and shrink it to zero every tick (self-shrink feedback loop).
+        moneyForAugs: Math.max(0, moneyRaw - getFlag(ns, "moneyFloor", 0)),
+        moneyRaw,        // pre-floor, for debug logging
+        moneyFloor: floor, // for debug logging
         homeRam: ns.getServerMaxRam("home"),
         ownedPrograms: new Set(ns.ls("home", ".exe")),
         hasTor: ns.hasTorRouter(),
@@ -230,6 +299,24 @@ function phaseTor(ns, snap) {
     }
 }
 
+// ── Phase (home RAM) ─────────────────────────────────────────────────────────
+
+/** docs/plans/home-ram.md — perpetual home-RAM upgrading. One upgrade per tick max
+ *  (observable buys; the doubling cost curve makes the frac gate self-limiting).
+ *  snap.money is net of floor + reservations, so the aug batch is never raided —
+ *  per user decision (2026-07-13), home RAM buys strictly from unreserved money. */
+function phaseHomeRam(ns, snap, state) {
+    if (snap.homeRam >= HOME_RAM_MAX_GB) return;
+    const cost = ns.singularity.getUpgradeHomeRamCost();
+    snap.nextHomeRamCost = cost;
+    if (cost > snap.money * HOME_RAM_SPEND_FRAC) return;
+    if (ns.singularity.upgradeHomeRam()) {
+        snap.homeRam = ns.getServerMaxRam("home");
+        state.homeRamBought = (state.homeRamBought ?? 0) + 1;
+        snap.money = Math.max(0, snap.money - cost);
+    }
+}
+
 // ── Phase 2: backdoors ───────────────────────────────────────────────────────
 
 /** One backdoor per tick max (per the plan) — keeps ticks short and each install
@@ -238,13 +325,18 @@ function phaseTor(ns, snap) {
  *  installs, then always returns home.
  *  Backdoor state is checked here via ns.getServer rather than stamped into
  *  servers.json — booster shouldn't pay getServer's RAM just to feed pilot, and
- *  pilot (home-only, already singularity-priced) checks at most 5 hosts. */
-async function phaseBackdoors(ns, snap) {
+ *  pilot (home-only, already singularity-priced) checks at most 5 hosts.
+ *  faction-prereqs-training.md: hosts computeFactionPlans flagged as gating a
+ *  wanted faction's invite (state.plans.backdoors, one tick stale — see main's
+ *  phase-order comment) are prepended so the planner's picks jump the queue ahead
+ *  of the static BACKDOOR_TARGETS list; deduped via Set. */
+async function phaseBackdoors(ns, snap, state) {
     const sing = ns.singularity;
     const byHost = new Map(snap.servers.map((s) => [s.hostname, s]));
     const hackLvl = ns.getHackingLevel();
+    const targets = [...new Set([...(state.plans?.backdoors ?? []), ...BACKDOOR_TARGETS])];
 
-    for (const host of BACKDOOR_TARGETS) {
+    for (const host of targets) {
         const info = byHost.get(host);
         if (!info || !info.hasRoot) continue;
         if (hackLvl < info.hackLevelReq) continue;
@@ -292,7 +384,14 @@ function phaseFactions(ns, snap, state) {
         if (PILOT_JOIN_BLOCKLIST.includes(faction)) { pending.push(faction); continue; }
         const enemies = sing.getFactionEnemies(faction);
         if (enemies.length === 0) {
+            // POLICY (user decision 2026-07-13): every enemy-free invite is joined
+            // UNCONDITIONALLY, the tick it appears — even a faction with zero wanted
+            // augs. Joining costs nothing, can't block anything (no enemies), and
+            // membership is pure upside (rep channel, intelligence XP). Only factions
+            // with enemies (city rivals) are ever gated on aug value. A failed join
+            // goes to pendingInvites so it's visible instead of silently dropped.
             if (sing.joinFaction(faction)) joined.add(faction);
+            else pending.push(faction);
         } else if (CITY_FACTIONS.includes(faction)) {
             // City faction invite present (we're in its city, reqs met) → join only if
             // no rival already joined AND it still has a wanted priority aug.
@@ -307,6 +406,152 @@ function phaseFactions(ns, snap, state) {
     snap.joinedFactions = [...joined];
     snap.pendingInvites = pending;
     snap.cityTarget = pursueCityFaction(ns, snap, joined, owned, state);
+    computeFactionPlans(ns, snap, owned, joined, state);
+}
+
+// ── Faction-prereq planner (faction-prereqs-training.md) ────────────────────
+
+/** True if a PlayerRequirement (or compound someCondition/everyCondition tree) is
+ *  currently satisfied. Pure predicate — no demand side effects — so it can be
+ *  called freely while picking someCondition's cheapest unmet branch below.
+ *  companyReputation/employedBy have no cheap NS check available under this file's
+ *  RAM budget (no new getCompanyRep-style call is allowed), so they're conservatively
+ *  treated as unmet — report-only, never blocking anything pilot itself decides. */
+function reqMet(req, player, ns) {
+    switch (req.type) {
+        case "money": return player.money >= req.money;
+        case "city": return player.city === req.city;
+        case "backdoorInstalled": return ns.getServer(req.server).backdoorInstalled;
+        case "skills": return Object.entries(req.skills).every(([stat, lvl]) => player.skills[stat] >= lvl);
+        case "companyReputation":
+        case "employedBy":
+            return false;
+        case "not": return !reqMet(req.condition, player, ns);
+        case "someCondition": return req.conditions.some((c) => reqMet(c, player, ns));
+        case "everyCondition": return req.conditions.every((c) => reqMet(c, player, ns));
+        // karma, numAugmentations, jobTitle, bladeburnerRank, numInfiltrations,
+        // sourceFile, bitNodeN, hacknet*, file, location, numPeopleKilled: no
+        // actionable demand pilot can produce, and most are satisfied by other
+        // paths (gang/resets) — report-only, treated as met so they never block.
+        default: return true;
+    }
+}
+
+/** "Cheapest" ordering for someCondition's unmet-branch pick (faction-prereqs-
+ *  training.md: prefer skills > backdoor > company). Lower = cheaper. */
+function reqCheapness(req) {
+    if (req.type === "skills") return 0;
+    if (req.type === "backdoorInstalled") return 1;
+    if (req.type === "companyReputation" || req.type === "employedBy") return 2;
+    return 3;
+}
+
+/** Stats the training row can actually raise (gym: combat, university: charisma/
+ *  hacking). A skills demand for anything else (e.g. intelligence) must stay
+ *  report-only: an untrainable demand would keep the training row applicable while
+ *  startTraining has nothing to start — pilot would idle forever on it. */
+const TRAINABLE_STATS = new Set([
+    ...COMBAT_SKILLS.map(([full]) => full), "charisma", "hacking",
+]);
+
+/** Records demands (training/backdoors/company) for an UNMET requirement into
+ *  `out`, recursing into compound types: someCondition is unmet only when ALL
+ *  branches are unmet, so only its single cheapest branch is demand-ified (no point
+ *  training AND backdooring when either alone would satisfy it); everyCondition
+ *  demands every one of its unmet branches (all must be satisfied). Leaf types with
+ *  no actionable demand (money, city, karma, ...) just record their type string for
+ *  the dashboard's byFaction.unmet list. */
+function recordDemand(req, player, ns, out) {
+    switch (req.type) {
+        case "skills":
+            for (const [stat, target] of Object.entries(req.skills)) {
+                if (!TRAINABLE_STATS.has(stat)) continue; // report-only via the push below
+                if (player.skills[stat] < target) {
+                    const cur = out.training.get(stat);
+                    if (!cur || target > cur) out.training.set(stat, target);
+                }
+            }
+            out.unmetTypes.push("skills");
+            return;
+        case "backdoorInstalled":
+            out.backdoors.add(req.server);
+            out.unmetTypes.push("backdoorInstalled");
+            return;
+        case "companyReputation":
+        case "employedBy":
+            out.company.push(req);
+            out.unmetTypes.push(req.type);
+            return;
+        case "not":
+            // Satisfying a NOT means making the inner condition FAIL (e.g. "not
+            // employed by CIA") — generating demands that would SATISFY it is exactly
+            // backwards, and pilot has no un-doing actions anyway. Report-only.
+            out.unmetTypes.push("not");
+            return;
+        case "someCondition": {
+            const unmetBranches = req.conditions.filter((c) => !reqMet(c, player, ns));
+            if (unmetBranches.length === 0) return;
+            const cheapest = [...unmetBranches].sort((a, b) => reqCheapness(a) - reqCheapness(b))[0];
+            recordDemand(cheapest, player, ns, out);
+            return;
+        }
+        case "everyCondition":
+            for (const c of req.conditions) {
+                if (!reqMet(c, player, ns)) recordDemand(c, player, ns, out);
+            }
+            return;
+        default:
+            out.unmetTypes.push(req.type);
+    }
+}
+
+/** Prereq planner (faction-prereqs-training.md Part A): for each PLANNED_FACTIONS
+ *  entry that's unjoined, not blocklisted, enemy-free with what's already joined,
+ *  and still offers an unowned priority aug, classify getFactionInviteRequirements
+ *  into training/backdoor/company demands + a report-only unmet-type list. No
+ *  Netscript API enumerates every faction name (FactionName is a closed enum in the
+ *  type defs, not something a getter returns as a list) — see PLANNED_FACTIONS.
+ *  Result lands in state.plans (not snap): phaseBackdoors runs BEFORE phaseFactions
+ *  in the tick loop, so it reads last tick's plans — one tick of staleness, fine. */
+function computeFactionPlans(ns, snap, owned, joined, state) {
+    const sing = ns.singularity;
+    const player = ns.getPlayer();
+    const out = { training: new Map(), backdoors: new Set(), company: [], unmetTypes: [] };
+    const byFaction = [];
+
+    for (const faction of PLANNED_FACTIONS) {
+        // The WHOLE per-faction body is guarded: PLANNED_FACTIONS is hand-typed, and
+        // getFactionEnemies/getAugmentationsFromFaction THROW on a name the game
+        // doesn't recognize (typo, faction absent this BN). An uncaught throw here
+        // kills pilot's entire loop — including the invite auto-join — so one bad
+        // list entry must never take the whole manager down.
+        try {
+            if (joined.has(faction) || PILOT_JOIN_BLOCKLIST.includes(faction)) continue;
+            if (sing.getFactionEnemies(faction).some((e) => joined.has(e))) continue;
+            if (!sing.getAugmentationsFromFaction(faction).some((a) => PRIORITY_AUGS.has(a) && !owned.has(a))) continue;
+
+            const reqs = sing.getFactionInviteRequirements(faction);
+            const unmet = [];
+            for (const req of reqs) {
+                if (reqMet(req, player, ns)) continue;
+                const before = out.unmetTypes.length;
+                recordDemand(req, player, ns, out);
+                unmet.push(...out.unmetTypes.slice(before));
+            }
+            if (unmet.length > 0) byFaction.push({ faction, unmet });
+        } catch {
+            continue; // bad/unavailable faction name — skip it, keep pilot alive
+        }
+    }
+
+    state.plans = {
+        // Dedup per stat, keeping the largest target (a stat can be demanded by
+        // multiple factions at different levels).
+        training: [...out.training].map(([stat, target]) => ({ stat, target })),
+        backdoors: [...out.backdoors],
+        company: out.company,
+        byFaction,
+    };
 }
 
 /** True if a faction still offers a priority aug we don't own (works for factions
@@ -368,30 +613,69 @@ function pursueCityFaction(ns, snap, joined, owned, state) {
 function phaseAugs(ns, snap) {
     const sing = ns.singularity;
     const ownedOrPurchased = new Set(sing.getOwnedAugmentations(true));
-    const repMet = [];
+    const repMetPriority = [];
+    const repMetRest = [];
+    let priorityLocked = false;   // a priority aug is unowned and rep-met at NO faction
+    let anyUnownedReal = false;   // any non-NF aug at a joined faction we don't own yet
     const seen = new Set();
 
     for (const faction of snap.joinedFactions) {
         const rep = sing.getFactionRep(faction);
         for (const aug of sing.getAugmentationsFromFaction(faction)) {
-            if (!PRIORITY_AUGS.has(aug)) continue;
-            if (ownedOrPurchased.has(aug) || seen.has(aug)) continue;
+            if (aug === PILOT_NEUROFLUX || ownedOrPurchased.has(aug)) continue;
+            anyUnownedReal = true;
+            const prio = PRIORITY_AUGS.has(aug);
             if (rep >= sing.getAugmentationRepReq(aug)) {
+                if (seen.has(aug)) continue;
                 seen.add(aug);
-                repMet.push(aug);
+                (prio ? repMetPriority : repMetRest).push(aug);
+            } else if (prio) {
+                priorityLocked = true; // still grindable → priority tier not finished
             }
         }
     }
 
-    snap.repUnlocked = repMet.length;
-    snap.acquirableNow = countAcquirable(repMet, snap.money);
-    // NeuroFlux affordable-level count: informational only (lifecycle owns the
-    // actual dump, since buying early wastes the per-purchase inflation).
-    snap.nfAffordableLevels = countAffordableNeuroflux(sing, snap.money);
+    // The Red Pill is a priority aug; if it's rep-met and unbought, lifecycle installs
+    // ASAP to claim it (redPillReady drives the redPillTrigger install).
+    snap.redPillReady = repMetPriority.includes(RED_PILL_AUG);
+
+    // wallet-reservations.md: feed the aug simulation moneyForAugs (raw minus only
+    // the frozen floor), never the fully-floored snap.money — see gatherState.
+    const nfReady = countReadyNeuroflux(sing, snap.moneyForAugs, bestRepFaction(sing, snap.joinedFactions));
+    snap.nfAffordableLevels = nfReady;
+
+    if (anyUnownedReal) {
+        // Real augs still obtainable → readiness = what the reset batch would buy now:
+        // priority augs always, plus non-priority once no priority aug is rep-locked
+        // (mirrors batchBuyAugs's cascade). NeuroFlux is excluded here — it's the
+        // pre-reset dump, not part of the real-aug batch.
+        const readySet = priorityLocked ? repMetPriority : [...repMetPriority, ...repMetRest];
+        snap.repUnlocked = readySet.length;
+        const { bought, cost } = countAcquirable(readySet, snap.moneyForAugs);
+        snap.acquirableNow = bought;
+        // wallet-reservations.md: earmark the simulated cost so no other spender
+        // (pserver, hacknet, pilot's own programs/donations/home-RAM) can un-ready an
+        // already-acquirable aug. Refreshed every tick (single writer: pilot).
+        if (cost > 0) setReservation(ns, "augBatch", cost, "pilot", "acquirable augs");
+        else clearReservation(ns, "augBatch");
+        snap.reservedForAugs = cost;
+    } else {
+        // Every real aug at joined factions is owned → NeuroFlux becomes the "real" aug:
+        // its rep+money-ready level count IS the readiness metric, so grinding NF rep
+        // grows readyCount (keeping the run open) and plateaus into an install (which
+        // banks the levels via dumpNeuroflux). Stops the old "grind NF forever, never
+        // install" deadlock. NF is bought under lifecycle's freeze, never reserved.
+        snap.repUnlocked = nfReady;
+        snap.acquirableNow = nfReady;
+        clearReservation(ns, "augBatch");
+        snap.reservedForAugs = 0;
+    }
 }
 
-/** How many of `augs` (rep-met priority aug names) the reset batch could afford now.
- *  Mirrors lifecycle's batch buy: most-expensive-first, each purchase multiplies the
+/** How many of `augs` (rep-met priority aug names) the reset batch could afford now,
+ *  and the cumulative simulated cost of those it counted (wallet-reservations.md:
+ *  the caller reserves this cost so no other spender un-readies it). Mirrors
+ *  lifecycle's batch buy: most-expensive-first, each purchase multiplies the
  *  remaining augs' prices by AUG_PRICE_RAMP. Uses base prices (aug-priority.js) — a
  *  cheap proxy; the live buy re-reads real prices. Keeps scanning past a too-dear aug
  *  since a cheaper one may still fit at the current ramp level. */
@@ -399,67 +683,78 @@ function countAcquirable(augs, money) {
     const sorted = [...augs].sort((a, b) => (AUG_BASE_PRICE[b] ?? 0) - (AUG_BASE_PRICE[a] ?? 0));
     let cash = money;
     let bought = 0;
+    let cost = 0;
     for (const aug of sorted) {
-        const cost = (AUG_BASE_PRICE[aug] ?? 0) * Math.pow(AUG_PRICE_RAMP, bought);
-        if (cost <= cash) { cash -= cost; bought++; }
+        const price = (AUG_BASE_PRICE[aug] ?? 0) * Math.pow(AUG_PRICE_RAMP, bought);
+        if (price <= cash) { cash -= price; cost += price; bought++; }
     }
-    return bought;
-}
-
-function countAffordableNeuroflux(sing, money) {
-    let n = 0;
-    let cash = money;
-    for (let i = 0; i < 1000; i++) {
-        let price;
-        try {
-            price = sing.getAugmentationPrice(PILOT_NEUROFLUX);
-        } catch {
-            break;
-        }
-        if (price > cash) break;
-        cash -= price;
-        n++;
-        // NF has no fixed inflation constant exposed here; stop after a
-        // reasonable cap rather than looping on a possibly-static price.
-        if (n > 200) break;
-    }
-    return n;
+    return { bought, cost };
 }
 
 // ── Phase 5: player-activity ladder (arbitration.md) ────────────────────────
 
 /**
- * choosePlayerActivity() — priority ladder (arbitration.md). This build implements
- * the SKELETON rows only: 1 (bootstrap crime), 6 (faction work), 8 (crime
- * fallback), 9 (idle). Rows 2-5 and 7 depend on mechanic managers that don't exist
- * yet; they're written as always-inapplicable placeholders so the ladder's shape
- * (an ordered {name, applicable, start, stop} array) is already correct and future
- * plans only need to insert rows, never restructure this function.
+ * choosePlayerActivity() — priority ladder (arbitration.md, amended 2026-07-13 —
+ * weighted-ETA grind selection). Rows carry `cls: "gate" | "grind"`. GATE rows
+ * (bootstrap-crime, the bladeburner stubs, idle) preempt absolutely in ladder
+ * order, same as before. Among applicable GRIND rows (karma-grind, company-work,
+ * stat-training, faction-work, crime-fallback) pickWinner() (see phaseWork) picks
+ * the lowest ETA/GRIND_WEIGHTS[row] instead of the first one in ladder order — see
+ * the arbitration.md amendment for the full rationale (a strict top-row-wins rule
+ * would let rep grinding monopolize focus and stall gang formation). This build
+ * implements rows 1 (bootstrap crime), 5 (stat training), 6 (faction work), 8
+ * (crime fallback), 9 (idle). Rows 2-4 and 7 depend on mechanic managers that don't
+ * exist yet; they're written as always-inapplicable placeholders so the ladder's
+ * shape (an ordered {name, cls, applicable, start, stop, eta?} array) is already
+ * correct and future plans only need to insert rows, never restructure this
+ * function.
  */
-function ladder(ns, snap) {
+function ladder(ns, snap, state) {
     return [
         {
             name: "bootstrap-crime",
+            cls: "gate",
             applicable: () => snap.homeRam < BOOTSTRAP_HOME_RAM_GB,
             start: (ns) => startCrimeOrTrain(ns),
             maintain: (ns, reassert) => maintainCrime(ns, reassert),
             stop: (ns) => ns.singularity.stopAction(),
         },
         // Row 2 (karma grind / gang assist) — needs the gang manager's focusRequest.
-        { name: "karma-grind", applicable: () => false, start: () => {}, stop: () => {} },
+        { name: "karma-grind", cls: "grind", applicable: () => false, start: () => {}, stop: () => {} },
         // Row 3 (Bladeburner, BN6/7) — needs the bladeburner manager.
-        { name: "bladeburner-bn67", applicable: () => false, start: () => {}, stop: () => {} },
+        { name: "bladeburner-bn67", cls: "gate", applicable: () => false, start: () => {}, stop: () => {} },
         // Row 4 (company work for a needed invite) — needs invite-requirement scan.
-        { name: "company-work", applicable: () => false, start: () => {}, stop: () => {} },
+        // (faction-prereqs-training.md publishes the demand via state.plans.company;
+        // servicing it is this row's own follow-up plan, still a stub here.)
+        { name: "company-work", cls: "grind", applicable: () => false, start: () => {}, stop: () => {} },
         // Row 5 (grafting) — needs the grafting manager's focusRequest.
         { name: "grafting", applicable: () => false, start: () => {}, stop: () => {} },
         {
-            // Grind rep toward the next-best (lowest-ETA) priority aug. Target is
-            // computed once per tick into snap.grindTarget (phaseWork).
-            name: "faction-work",
-            applicable: () => snap.grindTarget != null,
-            start: (ns) => startFactionWork(ns, snap),
+            // faction-prereqs-training.md: train the largest-deficit stat any planned
+            // faction's invite still requires (or a gang homicide-chance demand later),
+            // to target × TRAIN_STAT_BUFFER so it doesn't flap at the boundary.
+            name: "stat-training",
+            cls: "grind",
+            applicable: () => nextTrainingDemand(ns, state) != null,
+            start: (ns) => startTraining(ns, state),
+            maintain: (ns, reassert) => maintainTraining(ns, state, reassert),
             stop: (ns) => ns.singularity.stopAction(),
+            eta: () => trainingEta(ns, state),
+        },
+        {
+            // Grind rep toward the next-best aug: the lowest-ETA priority aug when one
+            // is rep-locked, else the fallback (non-priority aug, then NeuroFlux) so
+            // pilot never idles. Effective target computed into snap.workTarget
+            // (phaseWork); snap.grindTarget holds the priority-only target for status.
+            name: "faction-work",
+            cls: "grind",
+            applicable: () => snap.workTarget != null,
+            start: (ns) => startFactionWork(ns, snap),
+            maintain: (ns, reassert) => maintainFactionWork(ns, snap, reassert),
+            stop: (ns) => ns.singularity.stopAction(),
+            // pilot's own ETA is computed in SECONDS (bestAugByEta) — convert to ms.
+            // Infinity for the NeuroFlux fallback target propagates through unchanged.
+            eta: () => (snap.workTarget ? snap.workTarget.eta * 1000 : null),
         },
         // Row 7 (Bladeburner, non-BN6/7 passive) — needs the bladeburner manager.
         { name: "bladeburner-passive", applicable: () => false, start: () => {}, stop: () => {} },
@@ -469,13 +764,16 @@ function ladder(ns, snap) {
             // Once the fleet is done, spare player time is worth more idle than
             // heisting, and the ladder falls through to row 9.
             name: "crime-fallback",
+            cls: "grind",
             applicable: () => moneyStillWanted(ns),
             start: (ns) => startCrimeOrTrain(ns),
             maintain: (ns, reassert) => maintainCrime(ns, reassert),
             stop: (ns) => ns.singularity.stopAction(),
+            eta: () => Infinity, // pure money baseline — never the ETA-favored pick
         },
         {
             name: "idle",
+            cls: "gate",
             applicable: () => true,
             start: () => {},
             stop: () => {},
@@ -491,6 +789,72 @@ function ladder(ns, snap) {
  *  Returns null when nothing priority is left to grind — the ladder then falls
  *  through to crime to accumulate money for the reset batch buy. */
 function bestGrindTarget(ns, snap, state) {
+    return bestAugByEta(ns, snap, state, (aug) => PRIORITY_AUGS.has(aug));
+}
+
+/** Fallback grind when NO priority aug is rep-locked (bestGrindTarget returned null):
+ *  keep the player productive rather than idling. First grind the best NON-priority
+ *  rep-locked aug by ETA; if none remain either, grind rep for NeuroFlux (endless —
+ *  earned rep grows the NF ready-count that phaseAugs now reports, so lifecycle
+ *  installs the NF batch when it plateaus). So pilot never stops while any rep can
+ *  still be earned. `workSource` (priority / non-priority / neuroflux) tells lifecycle
+ *  which tier this is, so NF grinding is treated as real progress, not idle. */
+function fallbackGrindTarget(ns, snap, state) {
+    const nonPriority = bestAugByEta(ns, snap, state, (aug) => !PRIORITY_AUGS.has(aug));
+    if (nonPriority) return nonPriority;
+    return neurofluxGrindTarget(ns, snap);
+}
+
+/** Grind target for NeuroFlux: the joined faction with the highest current rep — the
+ *  same one dumpNeuroflux buys from — so earned rep maximizes the reset NF dump. */
+function neurofluxGrindTarget(ns, snap) {
+    const sing = ns.singularity;
+    const best = bestRepFaction(sing, snap.joinedFactions);
+    if (best === null) return null;
+    return { aug: PILOT_NEUROFLUX, faction: best, workType: pickWorkType(sing, best), eta: Infinity };
+}
+
+/** Joined faction with the highest current reputation — where NeuroFlux is grinded
+ *  and dumped (dumpNeuroflux picks the same). */
+function bestRepFaction(sing, factions) {
+    let best = null;
+    let bestRep = -Infinity;
+    for (const faction of factions) {
+        const rep = sing.getFactionRep(faction);
+        if (rep > bestRep) { bestRep = rep; best = faction; }
+    }
+    return best;
+}
+
+/** How many NeuroFlux levels are READY now — rep met AND affordable — at the given
+ *  faction. Simulates successive buys: each level's price and rep requirement grow by
+ *  NF_LEVEL_MULT, stopping when the next level's rep exceeds current faction rep or its
+ *  price exceeds remaining money. This is NF's analogue of countAcquirable, so when all
+ *  real augs are owned NF becomes the "ready" metric that drives lifecycle's install. */
+function countReadyNeuroflux(sing, money, faction) {
+    if (!faction) return 0;
+    const rep = sing.getFactionRep(faction);
+    let repReq, price;
+    try {
+        repReq = sing.getAugmentationRepReq(PILOT_NEUROFLUX);
+        price = sing.getAugmentationPrice(PILOT_NEUROFLUX);
+    } catch {
+        return 0;
+    }
+    let cash = money;
+    let n = 0;
+    while (n < NF_READY_CAP && repReq <= rep && price <= cash) {
+        cash -= price;
+        n++;
+        repReq *= NF_LEVEL_MULT;
+        price *= NF_LEVEL_MULT;
+    }
+    return n;
+}
+
+/** Core ETA selector: over augs matching `augFilter` that are rep-locked at a joined
+ *  faction and not owned, pick the lowest ETA = max(moneyTime, repTime). */
+function bestAugByEta(ns, snap, state, augFilter) {
     const sing = ns.singularity;
     const ownedOrPurchased = new Set(sing.getOwnedAugmentations(true));
     const income = state.income.ema; // $/s (null until two samples exist)
@@ -501,7 +865,7 @@ function bestGrindTarget(ns, snap, state) {
     for (const faction of snap.joinedFactions) {
         const rep = sing.getFactionRep(faction);
         for (const aug of sing.getAugmentationsFromFaction(faction)) {
-            if (!PRIORITY_AUGS.has(aug) || ownedOrPurchased.has(aug)) continue;
+            if (!augFilter(aug) || aug === PILOT_NEUROFLUX || ownedOrPurchased.has(aug)) continue;
             const repReq = sing.getAugmentationRepReq(aug);
             if (rep >= repReq) continue; // already unlocked → not a grind target
             const cur = perAug.get(aug);
@@ -582,6 +946,102 @@ function updateRepEstimate(ns, snap, state) {
     }
 }
 
+// ── Stat training row (faction-prereqs-training.md) ─────────────────────────
+
+/** Maps a CLASS work's classType (GymType short code or UniversityClassType name)
+ *  back to the Player.skills field it trains, or null if it isn't one of the
+ *  stats the training row drives (e.g. a class the player started manually). */
+function classToStat(classType) {
+    const combat = COMBAT_SKILLS.find(([, short]) => short === classType);
+    if (combat) return combat[0];
+    if (classType === UNIVERSITY_COURSE_BY_STAT.charisma) return "charisma";
+    if (classType === UNIVERSITY_COURSE_BY_STAT.hacking) return "hacking";
+    return null;
+}
+
+/** The largest-deficit training demand still below its buffer target, or null when
+ *  every planned demand is satisfied (row goes inapplicable, ladder moves on).
+ *  "Largest deficit" (not smallest) so pilot clears the furthest-behind stat first —
+ *  arbitrary but deterministic (no flapping between near-tied demands). */
+function nextTrainingDemand(ns, state) {
+    const demands = state.plans?.training ?? [];
+    if (demands.length === 0) return null;
+    const skills = ns.getPlayer().skills;
+    let best = null;
+    let bestDeficit = -Infinity;
+    for (const d of demands) {
+        if (skills[d.stat] >= d.target * TRAIN_STAT_BUFFER) continue; // met, with buffer
+        const deficit = d.target - skills[d.stat];
+        if (deficit > bestDeficit) { bestDeficit = deficit; best = d; }
+    }
+    return best;
+}
+
+/** stat-training row's start(): route to the gym for combat stats, the university
+ *  for charisma/hacking. universityCourse/gymWorkout return false if unreachable
+ *  (wrong city) — v1 accepts the failure and retries next tick rather than adding
+ *  dedicated travel (mirrors the crime row's gymWorkout fallback pattern). */
+function startTraining(ns, state) {
+    const demand = nextTrainingDemand(ns, state);
+    if (!demand) return;
+    const sing = ns.singularity;
+    const combat = COMBAT_SKILLS.find(([full]) => full === demand.stat);
+    if (combat) { sing.gymWorkout(GYM_LOCATION, combat[1], false); return; }
+    const course = UNIVERSITY_COURSE_BY_STAT[demand.stat];
+    if (course) sing.universityCourse(UNIVERSITY_LOCATION, course, false);
+}
+
+/** stat-training row's maintain(): classes never end on their own (mirrors the gym
+ *  branch of maintainCrime), so hand off whenever the player isn't actually in the
+ *  class this row expects — either because the current demand's stat changed
+ *  (a bigger deficit opened up elsewhere) or its buffer target was just met. */
+function maintainTraining(ns, state, reassert) {
+    const sing = ns.singularity;
+    const demand = nextTrainingDemand(ns, state);
+    if (!demand) { reassert(); return; } // met/gone — reassert lets the ladder re-pick
+    const work = sing.getCurrentWork();
+    if (!work || work.type !== "CLASS" || classToStat(work.classType) !== demand.stat) {
+        reassert();
+    }
+}
+
+/** ETA for the stat-training grind row (arbitration.md weighted-ETA amendment):
+ *  gap-to-buffered-target ÷ empirical gain rate, in ms. null when no demand or no
+ *  rate sample yet — pickWinner treats null as GRIND_ETA_SKIP_MS (eligible, not
+ *  favored), same as faction-work's unknown-rep-rate case. */
+function trainingEta(ns, state) {
+    const demand = nextTrainingDemand(ns, state);
+    if (!demand) return null;
+    const rate = state.train?.rate;
+    if (!rate) return null;
+    const skills = ns.getPlayer().skills;
+    const gap = demand.target * TRAIN_STAT_BUFFER - skills[demand.stat];
+    return gap > 0 ? (gap / rate) * 1000 : 0;
+}
+
+/** Empirical stat-gain rate (units/sec), sampled the same way as updateRepEstimate:
+ *  while pilot's own work is a CLASS at the gym/university, measure Δskill/Δt for
+ *  whichever stat that class trains and keep the last positive estimate. */
+function updateTrainRate(ns, snap, state) {
+    const work = snap.currentWork;
+    const now = Date.now();
+    const stat = work?.type === "CLASS" ? classToStat(work.classType) : null;
+    const t = state.train;
+    if (stat) {
+        const val = ns.getPlayer().skills[stat];
+        if (t.lastStat === stat && t.lastVal !== null && t.lastTs !== null) {
+            const dt = (now - t.lastTs) / 1000;
+            if (dt > 0) {
+                const rate = Math.max(0, val - t.lastVal) / dt;
+                if (rate > 0) t.rate = rate;
+            }
+        }
+        t.lastStat = stat; t.lastVal = val; t.lastTs = now;
+    } else {
+        t.lastStat = null; t.lastVal = null; t.lastTs = null;
+    }
+}
+
 /** Best expected-$/sec crime right now: money × successChance ÷ time over the
  *  full CrimeType catalog. Chance is a live read, so this self-adjusts as combat
  *  stats grow — a fresh character picks Shoplift/Mug, a trained one graduates to
@@ -636,37 +1096,149 @@ function maintainCrime(ns, reassert) {
     }
 }
 
-/** Grind the current ETA target (snap.grindTarget, computed once per tick in
- *  phaseWork). Donate money for rep once favor clears getFavorToDonate() (faster
- *  than working); otherwise work the faction (never steal focus). */
+/** faction-work row's maintain() — the ladder tracks rows by NAME, so when the
+ *  effective target (snap.workTarget) moves to a DIFFERENT faction the winner is
+ *  still "faction-work" and the row is never re-applied. Faction work is also
+ *  continuous (isBusy stays true), so the generic idle re-assert never fires either.
+ *  Detect the mismatch here: if the running faction/workType no longer matches the
+ *  current workTarget (or the player is idle, e.g. after a donate tick), re-assert to
+ *  switch to the new target. */
+function maintainFactionWork(ns, snap, reassert) {
+    const target = snap.workTarget;
+    if (!target) return;
+    const work = ns.singularity.getCurrentWork();
+    if (!work || work.type !== "FACTION" ||
+        work.factionName !== target.faction ||
+        work.factionWorkType !== target.workType) {
+        reassert();
+    }
+}
+
+/** Smallest donation amount that closes a `repNeeded` reputation gap
+ *  (docs/plans/donation-sizing.md). Exact via binary search against
+ *  ns.formulas.reputation.repFromDonation when Formulas.exe is owned (donation rep
+ *  isn't linear at the margins, so a closed-form guess can under/overshoot); else
+ *  the closed-form inverse of the game's base donation formula
+ *  (rep = amount * faction_rep_mult / 1e6). Caller multiplies the result by
+ *  DONATE_SLOP to absorb rounding so one donation reliably closes the gap. */
+function donationForRep(ns, repNeeded) {
+    if (ns.fileExists("Formulas.exe", "home")) {
+        try {
+            const player = ns.getPlayer();
+            let lo = 0;
+            let hi = repNeeded * 1e6;
+            // Grow hi until it's provably sufficient (repFromDonation is monotonic).
+            for (let i = 0; i < 60 && ns.formulas.reputation.repFromDonation(hi, player) < repNeeded; i++) {
+                hi *= 2;
+            }
+            for (let i = 0; i < 60; i++) {
+                const mid = (lo + hi) / 2;
+                if (ns.formulas.reputation.repFromDonation(mid, player) >= repNeeded) hi = mid;
+                else lo = mid;
+            }
+            return hi;
+        } catch { /* fall through to closed form */ }
+    }
+    return (repNeeded * 1e6) / ns.getPlayer().mults.faction_rep;
+}
+
+/** faction-work row's start(): work the effective target, sizing any donation to
+ *  the CURRENT target's remaining rep gap (donation-sizing.md) instead of the old
+ *  unbounded per-tick drip (snap.money * PILOT_SPEND_FRAC every tick regardless of
+ *  how much rep was actually needed — which could keep donating long after the aug
+ *  was already unlockable, or blow past what a huge gap needed in one shot). Sizing
+ *  is still capped by PILOT_SPEND_FRAC per tick, so a huge gap closes over several
+ *  ticks rather than a single giant donation; once the gap hits 0 this falls
+ *  through to working (no more donations for a target that's already unlocked).
+ *  NeuroFlux is bought with money at the reset dump, so DON'T donate for its rep —
+ *  that would spend the very cash dumpNeuroflux needs (and NF rep is usually
+ *  already ample); just work for the (free) rep. snap.money is already net of
+ *  floor + reservations (wallet-reservations.md), so donations can never raid the
+ *  acquirable-aug batch. */
 function startFactionWork(ns, snap) {
-    const target = snap.grindTarget;
+    const target = snap.workTarget;
     if (!target) return false;
     const sing = ns.singularity;
     const favor = sing.getFactionFavor(target.faction);
     const donateThreshold = ns.getFavorToDonate ? ns.getFavorToDonate() : 150;
-    if (favor >= donateThreshold) {
-        const amount = Math.min(snap.money * PILOT_SPEND_FRAC, snap.money);
-        if (amount > 0) sing.donateToFaction(target.faction, amount);
-        return true;
+    if (target.aug !== PILOT_NEUROFLUX && favor >= donateThreshold) {
+        const gap = Math.max(0, sing.getAugmentationRepReq(target.aug) - sing.getFactionRep(target.faction));
+        if (gap > 0) {
+            const amount = Math.min(snap.money * PILOT_SPEND_FRAC, donationForRep(ns, gap) * DONATE_SLOP);
+            if (amount > 0) { sing.donateToFaction(target.faction, amount); return true; }
+        }
+        // gap already closed (e.g. rep grinding caught up) — fall through to working.
     }
     return sing.workForFaction(target.faction, target.workType, false);
 }
 
+/** Weighted-ETA grind selection (arbitration.md amendment, 2026-07-13). Walks the
+ *  ladder in order; the first applicable GATE row wins outright (idle included —
+ *  it's a gate, always applicable last). The first applicable GRIND row instead
+ *  triggers a comparison across ALL applicable grind rows from that point on: each
+ *  exposes eta() (ms, null = unknown), unknown treated as exactly GRIND_ETA_SKIP_MS
+ *  (eligible, not favored). A grind whose raw ETA exceeds GRIND_ETA_SKIP_MS is
+ *  excluded whenever at least one OTHER applicable grind is at/under the
+ *  threshold (a days-long rep grind yields focus to a faster karma/training win);
+ *  among the eligible set the winner is the lowest eta/GRIND_WEIGHTS[name] (ladder
+ *  order breaks exact ties via the strict `<`). FOCUS_STABLE_TICKS hysteresis
+ *  around whatever this returns is unchanged (applied by the caller, phaseWork). */
+function pickWinner(rows, snap, state) {
+    for (const r of rows) {
+        if (!r.applicable(snap)) continue;
+        if (r.cls !== "grind") return r; // first applicable gate wins outright
+        const grinds = rows.filter((x) => x.cls === "grind" && x.applicable(snap));
+        const rawEta = (x) => {
+            const e = x.eta ? x.eta() : null;
+            return e == null ? GRIND_ETA_SKIP_MS : e;
+        };
+        const anyFast = grinds.some((x) => rawEta(x) <= GRIND_ETA_SKIP_MS);
+        const eligible = anyFast ? grinds.filter((x) => rawEta(x) <= GRIND_ETA_SKIP_MS) : grinds;
+        let best = null;
+        let bestEff = Infinity;
+        for (const x of eligible) {
+            const eff = rawEta(x) / (GRIND_WEIGHTS[x.name] ?? 1);
+            if (eff < bestEff) { bestEff = eff; best = x; }
+        }
+        return best ?? r;
+    }
+    return rows[rows.length - 1];
+}
+
 /**
- * Runs the ladder each tick: find the first applicable row, apply
- * FOCUS_STABLE_TICKS hysteresis before actually switching away from the
+ * Runs the ladder each tick: pick the winning row via pickWinner() (gate rows
+ * preempt absolutely in ladder order; among applicable grind rows the lowest
+ * ETA/GRIND_WEIGHTS wins — arbitration.md's 2026-07-13 weighted-ETA amendment),
+ * apply FOCUS_STABLE_TICKS hysteresis before actually switching away from the
  * currently-assigned row, then start/stop work accordingly. Never touches work
  * the PLAYER started manually — only replaces work pilot itself began (tracked
  * via the `pilotWorkSig` runtime flag), per the plan's manual-override rule.
  * Pilot also publishes the assigned row as the `focusOwner` flag so future
  * mechanic managers can see who owns the player (arbitration.md focus protocol).
+ *
+ * IMPORTANT: snap.workSource / snap.grindTarget below are computed exactly as
+ * before pickWinner ever runs — lifecycle's plateau trigger reads workSource, and
+ * a grind row OTHER than faction-work winning focus (e.g. stat-training) must not
+ * change what that signal reports.
  */
 function phaseWork(ns, snap, state) {
     updateRepEstimate(ns, snap, state);          // empirical rep-rate fallback
-    snap.grindTarget = bestGrindTarget(ns, snap, state); // computed once; row reads it
-    const rows = ladder(ns, snap);
-    const winner = rows.find((r) => r.applicable(snap)) ?? rows[rows.length - 1];
+    updateTrainRate(ns, snap, state);            // empirical stat-gain rate (training row's ETA)
+    // Priority-only target: published + drives lifecycle's plateau/install signal.
+    snap.grindTarget = bestGrindTarget(ns, snap, state);
+    // Effective work target the faction-work row grinds: priority first, else the
+    // fallback (non-priority aug → NeuroFlux) so pilot never idles while rep remains.
+    if (snap.grindTarget) {
+        snap.workTarget = snap.grindTarget;
+        snap.workSource = "priority";
+    } else {
+        snap.workTarget = fallbackGrindTarget(ns, snap, state);
+        snap.workSource = snap.workTarget
+            ? (snap.workTarget.aug === PILOT_NEUROFLUX ? "neuroflux" : "non-priority")
+            : "none";
+    }
+    const rows = ladder(ns, snap, state);
+    const winner = pickWinner(rows, snap, state);
 
     const { currentRow, challenger, challengerStreak } = state.ladder;
 
@@ -755,6 +1327,87 @@ function describeWork(task) {
     return { type: task.type };
 }
 
+// ── Debug logging ─────────────────────────────────────────────────────────────
+
+/** One rolling debug line per tick capturing every input to pilot's grind/work
+ *  decision, so "grinding X but nothing happening" and "why NF not a real aug" are
+ *  diagnosable from the log alone. Uses only NS functions pilot already calls
+ *  elsewhere → no static RAM increase. Gated by PILOT_DEBUG. */
+function logTick(ns, snap, workState, state) {
+    const sing = ns.singularity;
+    const wt = snap.workTarget;
+    const d = augDiag(ns, snap);
+
+    // Reproduce startFactionWork's donate-vs-work branch (donation-sizing.md: sized
+    // to the target's remaining rep gap, not an unbounded per-tick drip) so the log
+    // shows which path the target faction takes and the actual sized amount.
+    let tgt = "-", donate = "-", favor = "-", rep = "-", repReq = "-";
+    if (wt) {
+        tgt = `${wt.aug}@${wt.faction}`;
+        favor = sing.getFactionFavor(wt.faction);
+        rep = sing.getFactionRep(wt.faction);
+        repReq = wt.aug === PILOT_NEUROFLUX ? "-" : Math.round(sing.getAugmentationRepReq(wt.aug));
+        const willDonate = wt.aug !== PILOT_NEUROFLUX &&
+            favor >= (ns.getFavorToDonate ? ns.getFavorToDonate() : 150);
+        if (willDonate) {
+            const gap = Math.max(0, sing.getAugmentationRepReq(wt.aug) - rep);
+            donate = gap > 0
+                ? `donate($${Math.round(Math.min(snap.money * PILOT_SPEND_FRAC, donationForRep(ns, gap) * DONATE_SLOP))})`
+                : "work";
+        } else {
+            donate = "work";
+        }
+    }
+
+    debugLog(ns, PILOT_DEBUG_LOG, {
+        row: workState.focusOwner ?? "-",
+        over: workState.overridden ? 1 : 0,
+        busy: snap.isBusy ? 1 : 0,
+        cur: describeWork(snap.currentWork) ?? "-",
+        src: snap.workSource ?? "-",
+        tgt,
+        act: donate,
+        favor,
+        rep,
+        repReq,
+        prioGrind: snap.grindTarget ? `${snap.grindTarget.aug}@${snap.grindTarget.faction}` : "-",
+        // aug inventory by tier × rep-state (locked = rep not met, unlk = rep met, unbought)
+        pL: d.prioLocked, pU: d.prioUnlocked, rL: d.restLocked, rU: d.restUnlocked,
+        readyNow: snap.acquirableNow ?? 0,
+        income: state.income.ema ?? 0,
+        moneyRaw: snap.moneyRaw,
+        floor: snap.moneyFloor,
+        money: snap.money,
+        facs: snap.joinedFactions.length,
+    });
+}
+
+/** Aug inventory counts for the debug log: over joined factions, how many augs
+ *  (deduped, NeuroFlux/owned excluded) are priority vs rest × rep-locked vs rep-met.
+ *  "restU > 0 while grinding NeuroFlux" is the smoking gun for "non-priority augs
+ *  should be bought first". Reuses only already-charged NS functions. */
+function augDiag(ns, snap) {
+    const sing = ns.singularity;
+    const owned = new Set(sing.getOwnedAugmentations(true));
+    const met = new Map(); // aug -> rep-met at ANY joined faction
+    const prio = new Map(); // aug -> is priority
+    for (const faction of snap.joinedFactions) {
+        const rep = sing.getFactionRep(faction);
+        for (const aug of sing.getAugmentationsFromFaction(faction)) {
+            if (aug === PILOT_NEUROFLUX || owned.has(aug)) continue;
+            const isMet = rep >= sing.getAugmentationRepReq(aug);
+            met.set(aug, (met.get(aug) ?? false) || isMet);
+            prio.set(aug, PRIORITY_AUGS.has(aug));
+        }
+    }
+    let prioLocked = 0, prioUnlocked = 0, restLocked = 0, restUnlocked = 0;
+    for (const [aug, isMet] of met) {
+        if (prio.get(aug)) isMet ? prioUnlocked++ : prioLocked++;
+        else isMet ? restUnlocked++ : restLocked++;
+    }
+    return { prioLocked, prioUnlocked, restLocked, restUnlocked };
+}
+
 // ── Status ───────────────────────────────────────────────────────────────────
 
 function buildStatus(ns, snap, workState, state) {
@@ -768,6 +1421,7 @@ function buildStatus(ns, snap, workState, state) {
         else backdoorPending.push(host);
     }
     const target = snap.grindTarget;
+    const work = snap.workTarget;
 
     return {
         ts: Date.now(),
@@ -784,6 +1438,9 @@ function buildStatus(ns, snap, workState, state) {
             repUnlocked: snap.repUnlocked ?? 0,   // priority augs with rep met
             acquirableNow: snap.acquirableNow ?? 0, // ...and affordable under the ramp
             grindTarget: target ? { aug: target.aug, faction: target.faction, etaSec: Math.round(target.eta) } : null,
+            // Effective grind (priority target, else non-priority/NeuroFlux fallback) —
+            // for display; lifecycle keys its plateau on grindTarget above, not this.
+            workTarget: work ? { aug: work.aug, faction: work.faction, etaSec: Number.isFinite(work.eta) ? Math.round(work.eta) : null } : null,
         },
         nfAffordableLevels: snap.nfAffordableLevels ?? 0,
         incomePerSec: state.income.ema ?? 0,
@@ -792,6 +1449,20 @@ function buildStatus(ns, snap, workState, state) {
         // last grew — its install stagnation signal (stalls on money OR rep, whichever binds).
         acquirableNow: snap.acquirableNow ?? 0,
         lastAcquireTs: snap.lastAcquireTs ?? null,
+        // Which grind tier pilot is on ("priority"/"non-priority"/"neuroflux"/"none") —
+        // lifecycle's grindPending = still on a real-aug tier. And whether The Red Pill
+        // is rep-met (→ lifecycle installs ASAP to claim it).
+        workSource: snap.workSource ?? "none",
+        redPillReady: snap.redPillReady ?? false,
+        // wallet-reservations.md: money currently earmarked for the acquirable-aug
+        // batch (0 in the NeuroFlux-only branch — NF is never reserved).
+        reservedForAugs: snap.reservedForAugs ?? 0,
+        // home-ram.md: current size, live next-upgrade cost (gated by
+        // HOME_RAM_SPEND_FRAC), and how many upgrades this process has bought.
+        homeRam: { gb: snap.homeRam, nextCost: snap.nextHomeRamCost ?? null, bought: state.homeRamBought ?? 0 },
+        // faction-prereqs-training.md: per-faction unmet invite-requirement types for
+        // every PLANNED_FACTIONS candidate still worth pursuing (may be []).
+        factionPlans: state.plans?.byFaction ?? [],
         action: workState.overridden ? "player-controlled — pilot standing by" : `ladder: ${workState.focusOwner}`,
     };
 }
@@ -803,12 +1474,13 @@ function renderStatus(ns, s) {
     ns.print(`╔═ PILOT ═ ${new Date().toLocaleTimeString()} ${"═".repeat(Math.max(0, W - 19))}`);
     ns.print(`║ Programs ${s.programs.owned}/${s.programs.total}  |  Factions joined ${s.factions}`);
     ns.print(`║ Backdoors ${s.backdoors.done.length}/${s.backdoors.done.length + s.backdoors.pending.length}  |  Augs installed ${s.augs.purchased}  |  ready ${s.augs.acquirableNow}/${s.augs.repUnlocked} (afford/rep)`);
+    ns.print(`║ Home RAM: ${s.homeRam.gb.toFixed(0)}GB${s.homeRam.nextCost != null ? `  |  next $${Math.round(s.homeRam.nextCost).toLocaleString()}` : ""}  |  bought ${s.homeRam.bought}`);
     ns.print(`╠${"═".repeat(W)}`);
     ns.print(`║ Ladder: ${s.focusOwner ?? "—"}${s.working ? `  (${JSON.stringify(s.working)})` : ""}`);
-    if (s.augs.grindTarget) {
-        const g = s.augs.grindTarget;
-        const eta = Number.isFinite(g.etaSec) ? `${(g.etaSec / 60).toFixed(0)}m` : "∞";
-        ns.print(`║ Grinding: ${g.aug} @ ${g.faction} (ETA ${eta})`);
+    const grind = s.augs.workTarget ?? s.augs.grindTarget;
+    if (grind) {
+        const eta = Number.isFinite(grind.etaSec) ? `${(grind.etaSec / 60).toFixed(0)}m` : "∞";
+        ns.print(`║ Grinding: ${grind.aug} @ ${grind.faction} (ETA ${eta})`);
     }
     if (s.cityTarget) {
         ns.print(`║ City faction target: ${s.cityTarget} (travel/join)`);

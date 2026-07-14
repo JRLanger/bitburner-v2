@@ -64,6 +64,20 @@ buys every darkweb program not already on `home` (`getDarkwebPrograms()` minus
 triggers the controllers' booster→orbiter handoff — pilot needs no special-case
 code for it).
 
+**Home-RAM phase (`phaseHomeRam`)** (docs/plans/home-ram.md), runs right after
+`phaseTor` and before `phaseAugs` so the aug-readiness report sees post-purchase money the
+same tick. Perpetual home-RAM upgrading: at most one `upgradeHomeRam()` buy per tick, gated
+on `cost <= snap.money * HOME_RAM_SPEND_FRAC` (0.5, same class as pilot's other progression
+spends — a fraction gate, not a cross-domain score, per arbitration.md Decision 4) and on
+`snap.homeRam < HOME_RAM_MAX_GB` (an escape hatch, effectively `Infinity`). One buy per tick
+keeps each purchase individually observable; the doubling cost curve makes the fraction gate
+self-limiting on its own. It **never raids the `augBatch` reservation** by construction:
+`snap.money` is already `max(0, raw - moneyFloor(ns))`, and `moneyFloor()` folds in the live
+reservation total, so acquirable-aug money is invisible to this phase's gate the same way
+it's invisible to pserver/hacknet — no special-case check needed here. Bootstrap ladder row 1
+(`homeRam < 32 GB` → crime) is unaffected; this phase simply also runs during that window and
+naturally clears the row as home RAM grows.
+
 **Phase 2 — backdoors (`phaseBackdoors`).** For each host in `BACKDOOR_TARGETS`
 (`CSEC`, `avmnite-02h`, `I.I.I.I`, `run4theh111z`, `fulcrumassets` —
 `w0r1d_d43m0n` is deliberately excluded, it's a win-condition action owned by
@@ -77,7 +91,14 @@ keeps ticks short and each install individually observable in the tail/dashboard
 
 **Phase 3 — faction invites (`phaseFactions`).** `checkFactionInvitations()`;
 auto-joins any invite with an empty `getFactionEnemies()` list (CyberSec, the
-hacking groups, …) and not on `PILOT_JOIN_BLOCKLIST`.
+hacking groups, the gang factions like Slum Snakes, …) and not on
+`PILOT_JOIN_BLOCKLIST`. **Policy (user decision 2026-07-13): enemy-free invites
+are joined UNCONDITIONALLY the tick they appear — even when the faction offers no
+wanted augs.** Joining costs nothing and blocks nothing (no enemies), and
+membership is pure upside (a rep channel, intelligence leveling). Only factions
+with enemies (the city rivals below) are ever gated on aug value. A `joinFaction`
+call that returns false lands in `pendingInvites` so a failed join is visible on
+the dashboard instead of silently dropped.
 
 **City factions** (`Sector-12, Aevum, Volhaven, Chongqing, New Tokyo, Ishima` —
 mutually exclusive, faction name == city name) are auto-managed: pilot joins one
@@ -99,13 +120,69 @@ Non-city enemy-having factions (Silhouette, etc.) are still left un-joined and
 surfaced in `pendingInvites` for the player. Joined-faction membership comes from
 `ns.getPlayer().factions` — the authoritative list.
 
+**Faction-prereq planner** (docs/plans/faction-prereqs-training.md, `computeFactionPlans`,
+called at the end of `phaseFactions`). No Netscript API enumerates every faction name
+(`FactionName` is a closed enum type in `NetscriptDefinitions.d.ts`, not something a getter
+returns as a list), so pilot works from a hand-curated list, `PLANNED_FACTIONS` — classic
+requirement-gated factions worth pursuing (CyberSec, NiteSec, the megacorps, Illuminati,
+The Covenant, Daedalus, etc.), kept separate from `CITY_FACTIONS`' own travel-driven logic.
+For each unjoined, non-blocklisted, enemy-free planned faction that still offers an unowned
+priority aug, it reads `getFactionInviteRequirements(faction)` and classifies every unmet
+`PlayerRequirement`:
+
+- **`skills`** → a training demand (`{stat, target}`), but only for stats the training row
+  can actually raise — `TRAINABLE_STATS` (the four combat stats, charisma, hacking). A demand
+  for an untrainable stat (e.g. intelligence) stays report-only; making it a real demand would
+  keep the training row applicable with nothing for `startTraining` to start, and pilot would
+  idle on it forever.
+- **`backdoorInstalled`** → the host is added to `state.plans.backdoors`, which
+  `phaseBackdoors` reads and **prepends** to its static `BACKDOOR_TARGETS` scan (deduped via
+  `Set`), so a faction-gating host jumps the queue ahead of the default list.
+- **`companyReputation` / `employedBy`** → **report-only** company demands
+  (`state.plans.company`): no cheap NS call under this file's RAM budget can check or act on
+  company rep, so these are surfaced for the player/a future row rather than acted on.
+- **`not`** → also report-only, and deliberately so: satisfying a `not` means making its inner
+  condition *fail* (e.g. "not employed by CIA"), so generating a demand that would *satisfy*
+  the inner condition is exactly backwards — pilot has no "un-doing" actions anyway.
+- **`someCondition`** → only its single **cheapest unmet branch** is turned into a demand
+  (`reqCheapness`: skills < backdoor < company), since satisfying any one branch clears the
+  whole condition — there's no point training AND backdooring when either alone would do.
+  `everyCondition` instead demands every one of its unmet branches (all must be satisfied).
+- Everything else (`money`, `city`, `karma`, `numAugmentations`, `sourceFile`, hacknet/file/
+  location/kill-count requirements, …) has no actionable demand pilot can produce and is
+  either satisfied elsewhere (gang, resets) or accrues on its own — report-only.
+
+Results land in `state.plans` (`{training, backdoors, company, byFaction}`), not `snap` —
+`phaseBackdoors` runs **before** `phaseFactions` in the tick loop, so it always reads *last
+tick's* plans; one tick of staleness is harmless here and avoids restructuring the phase order.
+
+**Stat-training ladder row** (`stat-training`, between `company-work` and `faction-work`).
+Applicable whenever `nextTrainingDemand` finds an unmet demand from `state.plans.training` —
+the largest-deficit stat still below `target × TRAIN_STAT_BUFFER` (1.05; trains 5% past the
+raw requirement so a stat drained by some other mechanic later doesn't immediately re-flap the
+row). "Largest deficit" (not smallest) is an arbitrary but deterministic tie-break so demands
+never oscillate. `startTraining` routes combat stats to the gym (`gymWorkout`, `GYM_LOCATION`
+= Powerhouse Gym) and charisma/hacking to the university (`universityCourse`,
+`UNIVERSITY_LOCATION` = Rothman University, course from `UNIVERSITY_COURSE_BY_STAT` — Leadership
+for charisma, Algorithms for hacking); either call can fail if the player isn't in the right
+city, in which case v1 just retries next tick rather than adding dedicated travel (mirrors the
+crime row's `gymWorkout` fallback). `maintainTraining` hands off (`reassert()`) whenever the
+demand is satisfied or the running class no longer matches the current demand's stat — classes
+never end on their own, the same reason `maintainCrime`'s gym branch exists. The row's `eta()`
+(`trainingEta`) is gap-to-buffered-target ÷ an empirical stat-gain rate (`updateTrainRate`,
+sampled the same way as `updateRepEstimate`), in ms; `null` when there's no demand or no rate
+sample yet, which `pickWinner` treats as `GRIND_ETA_SKIP_MS` (eligible, not favored).
+
 **Phase 4 — augmentations (`phaseAugs`, REPORT-ONLY).** Pilot does **not buy augs
 during the run** (arbitration.md Decision 5): purchased augs are inert until
 install, so buying early only pays the ~1.9× price ramp for no benefit — lifecycle
-batch-buys the whole set at reset. Phase 4 reports two counts over the **priority
-tier** (`config/aug-priority.js` — category Hacking/Special or a `faction_rep`
-bonus):
-- `repUnlocked` — augs whose rep requirement is met (grinding progress);
+batch-buys the whole set at reset. Phase 4 reports two counts over the **ready set** —
+the augs `batchBuyAugs` would buy now: **priority-tier** rep-met augs
+(`config/aug-priority.js` — category Hacking/Special or a `faction_rep` bonus) always,
+**plus** non-priority rep-met augs **once no priority aug is rep-locked** (priority
+tier exhausted — mirroring the buy cascade, so rep-met non-priority augs can still
+fire an install instead of being stuck at readyCount 0):
+- `repUnlocked` — augs in the ready set whose rep requirement is met;
 - `acquirableNow` — how many of those the reset batch could actually **afford right
   now**, via `countAcquirable`, which simulates the batch (most-expensive-first,
   each purchase multiplying remaining prices by `AUG_PRICE_RAMP` = 1.9) against
@@ -116,28 +193,82 @@ an aug isn't ready until **both** its rep is met **and** the money to buy it exi
 so the count grows from rep grinding OR money saving and stalls only when the
 binding constraint stalls. This is what stops a gang's rep windfall (which unlocks
 nearly every aug at once) from firing an install before the money to buy them has
-been saved. Also reports `nfAffordableLevels` (NF is lifecycle's pre-reset dump,
-never bought here).
+been saved.
+
+**Wallet reservation (`augBatch`)** (docs/plans/wallet-reservations.md). `countAcquirable`
+now also returns the cumulative simulated cost of the augs it counted; `phaseAugs` writes
+that cost every tick as the `augBatch` entry in the flag port's reservation ledger
+(`setReservation`/`clearReservation`, `lib/flags.js`) — cleared when nothing is acquirable.
+Since `moneyFloor(ns)` folds the live reservation total into every spender's money read,
+this money becomes invisible to pserver, hacknet, and pilot's own programs/donations/home-RAM
+with no changes to their code — an already-acquirable aug can no longer be un-readied by
+another manager's purchase. pilot is the ledger's sole writer for this key (single-writer
+rule); lifecycle clears it in `liquidateAndFreeze` when it spends the batch for real.
+
+The snapshot carries a second money field, **`moneyForAugs`** (`gatherState`) — raw money
+minus only the *frozen* floor flag, never the live reservation total. `phaseAugs`,
+`countAcquirable`, and `countReadyNeuroflux` are its only readers. This exists to avoid a
+**self-shrink feedback loop**: `snap.money` (used by every other phase) is net of
+`moneyFloor()`, which after this change already includes pilot's own `augBatch` reservation
+— feeding that fully-floored figure back into the aug simulation would make the reservation
+count against itself every tick, shrinking `acquirableNow` toward zero. `moneyForAugs` breaks
+the cycle by only ever subtracting the frozen floor the simulation doesn't itself write.
+
+**NeuroFlux as the terminal "real" aug.** Once **every** non-NF aug at the joined
+factions is owned (`anyUnownedReal` is false), `acquirableNow` switches to
+`countReadyNeuroflux` — how many NeuroFlux levels are **rep-met AND affordable** right
+now, simulating successive buys where price and rep-req each grow by `NF_LEVEL_MULT`
+(1.14). NeuroFlux thus behaves like any other aug: grinding its rep grows the ready
+count (keeping the run open), and when the count plateaus lifecycle installs (the
+`dumpNeuroflux` step banks the levels). This replaces the old deadlock where pilot
+ground NeuroFlux forever and lifecycle — seeing `readyCount 0` — never reset. The NF
+grind also **works for rep only, never donates money** (`startFactionWork`), so the
+cash `dumpNeuroflux` needs to actually buy the levels isn't spent away. `repUnlocked`
+and `nfAffordableLevels` report the same NF count in this state.
 
 **Phase 5 — player-activity arbitration ladder (`phaseWork`).** Implements
 `choosePlayerActivity()` from `docs/plans/arbitration.md`: an ordered array of
-`{name, applicable, start, stop}` rows, evaluated top-to-bottom each tick — the
-first applicable row wins. This build ships the **skeleton**: rows 1, 6, 8, 9 are
-real; rows 2–5 and 7 are inert placeholders (`applicable: () => false`) reserved
-for mechanic managers (gang, Bladeburner, grafting) that don't exist yet — future
-plans only need to fill in a row's three functions, never restructure the ladder.
+`{name, cls, applicable, start, stop, eta?}` rows. This build ships rows 1
+(bootstrap-crime), 5 (stat-training), 6 (faction-work), 8 (crime-fallback), 9 (idle) as real;
+rows 2–4 and 7 are inert placeholders (`applicable: () => false`) reserved for mechanic
+managers (gang, Bladeburner, company-work servicing) that don't exist yet — future plans only
+need to fill in a row's functions, never restructure the ladder.
 
-| # | Row | Applicable when (this build) |
-|---|---|---|
-| 1 | `bootstrap-crime` | `home` RAM < 32 GB (nothing else works without base RAM) — chance-aware crime (see row 8) |
-| 2 | `karma-grind` | placeholder — always false (needs gang manager) |
-| 3 | `bladeburner-bn67` | placeholder — always false |
-| 4 | `company-work` | placeholder — always false |
-| 5 | `grafting` | placeholder — always false |
-| 6 | `faction-work` | a rep-locked PRIORITY aug exists at a joined faction (grind toward the lowest-ETA one) |
-| 7 | `bladeburner-passive` | placeholder — always false |
-| 8 | `crime-fallback` | money still wanted — port-4 snapshot fresh, i.e. pserver manager alive and still buying (once the fleet is maxed, idle beats heisting) |
-| 9 | `idle` | always true (terminal fallback) |
+| # | Row | cls | Applicable when (this build) |
+|---|---|---|---|
+| 1 | `bootstrap-crime` | gate | `home` RAM < 32 GB (nothing else works without base RAM) — chance-aware crime (see row 8) |
+| 2 | `karma-grind` | grind | placeholder — always false (needs gang manager) |
+| 3 | `bladeburner-bn67` | gate | placeholder — always false |
+| 4 | `company-work` | grind | placeholder — always false (`state.plans.company` publishes the demand; servicing it is a follow-up) |
+| 5 | `stat-training` | grind | a training demand exists (faction-prereqs-training.md) |
+| 6 | `faction-work` | grind | a rep-locked PRIORITY aug exists at a joined faction, or the fallback target (non-priority → NeuroFlux) applies |
+| 7 | `bladeburner-passive` | (unset) | placeholder — always false |
+| 8 | `crime-fallback` | grind | money still wanted — port-4 snapshot fresh, i.e. pserver manager alive and still buying (once the fleet is maxed, idle beats heisting) |
+| 9 | `idle` | gate | always true (terminal fallback) |
+
+**Weighted-ETA grind selection** (arbitration.md, amended 2026-07-13). Ladder rows are tagged
+`cls: "gate" | "grind"`. `pickWinner` (replacing a plain top-to-bottom "first applicable
+wins") walks the ladder in order: the first applicable **gate** row still wins outright, same
+as before — gates (bootstrap-crime, the bladeburner-BN67 stub, idle) preempt absolutely.
+But the first applicable **grind** row instead triggers a comparison across *every* applicable
+grind row from that point on (karma-grind, company-work, stat-training, faction-work,
+crime-fallback): each exposes `eta()` (ms, or `null` when no rate sample exists yet — treated
+as exactly `GRIND_ETA_SKIP_MS`, i.e. eligible but not favored). A grind whose raw ETA exceeds
+`GRIND_ETA_SKIP_MS` (default 8 h) is excluded whenever at least one *other* applicable grind is
+at or under that threshold — a days-long rep grind yields focus to a faster karma/training
+win. Among the eligible set, the winner is the lowest `eta / GRIND_WEIGHTS[name]` (hand-tunable
+per-row bias, e.g. `karma-grind: 1.5` biases toward gang formation, `crime-fallback: 0.5` is a
+last resort); strict `<` breaks exact ties by ladder order. This is a **sanctioned narrow
+exception** to arbitration.md Decision 4 ("no cross-domain score"): the unit (time-to-milestone)
+*is* comparable within the grind class, and the weights are hand-tuned ordinal bias, not a
+computed cross-domain money-ROI formula — money-ROI comparisons between domains remain
+forbidden. `FOCUS_STABLE_TICKS` hysteresis (below) is applied on top of `pickWinner`'s result
+unchanged, damping ETA noise the same way it damps any other borderline switch.
+
+`snap.workSource`/`snap.grindTarget` (lifecycle's plateau/install signal) are computed
+**before** `pickWinner` runs and are unaffected by which grind row actually wins focus — e.g.
+if `stat-training` wins the tick, `workSource` still correctly reports whether pilot has a real
+aug left to grind, independent of what's currently occupying the player.
 
 Rows 1 and 8 are **chance-aware** (`bestCrime`/`startCrimeOrTrain`/`maintainCrime`):
 each (re)start picks the best expected-$/sec crime — `money × successChance ÷ time`
@@ -166,12 +297,61 @@ rep-locked at a joined faction, it picks the lowest `ETA = max(moneyTime, repTim
 
 For each aug it grinds the joined faction where current rep is highest (closest to
 unlock). Work uses `hacking` type when offered, else the faction's first, via
-`workForFaction(faction, type, false)` — **`focus` always `false`**. Once favor ≥
-`ns.getFavorToDonate()` (150 fallback) it donates money for rep instead of working
-(same spend cap). When no priority aug is locked (all unlocked, awaiting the reset
-batch buy), the row is inapplicable and the ladder falls through to crime to
-accumulate money. Priorities are a single global order for all BitNodes;
+`workForFaction(faction, type, false)` — **`focus` always `false`**. When no priority aug
+is rep-locked (all owned or rep-met, awaiting the reset batch buy), the row stays
+applicable via the fallback target below (non-priority aug → NeuroFlux) rather than going
+idle.
+
+**Sized donations, not a drip** (docs/plans/donation-sizing.md, `startFactionWork`). Once
+favor ≥ `ns.getFavorToDonate()` (150 fallback) and the target isn't NeuroFlux, pilot
+computes the current target's remaining rep gap
+(`getAugmentationRepReq(target.aug) - getFactionRep(target.faction)`) and donates
+`min(snap.money * PILOT_SPEND_FRAC, donationForRep(ns, gap) * DONATE_SLOP)` — sized to close
+exactly that gap (`donationForRep` binary-searches `ns.formulas.reputation.repFromDonation`
+when Formulas.exe is owned, else uses the closed-form inverse; `DONATE_SLOP` = 1.001 absorbs
+rounding so one donation reliably clears the requirement), still capped per tick by
+`PILOT_SPEND_FRAC` so a huge gap closes over several ticks rather than one wallet-emptying
+donation. Once the gap hits 0 it falls straight through to `workForFaction` — no more
+donations for a target that's already unlocked. The **old code donated
+`money * PILOT_SPEND_FRAC` every single tick**, unconditionally, for as long as favor
+cleared the threshold — burning money long after the target's rep was already met, with no
+relationship between the amount donated and what was actually needed. NeuroFlux targets are
+still never donated to here: that cash is reserved for `dumpNeuroflux`'s own
+donate-exact-then-buy loop at reset (lifecycle.md); donating for NF's rep in-run would spend
+the very money the reset dump needs.
+
+The row has a **`maintain()`** (`maintainFactionWork`) because the ladder tracks
+rows by *name*: when the lowest-ETA aug shifts to a **different faction**, the
+winner is still `faction-work` (same name) and faction work stays `isBusy`, so
+neither the switch path nor the generic idle re-assert would fire — pilot would
+grind the old faction forever (you'd have to stop the work by hand). `maintain()`
+compares the running `getCurrentWork()` faction/workType against the current
+`grindTarget` each tick and re-asserts `workForFaction` when they diverge (also
+covers the idle gap after a donate tick).
+
+Priorities are a single global order for all BitNodes;
 `aug-priority.js` is hand-editable and is the documented hook for per-BN tuning.
+
+**Pilot never idles while any rep can still be earned.** When no priority aug is
+rep-locked (`bestGrindTarget` → null), the `faction-work` row grinds a **fallback**
+target (`fallbackGrindTarget`) instead of going idle:
+1. the lowest-ETA **non-priority** rep-locked aug (raises favor/rep that becomes
+   NeuroFlux at reset), then
+2. if no aug is left at all, **NeuroFlux** — grind the highest-current-rep joined
+   faction (the one `dumpNeuroflux` buys from), endlessly. There's no reason to stop.
+
+Pilot publishes `workSource` (`priority` / `non-priority` / `neuroflux` / `none`) —
+which grind tier it's on. Lifecycle's **plateau** install decision keys on this: it
+treats `priority` and `non-priority` as "still grinding a real aug" (don't cut the run
+short) and only lets the plateau fire once `workSource` descends to `neuroflux`/`none`
+(both aug tiers exhausted). So the fallback keeps the player busy through the whole
+priority → non-priority → NeuroFlux cascade **without** prematurely blocking or firing
+resets. Two targets are also tracked for display/work: `snap.grindTarget`
+(**priority-only**, for reference) and `snap.workTarget` (the effective grind =
+priority ?? fallback), which the `faction-work` row and the dashboard use.
+
+Pilot also publishes `redPillReady` (**The Red Pill** is rep-met and unbought), which
+lifecycle installs on ASAP to claim it — see `lifecycle.md`.
 
 **Anti-thrash hysteresis.** A new ladder winner must beat the *currently assigned*
 row for `FOCUS_STABLE_TICKS` (4) consecutive ticks before pilot actually switches
@@ -194,6 +374,20 @@ misattributed to pilot and stomped. Comparing signatures fixes that.
 `focusOwner` flag (via `lib/flags.js`) and returns it in the
 status snapshot — this is the arbitration protocol's advertised "who has focus"
 signal other mechanic managers and the dashboard read.
+
+### Debug log (`PILOT_DEBUG` → `/data/pilot-debug.txt`)
+
+When `PILOT_DEBUG` (constants.js) is true, each tick appends a rolling `key=value`
+line (last 400 kept) via `lib/debug-log.js` capturing the whole grind/work decision:
+`row` (assigned ladder row) and `over` (manual-override), `busy`/`cur` (is the player
+actually working, and at what), `src` (priority / non-priority / neuroflux / none),
+`tgt` + `act` (**`work` vs `donate($…)`** — this is how you tell "grinding X" apart
+from "donating 0 and doing nothing"), `favor`/`rep`/`repReq` of the target faction,
+`prioGrind` (priority-only target), the aug inventory counts **`pL`/`pU`/`rL`/`rU`**
+(priority/rest × rep-locked/rep-met, NeuroFlux & owned excluded — `rU>0` while `src=neuroflux`
+means non-priority augs are unlocked-but-unbought), `moneyRaw`/`floor`/`money` (a
+stuck `floor` = Infinity zeroes `money`, so donations become $0), and `income`. View
+with `nano /data/pilot-debug.txt`; newest last. read/write are 0-GB. Set false to silence.
 
 ### Topology extension (booster.js / orbiter.js)
 

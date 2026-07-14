@@ -67,6 +67,27 @@ the tail table already computes (via `displayHealth`, `expectedIncome`, `poolFre
 engine-lag indicator — no new NS calls. The three managers publish a small object
 (timestamp, headline stats, last-action string) at the end of their own loops.
 
+**Value formatting.** Every displayed number goes through a compact formatter so the
+panel never shows raw magnitudes — the goal is a readable unit, never a wall of digits:
+
+- `fmtMoney` — `$1.23k/m/b/t/q/Q` (thousands … quintillions).
+- `fmtCount` — plain integers below a million, then `m/b/t/q/Q` suffixes.
+- `fmtRam` — scales in **binary** (÷1024), the only correct base for Bitburner RAM
+  since server RAM is always a power of two: `MB/GB/TB/PB/EB`. So `33554432` GB reads
+  as `32.00PB` (32 × 1024²), **not** the `33.55PB` a decimal (÷1000) divisor would
+  give. (This was a real bug — the formatter used ÷1000 until it was fixed to ÷1024.)
+- `fmtTime` — clock style (`45s` / `1m23s` / `1h04m`), used for the short batch-time
+  column where clock precision reads best.
+- `fmtDur` — coarse durations in the largest sensible unit with one decimal, trailing
+  `.0` dropped: `45s` / `18m` / `1.5h` / `2.3d`. Used where magnitude matters more
+  than precision — lifecycle run age & no-unlock window, hacknet ROI horizon, and the
+  engine-lag tick gap (which still shows `ms` below one second). So a 90-minute
+  stagnation reads `1.5h`, not `90m`.
+
+Newer pilot fields ride the same formatters: **home RAM** (current size + next
+upgrade cost) via `fmtRam`/`fmtMoney`, and **reserved** (money earmarked for the
+acquirable-aug batch, `wallet-reservations.md`) via `fmtMoney`.
+
 ## Why it's built this way
 
 - **HTML overlay over a consolidated tail window.** The user asked for "as beautiful and

@@ -10,6 +10,10 @@ That project grew organically and became hard to follow.
 
 ## Rules for this project
 
+- **Before writing or reviewing any script, read `docs/reference/game-mechanics.md`**
+  — it corrects common wrong assumptions about the game engine (the static RAM
+  model especially: RAM is charged per distinct `ns` function referenced, NOT per
+  call — tick rate never saves RAM).
 - Brand new save game, scripts written from scratch.
 - Reference only the in-game docs / Netscript API definitions (see `docs/reference/`) —
   do NOT copy code or architecture from the old project, even if asked to look at it for
