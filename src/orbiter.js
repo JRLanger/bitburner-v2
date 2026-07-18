@@ -73,11 +73,13 @@ import {
     HACKNET_MANAGER,
     PILOT_MANAGER,
     LIFECYCLE_MANAGER,
+    GANG_MANAGER,
     CONTRACTS_MANAGER_RAM,
     PSERVER_MANAGER_RAM,
     HACKNET_MANAGER_RAM,
     PILOT_MANAGER_RAM,
     LIFECYCLE_MANAGER_RAM,
+    GANG_MANAGER_RAM,
     PSERVER_PREFIX,
     HACKNET_GATE,
     STATUS_PORT_CONTROLLER,
@@ -125,6 +127,7 @@ const MANAGERS = [
     { file: CONTRACTS_MANAGER, ramGB: CONTRACTS_MANAGER_RAM, gate: () => true },
     { file: PILOT_MANAGER, ramGB: PILOT_MANAGER_RAM, gate: pilotGate },
     { file: LIFECYCLE_MANAGER, ramGB: LIFECYCLE_MANAGER_RAM, gate: pilotGate },
+    { file: GANG_MANAGER, ramGB: GANG_MANAGER_RAM, gate: gangGate },
     { file: HACKNET_MANAGER, ramGB: HACKNET_MANAGER_RAM, gate: pserverFleetBuilt },
 ];
 
@@ -887,6 +890,18 @@ function pserverFleetBuilt(servers) {
  * Takes `ns` (unlike the other gates) because it's the only one that needs a live NS
  * call rather than pre-gathered topology data — see launchManagers' `m.gate(servers, ns)`.
  */
+/**
+ * Gang gate: a gang is only ever creatable with SF2 owned or inside BN2, and
+ * the manager's rep gate needs singularity (pilotGate). Checked without any
+ * ns.gang.* reference so the controller pays no gang-API RAM; the manager
+ * itself idles in its karma phase until createGang succeeds.
+ */
+function gangGate(servers, ns) {
+    const info = ns.getResetInfo();
+    const sf2 = (info.ownedSF.get(2) ?? 0) > 0 || info.currentNode === 2;
+    return sf2 && pilotGate(servers, ns);
+}
+
 function pilotGate(servers, ns) {
     const info = ns.getResetInfo();
     const sf4Level = info.ownedSF.get(4) ?? 0;
