@@ -353,6 +353,7 @@ export const CONTRACTS_MANAGER = "/managers/contracts.js";
 export const PSERVER_MANAGER = "/managers/pserver.js";
 export const HACKNET_MANAGER = "/managers/hacknet.js";
 export const PILOT_MANAGER = "/managers/pilot.js";
+export const GANG_MANAGER = "/managers/gang.js";
 
 /**
  * Manager RAM footprints, GB. Hardcoded so booster can
@@ -373,6 +374,11 @@ export const PILOT_MANAGER_RAM = 77.65; // STALE — re-measure: dropped aug-buy
  *  SF4.3 (×1 multiplier). Like pilot, only viable as a single script at SF4.3 —
  *  at SF4.2 this becomes ~95 GB, at SF4.1 ~365 GB, and would need the same
  *  per-phase one-shot split pilot's plan documents as its RAM fallback. */
+/** Estimated (not yet measured — `mem managers/gang.js` once played): gang API
+ *  ~33 GB (recruit/tasks/ascend/equipment/clash/info) + ~8.5 GB rep-gate
+ *  singularity (getAugmentationsFromFaction/RepReq, getFactionRep,
+ *  getOwnedAugmentations) at SF4.3 + base. */
+export const GANG_MANAGER_RAM = 45.0; // ESTIMATE — measure in-game and update
 export const LIFECYCLE_MANAGER_RAM = 27.75; // STALE — batchBuyAugs added getAugmentationsFromFaction/RepReq/Prereq/Price (~15GB); donation sizing (2026-07-13) added fileExists + formulas.reputation.repFromDonation. Re-measure `mem managers/lifecycle.js`
 
 /** Loop sleep for the (infrequent-purchase) managers, ms. */
@@ -480,6 +486,8 @@ export const STATUS_PORT_LIFECYCLE = 8;
  *  the stocks manager itself doesn't exist yet; lifecycle's liquidation-ack read
  *  is a no-op until it does, per docs/plans/reset-lifecycle.md checklist step 0). */
 export const STATUS_PORT_STOCKS = 9;
+/** gang manager status snapshot (docs/plans/gang.md). */
+export const STATUS_PORT_GANG = 10;
 
 /** Recorded run (aug-reset) durations + last-seen aug-reset timestamp, for hacknet's
  *  ROI horizon. Survives aug installs (a soft reset keeps files); delete on a full
@@ -626,6 +634,45 @@ export const TRAIN_STAT_BUFFER = 1.05;
 /** Gang/karma path (docs/plans/gang.md): pilot's karma row trains combat stats
  *  until Homicide's success chance clears this bar before grinding karma. */
 export const KARMA_HOMICIDE_MIN_CHANCE = 0.5;
+
+// ── gang manager (docs/plans/gang.md) ──────────────────────────────────────
+
+/** Faction the gang is created with. Combat gang (recorded decision: combat
+ *  gangs earn more and don't compete with the controllers' hacking focus);
+ *  Slum Snakes is the easiest combat-gang invite. */
+export const GANG_FACTION = "Slum Snakes";
+/** Karma required to create a gang outside BN2 (game constant). */
+export const GANG_KARMA_REQ = -54_000;
+/** Members below this avg combat stat train instead of earning. Old run used
+ *  300 — tune in-game. */
+export const GANG_TRAIN_THRESHOLD = 200;
+/** Keep getGangInformation().wantedPenalty above this via reactive vigilantes. */
+export const GANG_WANTED_PENALTY_FLOOR = 0.95;
+/** Ascend when the ABSOLUTE avg-combat-multiplier gain (ratio−1)×currentMult
+ *  clears this. A/B-tested in the old playthrough against a fixed ratio
+ *  threshold (which stalls at high mults and over-fires at low ones). */
+export const GANG_ASCEND_ABS_GAIN = 0.70;
+/** Buy an Augmentation-type equipment only when money ≥ cost × this. */
+export const GANG_AUG_SAFETY_MULT = 5;
+/** Per-purchase cap for gang equipment as a fraction of current money (on top
+ *  of the shared MECH_SPEND_FRAC per-tick cap). */
+export const GANG_EQUIP_BUDGET_FRAC = 0.1;
+/** Hard safety floor: never enable clashes below this min win chance (over ALL
+ *  rivals — clashes hit every rival at once). NOT the entry trigger. */
+export const GANG_CLASH_MIN_CHANCE = 0.55;
+/** Enter CLASH when min-win-chance growth over the history window drops below
+ *  this (near the W_max ceiling — entering at bare 55% is ~6× slower). */
+export const GANG_CLASH_GROWTH_MIN = 0.005;
+/** Rolling window for the win-chance growth measurement, ms. */
+export const GANG_WIN_HISTORY_MS = 180_000;
+/** Territory at which the push is considered complete (DONE phase). */
+export const GANG_TERRITORY_DONE = 0.99;
+/** Full roster size (game cap). */
+export const GANG_MAX_MEMBERS = 12;
+/** Earners kept on the respect task (Terrorism) during RECRUIT phase. */
+export const GANG_RECRUIT_RESPECT_SLOTS = 2;
+/** Repeatable augs excluded from the DONE-phase rep target. */
+export const GANG_REP_TARGET_EXCLUDE = ["NeuroFlux Governor"];
 
 // ── arbitration (docs/plans/arbitration.md) ────────────────────────────────
 //
