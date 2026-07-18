@@ -355,31 +355,13 @@ export const HACKNET_MANAGER = "/managers/hacknet.js";
 export const PILOT_MANAGER = "/managers/pilot.js";
 export const GANG_MANAGER = "/managers/gang.js";
 
-/**
- * Manager RAM footprints, GB. Hardcoded so booster can
- * reserve home headroom for the next pending manager WITHOUT a getScriptRam call.
- * Measure each with `mem <file>` after any change and update here.
- */
-export const CONTRACTS_MANAGER_RAM = 16.80; // measured in-game (mem managers/contracts.js): 1.6 base + 0.2 ls + 15 getContract
-export const PSERVER_MANAGER_RAM = 5.85; // measured in-game (mem managers/pserver.js)
-export const HACKNET_MANAGER_RAM = 8.20; // measured in-game (mem managers/hacknet.js)
-/** Measured in-game at SF4.3 (mem managers/pilot.js): 65.65 GB total, ~61 GB of it
- *  singularity functions. Singularity RAM is multiplied ×16/×4/×1 by SF4 level:
- *  at SF4.2 this becomes ~249 GB, at SF4.1 ~981 GB — below SF4.3, pilot must be
- *  split into per-phase one-shot scripts (the documented RAM fallback in
- *  docs/plans/pilot-singularity.md) and this constant re-measured. */
-export const PILOT_MANAGER_RAM = 77.65; // STALE — re-measure: dropped aug-buying calls (~12.5GB); added getMoneySources, formulas.work.factionGains, fileExists, travelToCity, and (2026-07-13) upgradeHomeRam, getUpgradeHomeRamCost, getFactionInviteRequirements, universityCourse, formulas.reputation.repFromDonation. `mem managers/pilot.js`
-/** Estimated (not yet measured in-game — re-measure with `mem managers/lifecycle.js`
- *  once played) from the type defs' documented per-call RAM costs: ~27.75 GB at
- *  SF4.3 (×1 multiplier). Like pilot, only viable as a single script at SF4.3 —
- *  at SF4.2 this becomes ~95 GB, at SF4.1 ~365 GB, and would need the same
- *  per-phase one-shot split pilot's plan documents as its RAM fallback. */
-/** Estimated (not yet measured — `mem managers/gang.js` once played): gang API
- *  ~33 GB (recruit/tasks/ascend/equipment/clash/info) + ~8.5 GB rep-gate
- *  singularity (getAugmentationsFromFaction/RepReq, getFactionRep,
- *  getOwnedAugmentations) at SF4.3 + base. */
-export const GANG_MANAGER_RAM = 45.0; // ESTIMATE — measure in-game and update
-export const LIFECYCLE_MANAGER_RAM = 27.75; // STALE — batchBuyAugs added getAugmentationsFromFaction/RepReq/Prereq/Price (~15GB); donation sizing (2026-07-13) added fileExists + formulas.reputation.repFromDonation. Re-measure `mem managers/lifecycle.js`
+// Manager RAM footprints used to be hardcoded here (measured with `mem`), but the
+// numbers went stale on every code edit AND every SF4-level change (singularity
+// RAM is ×16/×4/×1 by level). booster/orbiter now read the live cost with
+// ns.getScriptRam(file, "home") — 0.1 GB, always current — in nextManagerReserve.
+// Singularity-heavy managers (pilot, lifecycle, gang) remain practical only at
+// SF4.3; below that the per-phase one-shot split documented in
+// docs/plans/pilot-singularity.md is the fallback.
 
 /** Loop sleep for the (infrequent-purchase) managers, ms. */
 export const MANAGER_LOOP_SLEEP = 10000;

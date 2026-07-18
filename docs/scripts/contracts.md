@@ -114,12 +114,12 @@ regressing.
 plain Node (which is how they were validated) and keeps the dispatch trivial — the
 type string from the engine is the registry key directly.
 
-**Orchestration wiring.** `CONTRACTS_MANAGER` / `CONTRACTS_MANAGER_RAM` live in
-`config/constants.js`; `booster`'s `MANAGERS` array lists it at order 1 with an
-always-true gate. `booster`'s generic `launchManagers` / `nextManagerReserve` logic
-then reserves its `home` RAM and launches it (once — it checks `ns.ps` to avoid
-double-launch on a `booster` restart) exactly like the other managers. The hardcoded
-`CONTRACTS_MANAGER_RAM` must be confirmed in-game with `mem managers/contracts.js`.
+**Orchestration wiring.** `CONTRACTS_MANAGER` lives in `config/constants.js`;
+`booster`'s `MANAGERS` array lists it at order 1 with an always-true gate.
+`booster`'s generic `launchManagers` / `nextManagerReserve` logic reserves its
+`home` RAM — read live via `ns.getScriptRam`, so it's always current — and
+launches it (once — it checks `ns.ps` to avoid double-launch on a `booster`
+restart) exactly like the other managers.
 
 ## Alternatives considered
 

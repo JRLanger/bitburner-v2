@@ -64,12 +64,6 @@ import {
     PILOT_MANAGER,
     LIFECYCLE_MANAGER,
     GANG_MANAGER,
-    CONTRACTS_MANAGER_RAM,
-    PSERVER_MANAGER_RAM,
-    HACKNET_MANAGER_RAM,
-    PILOT_MANAGER_RAM,
-    LIFECYCLE_MANAGER_RAM,
-    GANG_MANAGER_RAM,
     PSERVER_PREFIX,
     HACKNET_GATE,
     STATUS_PORT_CONTROLLER,
@@ -99,7 +93,9 @@ const PLACED_WORKERS = [...WORKERS, SHARE_WORKER];
  * Managers booster orchestrates, in fixed dependency order. Each tick booster
  * launches the FIRST not-yet-running manager whose gate passes, and won't consider
  * a later one until every earlier one is already running (see launchManagers).
- * `ramGB` (hardcoded in constants) is reserved on home so the exec always fits.
+ * The manager's live RAM cost (ns.getScriptRam — always current, tracking both
+ * code edits and SF-level singularity multipliers) is reserved on home so the
+ * exec always fits.
  *
  *  1. pserver — grows the RAM pool; launch immediately (it waits internally to
  *     afford). Highest compounding ROI: purchased servers feed the batch pool that
@@ -113,12 +109,12 @@ const PLACED_WORKERS = [...WORKERS, SHARE_WORKER];
  *     from topology data booster already has — no extra NS call).
  */
 const MANAGERS = [
-    { file: PSERVER_MANAGER, ramGB: PSERVER_MANAGER_RAM, gate: () => true },
-    { file: CONTRACTS_MANAGER, ramGB: CONTRACTS_MANAGER_RAM, gate: () => true },
-    { file: PILOT_MANAGER, ramGB: PILOT_MANAGER_RAM, gate: pilotGate },
-    { file: LIFECYCLE_MANAGER, ramGB: LIFECYCLE_MANAGER_RAM, gate: pilotGate },
-    { file: GANG_MANAGER, ramGB: GANG_MANAGER_RAM, gate: gangGate },
-    { file: HACKNET_MANAGER, ramGB: HACKNET_MANAGER_RAM, gate: pserverFleetBuilt },
+    { file: PSERVER_MANAGER, gate: () => true },
+    { file: CONTRACTS_MANAGER, gate: () => true },
+    { file: PILOT_MANAGER, gate: pilotGate },
+    { file: LIFECYCLE_MANAGER, gate: pilotGate },
+    { file: GANG_MANAGER, gate: gangGate },
+    { file: HACKNET_MANAGER, gate: pserverFleetBuilt },
 ];
 
 /**
@@ -777,7 +773,7 @@ function nextManagerReserve(ns) {
     for (const m of MANAGERS) {
         if (isRunning(ns, m.file)) continue;
         if (seen.has(m.file)) continue;
-        return m.ramGB;
+        return ns.getScriptRam(m.file, "home");
     }
     return 0; // nothing left to launch → no reserve needed
 }

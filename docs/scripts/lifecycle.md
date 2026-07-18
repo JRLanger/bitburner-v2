@@ -312,12 +312,13 @@ type the BitNode number themselves, every time.
 
 ## Unverified / open items
 
-- **`LIFECYCLE_MANAGER_RAM` is an ESTIMATE (27.75 GB at SF4.3), not yet
-  measured in-game** — computed from the type defs' documented per-call RAM
-  costs (`isBusy` 0.5, `getOwnedAugmentations` 5, `getFactionRep` 1,
+- **RAM cost (~27.75 GB at SF4.3, more at lower SF4 levels)** — booster now
+  reads the live cost via `ns.getScriptRam` when reserving home headroom, so no
+  constant needs re-measuring; but singularity RAM scales ×16/×4/×1 with SF4
+  level (`isBusy` 0.5, `getOwnedAugmentations` 5, `getFactionRep` 1,
   `purchaseAugmentation` 5, `getFactionFavor` 1, `donateToFaction` 5,
-  `installAugmentations` 5, all ×16/4/1, plus ~5.25 GB of unmultiplied base
-  calls). Re-measure with `mem managers/lifecycle.js` once played and update
+  `installAugmentations` 5, plus ~5.25 GB of unmultiplied base calls), so
+  home must still be big enough for the level you're at.
   the constant. Like pilot, only viable as a single script at SF4.3 — at lower
   SF4 levels it would need the same per-phase one-shot split documented as
   pilot's RAM fallback.
