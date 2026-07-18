@@ -45,8 +45,8 @@ Each loop tick (`MANAGER_LOOP_SLEEP`, default 10 s — purchases are infrequent)
    rebuilt from scratch each run.
 
 The manager owns *spending*; `booster` owns only *when to launch it*. `booster`
-reserves `PSERVER_MANAGER_RAM` of `home` RAM for this script before it starts, so
-workers never fill `home` and block its `exec`.
+reserves this script's live RAM cost (`ns.getScriptRam`) on `home` before it
+starts, so workers never fill `home` and block its `exec`.
 
 ## Why it's built this way
 

@@ -533,7 +533,8 @@ or a JSON file.
 
 ## Unverified / open items
 
-- **`PILOT_MANAGER_RAM`: 65.65 GB measured at SF4.3, +12 GB computed for the chance-aware crime fallback (getCrimeStats, getCrimeChance, gymWorkout) = 77.65 GB — re-measure with `mem`** (~61 GB of it
+- **RAM cost: ~77 GB at SF4.3** — booster reads the live cost via
+  `ns.getScriptRam` when reserving home headroom, so no constant to maintain (~61 GB of it
   singularity functions, biggest single items 5 GB each: getOwnedAugmentations,
   getAugmentationsFromFaction, getAugmentationPrereq, purchaseAugmentation,
   commitCrime, donateToFaction). Because singularity RAM scales ×16/×4/×1 with
