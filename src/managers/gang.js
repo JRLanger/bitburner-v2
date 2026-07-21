@@ -196,9 +196,16 @@ export async function main(ns) {
         // ── Status + tail ───────────────────────────────────────────────────
         const avgStats = names.length
             ? names.reduce((s, n) => s + combatAvg(info.get(n)), 0) / names.length : 0;
+        // Short phase label for the dashboard row's header line (managerRow reads
+        // snap.action). Adds the most relevant per-phase detail inline.
+        const action = phase === "RECRUIT" ? `RECRUIT · ${names.length}/${GANG_MAX_MEMBERS}`
+            : phase === "POWER" ? `POWER · win ${Math.round(minWin * 100)}%`
+            : phase === "CLASH" ? `CLASH · win ${Math.round(minWin * 100)}%`
+            : `DONE · ${focus}`;
         publishStatus(ns, STATUS_PORT_GANG, {
             ts: Date.now(),
             phase: phase.toLowerCase(),
+            action,
             karmaNeeded: 0,
             members: names.length,
             avgStats: Math.round(avgStats),
@@ -248,6 +255,7 @@ async function formation(ns) {
         publishStatus(ns, STATUS_PORT_GANG, {
             ts: now,
             phase: "karma",
+            action: inBn2 ? "forming · awaiting faction" : `forming · karma ${ns.format.number(needed)} left`,
             karmaNeeded: needed,
             members: 0,
             focus: null,
