@@ -13,7 +13,7 @@ lifecycle; publishes a status snapshot on port 10 (`STATUS_PORT_GANG`).
 ## How it works
 
 **Formation.** Until `inGang()`, it attempts `ns.gang.createGang("Slum Snakes")`
-every 30 s — the call simply returns false until the player is in the faction
+every 5 s — the call simply returns false until the player is in the faction
 with enough karma, so no separate eligibility check is needed. Outside BN2 it
 publishes `focusRequest: {action:'karma-homicide', etaMs}` (ETA from a measured
 karma-rate EMA) so pilot's arbitration ladder row 2 can lend player time to the
@@ -21,8 +21,9 @@ karma grind; sleeves are the primary grinders and their karma lands on the
 player total, so the measured rate already includes them.
 
 **Running: RECRUIT → POWER → CLASH → DONE**, recomputed from live API state
-every tick (`await nextUpdate()` raced against a 30 s sleep guard). Nothing
-load-bearing is in-memory-only, so restarts and aug resets resume cleanly.
+every tick (`await ns.gang.nextUpdate()`, which resolves each gang update cycle,
+~2 s at normal speed). Nothing load-bearing is in-memory-only, so restarts and
+aug resets resume cleanly.
 
 - **RECRUIT** (< 12 members): respect first, not money — power scales linearly
   with roster size, so unlocking all 12 slots is the biggest early lever. The

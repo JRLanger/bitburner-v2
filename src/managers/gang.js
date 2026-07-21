@@ -64,9 +64,11 @@ import {
 import { publishStatus } from "/lib/status.js";
 import { moneyFloor } from "/lib/flags.js";
 
-/** Tick fallback, ms: nextUpdate() normally resolves every ~2s (faster with
- *  bonus time), but race a sleep so a stalled promise can't wedge the loop. */
-const TICK_GUARD_MS = 30_000;
+/** Formation-loop poll interval, ms — used only before the gang exists, where
+ *  there is no nextUpdate() to await. The running loop awaits ns.gang.nextUpdate()
+ *  directly: racing it against a sleep is illegal (the losing Netscript async call
+ *  keeps running and collides with the next tick's gang call). */
+const FORMATION_POLL_MS = 5_000;
 
 /** Combat tasks by role. Static names (stable game data) — getTaskNames() is
  *  only consulted for money-task scoring, where stats matter per member. */
@@ -211,7 +213,7 @@ export async function main(ns) {
         });
         render(ns, phase, gi, names, minWin, growth, windowFull, equipped, equipTarget, focus, factionRep, repTarget, vigilantes);
 
-        await Promise.race([ns.gang.nextUpdate(), ns.sleep(TICK_GUARD_MS)]);
+        await ns.gang.nextUpdate();
     }
 }
 
@@ -256,7 +258,7 @@ async function formation(ns) {
         ns.print(inBn2
             ? `waiting to create gang with ${GANG_FACTION} (BN2 — join faction)`
             : `karma ${ns.format.number(karma)} / ${ns.format.number(GANG_KARMA_REQ)} (rate ${rate.toFixed(2)}/s)`);
-        await ns.sleep(TICK_GUARD_MS);
+        await ns.sleep(FORMATION_POLL_MS);
     }
     ns.print(`gang created with ${GANG_FACTION}`);
 }

@@ -297,7 +297,12 @@ rep-locked at a joined faction, it picks the lowest `ETA = max(moneyTime, repTim
 
 For each aug it grinds the joined faction where current rep is highest (closest to
 unlock). Work uses `hacking` type when offered, else the faction's first, via
-`workForFaction(faction, type, false)` — **`focus` always `false`**. When no priority aug
+`workForFaction(faction, type, false)` — **`focus` always `false`**. Factions whose
+`getFactionWorkTypes` is empty are skipped as work targets: the player's **gang
+faction** earns rep only through gang respect, not `workForFaction`, so `pickWorkType`
+returns `null` for it and both the ETA selector and the NeuroFlux grind exclude it
+(otherwise the gang faction — often the highest-rep one — would be handed to
+`workForFaction` with an `undefined` work type and throw). When no priority aug
 is rep-locked (all owned or rep-met, awaiting the reset batch buy), the row stays
 applicable via the fallback target below (non-priority aug → NeuroFlux) rather than going
 idle.

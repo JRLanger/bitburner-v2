@@ -809,7 +809,10 @@ function fallbackGrindTarget(ns, snap, state) {
  *  same one dumpNeuroflux buys from — so earned rep maximizes the reset NF dump. */
 function neurofluxGrindTarget(ns, snap) {
     const sing = ns.singularity;
-    const best = bestRepFaction(sing, snap.joinedFactions);
+    // Only workable factions — the gang faction often has the highest rep (respect
+    // converts to rep) but can't be worked, so it must not win the NF grind slot.
+    const workable = snap.joinedFactions.filter((f) => pickWorkType(sing, f) !== null);
+    const best = bestRepFaction(sing, workable);
     if (best === null) return null;
     return { aug: PILOT_NEUROFLUX, faction: best, workType: pickWorkType(sing, best), eta: Infinity };
 }
@@ -863,6 +866,9 @@ function bestAugByEta(ns, snap, state, augFilter) {
     // Per aug: the joined faction with the highest current rep (closest to unlock).
     const perAug = new Map(); // aug -> { faction, rep, repReq }
     for (const faction of snap.joinedFactions) {
+        // Skip factions whose rep can't be worked (e.g. the gang faction) — their
+        // augs are unlockable only through that mechanic, never via workForFaction.
+        if (pickWorkType(sing, faction) === null) continue;
         const rep = sing.getFactionRep(faction);
         for (const aug of sing.getAugmentationsFromFaction(faction)) {
             if (!augFilter(aug) || aug === PILOT_NEUROFLUX || ownedOrPurchased.has(aug)) continue;
@@ -907,7 +913,9 @@ function bestAugByEta(ns, snap, state, augFilter) {
  *  faction's first available type. */
 function pickWorkType(sing, faction) {
     const types = sing.getFactionWorkTypes(faction);
-    return types.includes("hacking") ? "hacking" : types[0];
+    // A faction with no workable types (e.g. the player's GANG faction, whose rep is
+    // earned only via gang respect) yields null — callers skip it as a work target.
+    return types.includes("hacking") ? "hacking" : (types[0] ?? null);
 }
 
 /** Reputation gain rate (rep/sec) for a faction+workType. Exact via Formulas when
