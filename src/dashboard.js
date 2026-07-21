@@ -22,6 +22,8 @@ import {
     STATUS_PORT_HACKNET,
     STATUS_PORT_PILOT,
     STATUS_PORT_LIFECYCLE,
+    STATUS_PORT_GANG,
+    GANG_MAX_MEMBERS,
     PILOT_LOOP_SLEEP,
     LIFECYCLE_LOOP_SLEEP,
     LOOP_SLEEP,
@@ -40,7 +42,8 @@ const LIFECYCLE_STALE_MS = 2.5 * LIFECYCLE_LOOP_SLEEP;
 const LAG_MS = 2 * LOOP_SLEEP;
 
 const ROOT_ID = "bb-dashboard";
-const POS_KEY = "bb-dashboard-pos";
+const POS_KEY = "bb-dashboard-pos"; // { left, top, width, height }
+const MIN_KEY = "bb-dashboard-min"; // "1" when the panel is minimized
 
 export async function main(ns) {
     ns.disableLog("ALL");
@@ -51,6 +54,10 @@ export async function main(ns) {
     const { root, body, titleEl } = createPanel(doc, win);
     let stopped = false;
     root.querySelector(".bb-close").onclick = () => { stopped = true; };
+    const minBtn = root.querySelector(".bb-min");
+    minBtn.onclick = () => toggleMin(root, win, !root.classList.contains("bb-collapsed"));
+    // Restore a previously-minimized state so it survives a script restart.
+    try { if (win.localStorage.getItem(MIN_KEY) === "1") toggleMin(root, win, true); } catch { /* ignore */ }
     ns.atExit(() => root.remove());
 
     while (!stopped) {
@@ -61,6 +68,7 @@ export async function main(ns) {
             hacknet: readStatus(ns, STATUS_PORT_HACKNET),
             pilot: readStatus(ns, STATUS_PORT_PILOT),
             lifecycle: readStatus(ns, STATUS_PORT_LIFECYCLE),
+            gang: readStatus(ns, STATUS_PORT_GANG),
         };
         // Live title: "Dashboard - <Controller> · <income>/s · <n> tgt".
         const c = snaps.ctrl;
@@ -83,7 +91,9 @@ function createPanel(doc, win) {
 
     const header = doc.createElement("div");
     header.className = "bb-header";
-    header.innerHTML = `<span class="bb-title">Dashboard</span><span class="bb-close" title="close">×</span>`;
+    header.innerHTML = `<span class="bb-title">Dashboard</span>`
+        + `<span class="bb-controls"><span class="bb-min" title="minimize">–</span>`
+        + `<span class="bb-close" title="close">×</span></span>`;
     root.appendChild(header);
 
     const body = doc.createElement("div");
@@ -92,24 +102,64 @@ function createPanel(doc, win) {
     root.appendChild(body);
 
     doc.body.appendChild(root);
-    restorePos(root, win);
+    restoreGeometry(root, win);
     makeDraggable(root, header, win);
+    // Persist size after a drag-resize (the corner grip fires no header mouseup).
+    // Observe fires once on attach with the just-restored size — a harmless re-save.
+    try { new win.ResizeObserver(() => saveGeometry(root, win)).observe(root); } catch { /* no ResizeObserver → size just isn't persisted */ }
     return { root, body, titleEl: header.querySelector(".bb-title") };
 }
 
-/** Restore the last saved top/left from localStorage (default top-right). */
-function restorePos(root, win) {
+/** Restore saved position AND size from localStorage (default top-right, auto size). */
+function restoreGeometry(root, win) {
     try {
-        const saved = JSON.parse(win.localStorage.getItem(POS_KEY) || "null");
-        if (saved && typeof saved.left === "number") {
-            root.style.left = saved.left + "px";
-            root.style.top = saved.top + "px";
+        const s = JSON.parse(win.localStorage.getItem(POS_KEY) || "null");
+        if (s && typeof s.left === "number") {
+            root.style.left = s.left + "px";
+            root.style.top = s.top + "px";
             root.style.right = "auto";
+            if (typeof s.width === "number") root.style.width = s.width + "px";
+            if (typeof s.height === "number") root.style.height = s.height + "px";
             return;
         }
     } catch { /* fall through to default */ }
     root.style.top = "90px";
     root.style.right = "20px";
+}
+
+/** Single source of truth for the localStorage geometry write, used by both the
+ *  drag-end and resize-end paths. While minimized the body is hidden and height
+ *  collapses to the header, so the last expanded width/height is preserved instead
+ *  of overwritten with the collapsed size. */
+function saveGeometry(root, win) {
+    try {
+        const prev = JSON.parse(win.localStorage.getItem(POS_KEY) || "null") || {};
+        const r = root.getBoundingClientRect();
+        const collapsed = root.classList.contains("bb-collapsed");
+        win.localStorage.setItem(POS_KEY, JSON.stringify({
+            left: r.left,
+            top: r.top,
+            width: collapsed ? prev.width : r.width,
+            height: collapsed ? prev.height : r.height,
+        }));
+    } catch { /* ignore */ }
+}
+
+/** Collapse/expand the panel body. On collapse the explicit height is remembered
+ *  and cleared so the panel shrinks to just the header; on expand it's restored.
+ *  Persists the state so it survives a script restart. */
+function toggleMin(root, win, collapse) {
+    if (collapse) {
+        root.dataset.expandedHeight = root.style.height || "";
+        root.classList.add("bb-collapsed");
+        root.style.height = ""; // auto → header only
+    } else {
+        root.classList.remove("bb-collapsed");
+        root.style.height = root.dataset.expandedHeight || "";
+    }
+    const btn = root.querySelector(".bb-min");
+    if (btn) { btn.textContent = collapse ? "+" : "–"; btn.title = collapse ? "expand" : "minimize"; }
+    try { win.localStorage.setItem(MIN_KEY, collapse ? "1" : "0"); } catch { /* ignore */ }
 }
 
 /** Drag the panel by its header; persist the resting position. */
@@ -132,8 +182,7 @@ function makeDraggable(root, header, win) {
     win.addEventListener("mouseup", () => {
         if (!dragging) return;
         dragging = false;
-        const r = root.getBoundingClientRect();
-        try { win.localStorage.setItem(POS_KEY, JSON.stringify({ left: r.left, top: r.top })); } catch { /* ignore */ }
+        saveGeometry(root, win);
     });
 }
 
@@ -275,6 +324,7 @@ function renderScripts(snaps, now) {
             ["no-unlock", fmtDur(snaps.lifecycle.stagnantMin * 60_000)],
             ["auto-install", snaps.lifecycle.autoInstallArmed ? "ARMED" : "off"],
         ] : [], LIFECYCLE_STALE_MS));
+    rows.push(managerRow("gang", snaps.gang, now, gangStats(snaps.gang)));
 
     // Share row: state lives on the controller snapshot, not its own port.
     const shareState = !c ? "off" : c.shareOff ? "paused" : c.shareThreads > 0 ? "live" : "idle";
@@ -287,6 +337,25 @@ function renderScripts(snaps, now) {
     rows.push(managerRowHtml("share", shareDot, c ? "" : "no controller publishing", shareStats));
 
     return `<div class="bb-section"><div class="bb-label">MANAGERS</div><div class="bb-mgrlist">${rows.join("")}</div></div>`;
+}
+
+/** Gang stat pairs, conditional on phase: the karma (formation) phase reports
+ *  progress toward creating the gang; the running phases report roster/economy. */
+function gangStats(g) {
+    if (!g) return [];
+    if (g.phase === "karma") {
+        const s = [["phase", "karma"], ["karma left", fmtCount(g.karmaNeeded)]];
+        if (g.focusRequest) s.push(["assist", "homicide"]);
+        return s;
+    }
+    return [
+        ["phase", g.phase],
+        ["members", `${g.members}/${GANG_MAX_MEMBERS}`],
+        ["income", fmtMoney(g.income) + "/s"],
+        ["territory", pct(g.territory)],
+        ["respect", fmtCount(g.respect)],
+        ["wanted", pct(g.wantedPenalty)],
+    ];
 }
 
 /**
@@ -323,7 +392,7 @@ function renderAlerts(snaps, now) {
         if (c.totalRam > 0 && c.poolFree / c.totalRam < 0.03) alerts.push("Pool nearly full");
         if (c.shareOff) alerts.push("Share manually paused");
     }
-    for (const [name, staleMs] of [["contracts", MGR_STALE_MS], ["pserver", MGR_STALE_MS], ["hacknet", MGR_STALE_MS], ["pilot", PILOT_STALE_MS], ["lifecycle", LIFECYCLE_STALE_MS]]) {
+    for (const [name, staleMs] of [["contracts", MGR_STALE_MS], ["pserver", MGR_STALE_MS], ["hacknet", MGR_STALE_MS], ["pilot", PILOT_STALE_MS], ["lifecycle", LIFECYCLE_STALE_MS], ["gang", MGR_STALE_MS]]) {
         const s = snaps[name];
         if (s && now - (s.ts || 0) > staleMs && !/done|maxed|exit|exhaust/i.test(s.action || "")) {
             alerts.push(`${name} not reporting`);
@@ -392,6 +461,11 @@ function capitalize(s) {
     return s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
 }
 
+/** Fraction (0..1) → whole-percent string. "—" for missing/non-finite. */
+function pct(v) {
+    return v == null || !isFinite(v) ? "—" : Math.round(v * 100) + "%";
+}
+
 /** Compact clock-style duration for short spans (batch times): "45s" / "1m23s" /
  *  "1h04m". Use fmtDur instead for long, coarse spans (run age, horizons) where a
  *  single decimal unit reads better. */
@@ -452,13 +526,16 @@ function injectStyle(doc) {
   --bb-bg: rgba(12,18,22,0.92); --bb-fg: #cfe8e3; --bb-dim: #6f8a86; --bb-line: rgba(54,197,240,0.18);
 }
 #${ROOT_ID} {
-  position: fixed; z-index: 99999; width: 880px; max-height: 90vh; overflow: hidden;
+  position: fixed; z-index: 99999; width: 880px; max-height: 100vh; overflow: hidden;
+  min-width: 420px; min-height: 120px; resize: both;
   display: flex; flex-direction: column;
   background: var(--bb-bg); color: var(--bb-fg);
   font-family: "JetBrains Mono","Consolas","Courier New",monospace; font-size: 18px; line-height: 1.45;
   border: 1px solid var(--bb-line); border-radius: 14px;
   box-shadow: 0 10px 40px rgba(0,0,0,0.55); backdrop-filter: blur(6px);
 }
+#${ROOT_ID}.bb-collapsed { resize: none; min-height: 0; height: auto; }
+#${ROOT_ID}.bb-collapsed .bb-body { display: none; }
 #${ROOT_ID} .bb-header {
   display: flex; justify-content: space-between; align-items: center;
   padding: 11px 18px; cursor: move; user-select: none;
@@ -466,6 +543,9 @@ function injectStyle(doc) {
   border-bottom: 1px solid var(--bb-line);
 }
 #${ROOT_ID} .bb-title { color: var(--bb-green); font-weight: 600; letter-spacing: 1.5px; font-size: 16px; }
+#${ROOT_ID} .bb-controls { display: flex; align-items: center; gap: 4px; }
+#${ROOT_ID} .bb-min { cursor: pointer; color: var(--bb-dim); font-size: 24px; padding: 0 6px; line-height: 1; }
+#${ROOT_ID} .bb-min:hover { color: var(--bb-green); }
 #${ROOT_ID} .bb-close { cursor: pointer; color: var(--bb-dim); font-size: 24px; padding: 0 6px; }
 #${ROOT_ID} .bb-close:hover { color: var(--bb-red); }
 #${ROOT_ID} .bb-body { overflow-y: auto; padding: 6px 0; }

@@ -75,10 +75,12 @@ aug resets resume cleanly.
   (0.25) cap, the per-purchase `GANG_EQUIP_BUDGET_FRAC` (0.1) cap, and
   lifecycle's `moneyFloor()` reserve.
 
-**Status (port 10):** `{ts, phase, karmaNeeded, members, avgStats, respect,
-wantedPenalty, income, territory, warfare, minWinChance, focus, focusRequest}`.
-`income` multiplies `moneyGainRate` by 5 — the API reports gain per 200 ms game
-cycle, not per second.
+**Status (port 10):** `{ts, phase, action, karmaNeeded, members, avgStats,
+respect, wantedPenalty, income, territory, warfare, minWinChance, focus,
+focusRequest}`. `income` multiplies `moneyGainRate` by 5 — the API reports gain
+per 200 ms game cycle, not per second. `action` is a short phase label
+(`RECRUIT · 7/12`, `POWER · win 62%`, `CLASH · win 78%`, `DONE · money`, or
+`forming · karma … left`) shown as the dashboard row's header line.
 
 **Launch gate** (in booster/orbiter's `MANAGERS` registry, after lifecycle):
 SF2 owned or currently BN2, plus `pilotGate` (the rep gate needs singularity).

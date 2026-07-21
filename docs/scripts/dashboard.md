@@ -30,11 +30,15 @@ The panel shows, top to bottom:
   when admission is ranking by absolute earning power (RAM-rich), or `$/GB·s` when ranking
   by efficiency (RAM-limited) — so the row order always reads sensibly against the metric.
 - **Scripts row** — one chip per script (controller, contracts, pserver, hacknet, pilot,
-  lifecycle, share) with a live/stale/done dot and its headline stat (fleet size, hacknet
+  lifecycle, gang, share) with a live/stale/done dot and its headline stat (fleet size, hacknet
   production, pilot's grind target `aug - faction` + acquirable/rep aug counts, lifecycle's
   augs-ready + auto-install state, etc.). The slow-tick managers (pilot 30s, lifecycle 60s)
   use higher staleness thresholds (2.5× their own loop) so they aren't falsely flagged
-  "not reporting". Pilot's pending city-faction invites and lifecycle's install
+  "not reporting". The **gang** chip is phase-aware: in formation it shows karma remaining,
+  and once running shows phase / members `n/12` / income / territory / respect / wanted
+  (its `action` header reads `RECRUIT · 7/12`, `POWER · win 62%`, `CLASH`, `DONE · money`);
+  it uses the default 25 s threshold since gang publishes every `nextUpdate` (≤ 5 s).
+  Pilot's pending city-faction invites and lifecycle's install
   recommendation / BitNode-completable state surface as alert lines.
 - **Alerts line** — engine lag, pool nearly full, share paused, or a manager that stopped
   reporting; otherwise "all systems nominal."
@@ -48,13 +52,19 @@ The panel shows, top to bottom:
    DOM is the same as in the browser build.
 2. **Panel scaffolding (`createPanel`).** Builds a fixed-position container with a
    draggable header and a `.bb-body` div. The header and body are created once; only the
-   body's `innerHTML` is rewritten each tick, so dragging and the close button stay live.
-   A `<style>` block is injected once (`injectStyle`). Position is restored from / saved to
-   `localStorage` so the panel reopens where you left it.
+   body's `innerHTML` is rewritten each tick, so dragging and the header buttons stay live.
+   A `<style>` block is injected once (`injectStyle`). **Geometry** (position + size) is
+   restored from / saved to `localStorage` (`POS_KEY`) so the panel reopens where and how
+   big you left it. The panel is **resizable** via the native CSS `resize: both` grip; a
+   `ResizeObserver` persists the new size through the shared `saveGeometry` helper (the
+   grip fires no header `mouseup`, so the drag-end path alone wouldn't catch it). A
+   **minimize** button (`toggleMin`) collapses the body to just the header — remembering the
+   expanded height so `saveGeometry` doesn't overwrite it with the collapsed size, and
+   persisting the collapsed state under `MIN_KEY` so it survives a script restart.
 3. **Cleanup.** `ns.atExit(() => root.remove())` removes the overlay when the script is
    killed; the × button sets a `stopped` flag so the loop exits (and atExit fires).
-4. **Render loop.** Every second it `readStatus`-es all four ports into a `snaps` object,
-   then rebuilds the body from `render(snaps)`, which composes the five sections as HTML
+4. **Render loop.** Every second it `readStatus`-es all the manager ports into a `snaps`
+   object, then rebuilds the body from `render(snaps)`, which composes the five sections as HTML
    strings. Liveness uses each snapshot's `ts`: the controller is "stale" after 3 s (it
    ticks ~every 200 ms), the managers after 25 s (they loop every 10 s). A stale manager
    whose last `action` says *done/maxed/exit/exhausted* is shown grey ("done"), not red —
@@ -64,8 +74,8 @@ The controller-side data is produced by a new `buildSnapshot(...)` in both `boos
 and `orbiter.js`, called right after `renderStatus` each tick. It reuses the exact values
 the tail table already computes (via `displayHealth`, `expectedIncome`, `poolFree`, the
 `pipelines` map, `topRampF`/`rampSaturated`, `shareThreads`) plus `tickGap`/`lastWorkMs` for the
-engine-lag indicator — no new NS calls. The three managers publish a small object
-(timestamp, headline stats, last-action string) at the end of their own loops.
+engine-lag indicator — no new NS calls. Each manager publishes a small object
+(timestamp, headline stats, last-action string) at the end of its own loop.
 
 **Value formatting.** Every displayed number goes through a compact formatter so the
 panel never shows raw magnitudes — the goal is a readable unit, never a wall of digits:
