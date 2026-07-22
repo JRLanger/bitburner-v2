@@ -863,6 +863,19 @@ function bestAugByEta(ns, snap, state, augFilter) {
     const income = state.income.ema; // $/s (null until two samples exist)
     const money = snap.money;
 
+    // First, augs already rep-met at ANY joined faction — including the gang faction,
+    // whose respect-derived rep unlocks its augs without any grinding. Such an aug is
+    // ready for lifecycle to BUY; grinding another faction's rep for it is wasted work
+    // (the "grind Aevum for an aug the gang already offers" bug). Includes non-workable
+    // factions precisely because the gang faction is the common source of a free unlock.
+    const alreadyUnlockable = new Set();
+    for (const faction of snap.joinedFactions) {
+        const rep = sing.getFactionRep(faction);
+        for (const aug of sing.getAugmentationsFromFaction(faction)) {
+            if (rep >= sing.getAugmentationRepReq(aug)) alreadyUnlockable.add(aug);
+        }
+    }
+
     // Per aug: the joined faction with the highest current rep (closest to unlock).
     const perAug = new Map(); // aug -> { faction, rep, repReq }
     for (const faction of snap.joinedFactions) {
@@ -872,6 +885,7 @@ function bestAugByEta(ns, snap, state, augFilter) {
         const rep = sing.getFactionRep(faction);
         for (const aug of sing.getAugmentationsFromFaction(faction)) {
             if (!augFilter(aug) || aug === PILOT_NEUROFLUX || ownedOrPurchased.has(aug)) continue;
+            if (alreadyUnlockable.has(aug)) continue; // rep-met elsewhere → buy, don't grind
             const repReq = sing.getAugmentationRepReq(aug);
             if (rep >= repReq) continue; // already unlocked → not a grind target
             const cur = perAug.get(aug);
