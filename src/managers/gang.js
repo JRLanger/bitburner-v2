@@ -396,13 +396,21 @@ function assignTasks(ns, phase, focus, names, info, vigilantes, moneyTasks) {
     for (const n of trainees) set(n, TASK_TRAIN);
 
     const vigil = Math.min(vigilantes, earners.length);
+
+    // RECRUIT respect slots go to a STABLE set — the oldest members (lowest g<N>
+    // index) among the non-vigilante earners — not the live-strongest. Terrorism
+    // grants far less combat XP than training, so a rank-based pick would reshuffle
+    // every tick (the Terrorism member falls behind, a trainee overtakes it) and
+    // flap tasks; oldest≈strongest anyway, so this costs almost no respect rate.
+    const idx = (n) => parseInt(n.slice(1), 10) || 0;
+    const respectSet = phase !== "RECRUIT" ? null : new Set(
+        earners.slice(vigil).sort((a, b) => idx(a) - idx(b)).slice(0, GANG_RECRUIT_RESPECT_SLOTS));
+
     for (let i = 0; i < earners.length; i++) {
         const n = earners[i];
         if (i < vigil) { set(n, TASK_VIGILANTE); continue; }
         if (phase === "RECRUIT") {
-            // Strongest GANG_RECRUIT_RESPECT_SLOTS earners on Terrorism, rest train.
-            const strongest = i >= earners.length - GANG_RECRUIT_RESPECT_SLOTS;
-            set(n, strongest ? TASK_RESPECT : TASK_TRAIN);
+            set(n, respectSet.has(n) ? TASK_RESPECT : TASK_TRAIN);
         } else if (phase === "POWER" || phase === "CLASH") {
             set(n, TASK_TERRITORY);
         } else { // DONE
