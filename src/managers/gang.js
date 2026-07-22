@@ -13,28 +13,31 @@
  *   Running: RECRUIT → POWER → CLASH → DONE, recomputed from live API state
  *   every tick (nothing load-bearing is in-memory-only, so restarts and aug
  *   resets resume cleanly).
- *     RECRUIT  <12 members. Strongest earners on Terrorism (respect unlocks
- *              member slots — the biggest early lever), everyone else trains.
- *              No equipment purchases yet.
+ *     RECRUIT  <12 members. Every member past the training threshold runs
+ *              Terrorism (respect unlocks member slots — the biggest early
+ *              lever, so maximize it to reach 12 fastest); sub-threshold recruits
+ *              train combat until productive; vigilantes are peeled off
+ *              reactively for wanted. No equipment purchases yet.
  *     POWER    full roster, clashes OFF, all earners on the Territory Warfare
  *              TASK — power (and hence win chance) grows ONLY from members
  *              assigned to it. Sequential arming: non-aug gear one member at a
  *              time, strongest first; armed members are ascension-locked.
- *     CLASH    entered when min win chance ≥ floor AND its growth has flattened
- *              (near the W_max ceiling) AND everyone is armed. Clashes ON,
- *              earners STAY on Territory Warfare (power keeps growing while NPC
- *              power decays per loss). Income ~0 here by design — status
- *              carries the phase so pilot doesn't read it as a fault. Sticky:
- *              only min win chance dropping below the floor reverts to POWER
- *              (and that clears the win history — stale CLASH samples read as
- *              falsely-flat growth).
+ *     CLASH    entered as soon as the min win chance over all rivals reaches
+ *              GANG_CLASH_MIN_CHANCE (0.75); reverts to POWER if it drops back
+ *              below. Clashes stay ON throughout. Earner tasks follow a win-chance
+ *              hysteresis: below GANG_CLASH_REBUILD_CHANCE they build power on
+ *              Territory Warfare; at/above GANG_CLASH_EARN_CHANCE they come OFF TW
+ *              onto respect/money (gang power is a frozen accumulator, so win
+ *              chance holds while territory keeps climbing and the gang earns).
  *     DONE     territory ≥ 0.99 — clashes off. Rep→money gate: earners work
  *              Terrorism until the faction's rep covers its highest aug
  *              requirement (faction rep accrues in proportion to respect), then
  *              switch to each member's best money task.
  *
- * Cross-phase: reactive vigilante hysteresis keeps wantedPenalty ≥ 0.95;
- * absolute-gain ascension (Δmult ≥ 0.70, not a ratio threshold); augs are
+ * Cross-phase: reactive vigilante hysteresis keeps wantedPenalty ≥ 0.95 in EVERY
+ * phase (the penalty multiplies both money and respect, so it's never neglected —
+ * vigilantes are only released once the penalty recovers, not merely when wanted
+ * stops rising); absolute-gain ascension (Δmult ≥ 0.70, not a ratio threshold); augs are
  * bought any time after RECRUIT (they survive ascension — the wipeable gear is
  * what needs the arming locks).
  *
@@ -53,11 +56,10 @@ import {
     GANG_AUG_SAFETY_MULT,
     GANG_EQUIP_BUDGET_FRAC,
     GANG_CLASH_MIN_CHANCE,
-    GANG_CLASH_GROWTH_MIN,
-    GANG_WIN_HISTORY_MS,
+    GANG_CLASH_EARN_CHANCE,
+    GANG_CLASH_REBUILD_CHANCE,
     GANG_TERRITORY_DONE,
     GANG_MAX_MEMBERS,
-    GANG_RECRUIT_RESPECT_SLOTS,
     GANG_REP_TARGET_EXCLUDE,
     MECH_SPEND_FRAC,
 } from "/config/constants.js";
@@ -114,8 +116,8 @@ export async function main(ns) {
 
     // ── Per-run state (advisory only — safe to lose on restart) ─────────────
     const equipped = new Set(); // members whose non-aug arming is complete
-    const winHistory = [];      // [{ts, v}] min-win-chance samples, GANG_WIN_HISTORY_MS window
     let vigilantes = 0;         // wanted-penalty hysteresis target
+    let clashEarning = false;   // CLASH sub-state: earners off TW onto money/respect (hysteresis)
     let phase = null;
 
     while (true) {
@@ -133,27 +135,25 @@ export async function main(ns) {
             minWin = Math.min(minWin, ns.gang.getChanceToWinClash(g));
         }
 
-        // Rolling growth window: flat growth means we're near the W_max ceiling
-        // and further power-building yields little — time to engage.
-        const now = Date.now();
-        winHistory.push({ ts: now, v: minWin });
-        while (winHistory.length > 1 && now - winHistory[0].ts > GANG_WIN_HISTORY_MS) winHistory.shift();
-        const windowFull = now - winHistory[0].ts >= GANG_WIN_HISTORY_MS * 0.9;
-        const growth = windowFull ? minWin - winHistory[0].v : Infinity;
-
-        // ── Phase (recomputed from live state; CLASH is sticky) ─────────────
-        const allArmed = names.length > 0 && names.every((n) => equipped.has(n));
+        // ── Phase (recomputed from live state) ──────────────────────────────
         const prev = phase;
-        phase = pickPhase(names.length, gi.territory, minWin, growth, allArmed, prev);
+        phase = pickPhase(names.length, gi.territory, minWin);
         if (prev === "CLASH" && phase === "POWER") {
-            winHistory.length = 0; // stale CLASH samples read as falsely-flat growth
-            equipped.clear();      // rivals grew — re-verify everyone's arming
+            equipped.clear(); // rivals grew — re-verify everyone's arming
             ns.print(`WARN: reverted CLASH→POWER (min win ${(minWin * 100).toFixed(1)}%)`);
         }
 
-        // ── Rep→money gate (DONE phase only) ────────────────────────────────
+        // ── CLASH earn/build hysteresis ─────────────────────────────────────
+        // At a comfortable win chance the earners come off Territory Warfare to
+        // actually earn (power is a frozen accumulator, so win chance holds and
+        // territory keeps climbing); if it slips they go back on TW to rebuild.
+        if (minWin >= GANG_CLASH_EARN_CHANCE) clashEarning = true;
+        else if (minWin < GANG_CLASH_REBUILD_CHANCE) clashEarning = false;
+
+        // ── Rep→money gate (whenever earning: DONE, or CLASH earn sub-state) ──
+        const earning = phase === "DONE" || (phase === "CLASH" && clashEarning);
         const factionRep = ns.singularity.getFactionRep(faction);
-        const focus = phase !== "DONE" ? null : (factionRep >= repTarget ? "money" : "respect");
+        const focus = !earning ? null : (factionRep >= repTarget ? "money" : "respect");
 
         // ── Ascension (absolute-gain rule + arming locks) ───────────────────
         const equipTarget = (phase === "POWER" || phase === "CLASH")
@@ -182,15 +182,21 @@ export async function main(ns) {
         // ── Equipment ───────────────────────────────────────────────────────
         if (phase !== "RECRUIT") buyEquipment(ns, phase, names, info, equipped, equipTarget, augEquip, gearEquip);
 
-        // ── Wanted-penalty hysteresis ───────────────────────────────────────
-        if (gi.wantedPenalty < GANG_WANTED_PENALTY_FLOOR && gi.wantedLevelGainRate > 0) {
-            vigilantes = Math.min(vigilantes + 1, names.length);
-        } else if (gi.wantedLevelGainRate <= 0 && vigilantes > 0) {
+        // ── Wanted-penalty hysteresis (every phase — the penalty multiplies BOTH
+        //    money and respect, so it's never neglected) ──────────────────────
+        // Below the floor: add a vigilante whenever wanted isn't already falling
+        // (rate ≥ 0 means the current count can't even reduce the accumulated
+        // wanted, let alone with Terrorism running) — ramp up until it drops. Only
+        // release once the penalty has actually recovered above the floor; releasing
+        // merely because wanted stopped rising would strand a catastrophic penalty.
+        if (gi.wantedPenalty < GANG_WANTED_PENALTY_FLOOR) {
+            if (gi.wantedLevelGainRate >= 0) vigilantes = Math.min(vigilantes + 1, names.length);
+        } else if (vigilantes > 0) {
             vigilantes--;
         }
 
         // ── Task assignment ─────────────────────────────────────────────────
-        assignTasks(ns, phase, focus, names, info, vigilantes, moneyTasks);
+        assignTasks(ns, phase, focus, names, info, vigilantes, moneyTasks, clashEarning);
         ns.gang.setTerritoryWarfare(phase === "CLASH");
 
         // ── Status + tail ───────────────────────────────────────────────────
@@ -200,7 +206,7 @@ export async function main(ns) {
         // snap.action). Adds the most relevant per-phase detail inline.
         const action = phase === "RECRUIT" ? `RECRUIT · ${names.length}/${GANG_MAX_MEMBERS}`
             : phase === "POWER" ? `POWER · win ${Math.round(minWin * 100)}%`
-            : phase === "CLASH" ? `CLASH · win ${Math.round(minWin * 100)}%`
+            : phase === "CLASH" ? `CLASH · win ${Math.round(minWin * 100)}% · ${clashEarning ? focus : "build"}`
             : `DONE · ${focus}`;
         publishStatus(ns, STATUS_PORT_GANG, {
             ts: Date.now(),
@@ -218,7 +224,7 @@ export async function main(ns) {
             focus,
             focusRequest: null,
         });
-        render(ns, phase, gi, names, minWin, growth, windowFull, equipped, equipTarget, focus, factionRep, repTarget, vigilantes);
+        render(ns, phase, gi, names, minWin, equipped, equipTarget, focus, factionRep, repTarget, vigilantes, clashEarning);
 
         await ns.gang.nextUpdate();
     }
@@ -273,14 +279,14 @@ async function formation(ns) {
 
 // ── Phase machine ───────────────────────────────────────────────────────────
 
-/** RECRUIT → POWER → CLASH → DONE, from live state. CLASH is sticky above the
- *  win-chance floor; growth un-flattening alone never reverts it. */
-function pickPhase(memberCount, territory, minWin, growth, allArmed, prev) {
+/** RECRUIT → POWER → CLASH → DONE, from live state. CLASH engages as soon as the
+ *  min win chance over all rivals reaches GANG_CLASH_MIN_CHANCE (0.75) and reverts
+ *  to POWER if it drops back below — no separate stickiness needed, the threshold
+ *  is the whole rule. */
+function pickPhase(memberCount, territory, minWin) {
     if (memberCount < GANG_MAX_MEMBERS) return "RECRUIT";
     if (territory >= GANG_TERRITORY_DONE) return "DONE";
-    if (minWin < GANG_CLASH_MIN_CHANCE) return "POWER";
-    if (prev === "CLASH") return "CLASH";
-    return (growth < GANG_CLASH_GROWTH_MIN && allArmed) ? "CLASH" : "POWER";
+    return minWin >= GANG_CLASH_MIN_CHANCE ? "CLASH" : "POWER";
 }
 
 // ── Members ─────────────────────────────────────────────────────────────────
@@ -384,9 +390,11 @@ function buyEquipment(ns, phase, names, info, equipped, equipTarget, augEquip, g
  * Assign every member's task for this tick, by phase. Members are split into
  * trainees (< GANG_TRAIN_THRESHOLD avg combat) and earners; earners are sorted
  * weakest-first so vigilante duty (and money in DONE) lands on the weakest
- * while the strongest carry respect/territory.
+ * while the strongest carry respect/territory. In CLASH, `clashEarning` flips the
+ * earners between Territory Warfare (build power) and respect/money (earn) — see
+ * the win-chance hysteresis in the main loop.
  */
-function assignTasks(ns, phase, focus, names, info, vigilantes, moneyTasks) {
+function assignTasks(ns, phase, focus, names, info, vigilantes, moneyTasks, clashEarning) {
     const set = (n, task) => {
         if (info.get(n).task !== task) ns.gang.setMemberTask(n, task);
     };
@@ -396,15 +404,23 @@ function assignTasks(ns, phase, focus, names, info, vigilantes, moneyTasks) {
     for (const n of trainees) set(n, TASK_TRAIN);
 
     const vigil = Math.min(vigilantes, earners.length);
+
     for (let i = 0; i < earners.length; i++) {
         const n = earners[i];
         if (i < vigil) { set(n, TASK_VIGILANTE); continue; }
         if (phase === "RECRUIT") {
-            // Strongest GANG_RECRUIT_RESPECT_SLOTS earners on Terrorism, rest train.
-            const strongest = i >= earners.length - GANG_RECRUIT_RESPECT_SLOTS;
-            set(n, strongest ? TASK_RESPECT : TASK_TRAIN);
-        } else if (phase === "POWER" || phase === "CLASH") {
+            // Every productive member on Terrorism — respect unlocks the next member
+            // slot, so maximizing it (not just 2 earners) reaches 12 fastest. No top-N
+            // selection means nothing to flap.
+            set(n, TASK_RESPECT);
+        } else if (phase === "POWER") {
             set(n, TASK_TERRITORY);
+        } else if (phase === "CLASH") {
+            // Clashes stay ON either way; only the earners' task changes. Earn when
+            // win chance is comfortable, otherwise rebuild power on Territory Warfare.
+            set(n, clashEarning
+                ? (focus === "respect" ? TASK_RESPECT : bestMoneyTask(info.get(n), moneyTasks))
+                : TASK_TERRITORY);
         } else { // DONE
             set(n, focus === "respect" ? TASK_RESPECT : bestMoneyTask(info.get(n), moneyTasks));
         }
@@ -413,18 +429,18 @@ function assignTasks(ns, phase, focus, names, info, vigilantes, moneyTasks) {
 
 // ── Tail display ────────────────────────────────────────────────────────────
 
-function render(ns, phase, gi, names, minWin, growth, windowFull, equipped, equipTarget, focus, factionRep, repTarget, vigilantes) {
+function render(ns, phase, gi, names, minWin, equipped, equipTarget, focus, factionRep, repTarget, vigilantes, clashEarning) {
     const pct = (v) => (v * 100).toFixed(1) + "%";
     ns.clearLog();
     ns.print(`gang ${gi.faction} | ${phase} | ${names.length}/${GANG_MAX_MEMBERS} members | vigil ${vigilantes}`);
     ns.print(`  $${ns.format.number(gi.moneyGainRate * 5)}/s  respect ${ns.format.number(gi.respect)}  ` +
         `wanted ${pct(gi.wantedPenalty)}  territory ${pct(gi.territory)}  power ${ns.format.number(gi.power)}`);
     if (phase === "POWER") {
-        const g = windowFull ? `Δwin ${(growth * 100).toFixed(3)}% (need <${(GANG_CLASH_GROWTH_MIN * 100).toFixed(1)}%)` : "Δwin measuring…";
-        ns.print(`  min win ${pct(minWin)} (floor ${pct(GANG_CLASH_MIN_CHANCE)})  ${g}  armed ${equipped.size}/${names.length}` +
+        ns.print(`  min win ${pct(minWin)} (clash at ${pct(GANG_CLASH_MIN_CHANCE)})  armed ${equipped.size}/${names.length}` +
             (equipTarget ? `  arming ${equipTarget}` : ""));
     } else if (phase === "CLASH") {
-        ns.print(`  CLASHING — min win ${pct(minWin)}; income paused by design` +
+        ns.print(`  CLASHING — min win ${pct(minWin)}; ` +
+            (clashEarning ? `earning (${focus})` : `building power (win < ${pct(GANG_CLASH_EARN_CHANCE)})`) +
             (equipTarget ? `  re-arming ${equipTarget}` : ""));
     } else if (phase === "DONE") {
         ns.print(focus === "respect"
