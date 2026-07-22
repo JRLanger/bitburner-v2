@@ -639,26 +639,23 @@ export const GANG_AUG_SAFETY_MULT = 5;
 /** Per-purchase cap for gang equipment as a fraction of current money (on top
  *  of the shared MECH_SPEND_FRAC per-tick cap). */
 export const GANG_EQUIP_BUDGET_FRAC = 0.1;
-/** Hard safety floor: never enable clashes below this min win chance (over ALL
- *  rivals — clashes hit every rival at once). NOT the entry trigger. */
-export const GANG_CLASH_MIN_CHANCE = 0.55;
-/** Enter CLASH when min-win-chance growth over the history window drops below
- *  this (near the W_max ceiling — entering at bare 55% is ~6× slower). */
-export const GANG_CLASH_GROWTH_MIN = 0.005;
-/** Rolling window for the win-chance growth measurement, ms. */
-export const GANG_WIN_HISTORY_MS = 180_000;
+/** Enter (and stay in) CLASH once the min win chance over ALL rivals (clashes hit
+ *  every rival at once) is at or above this. Dropping back below it reverts to
+ *  POWER to rebuild. */
+export const GANG_CLASH_MIN_CHANCE = 0.75;
+/** Within CLASH, once min win chance reaches this the earners come OFF Territory
+ *  Warfare and switch to respect/money — clashes stay ON, and gang power is a
+ *  frozen accumulator (only TW members grow it, it never decays), so win chance
+ *  holds while territory keeps climbing and the gang actually earns. */
+export const GANG_CLASH_EARN_CHANCE = 0.90;
+/** Hysteresis partner to GANG_CLASH_EARN_CHANCE: if win chance slips back below
+ *  this, earners return to Territory Warfare to rebuild power. The band between the
+ *  two prevents per-tick flapping. */
+export const GANG_CLASH_REBUILD_CHANCE = 0.85;
 /** Territory at which the push is considered complete (DONE phase). */
 export const GANG_TERRITORY_DONE = 0.99;
 /** Full roster size (game cap). */
 export const GANG_MAX_MEMBERS = 12;
-/** Earners kept on the respect task (Terrorism) during RECRUIT phase. */
-export const GANG_RECRUIT_RESPECT_SLOTS = 2;
-/** RECRUIT respect-slot hysteresis: a challenger must beat the weakest incumbent's
- *  avg combat by ×(1 + this) to take its Terrorism slot. Prevents per-tick flapping
- *  (Terrorism grants little combat XP, so a rank-only pick reshuffles every tick)
- *  while letting the duty self-rotate as incumbents fall behind. Relative, so it
- *  self-scales with stat level; larger = stickier / slower rotation. */
-export const GANG_RESPECT_SWAP_MARGIN = 0.10;
 /** Repeatable augs excluded from the DONE-phase rep target. */
 export const GANG_REP_TARGET_EXCLUDE = ["NeuroFlux Governor"];
 
