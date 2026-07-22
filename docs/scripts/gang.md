@@ -27,14 +27,17 @@ aug resets resume cleanly.
 
 - **RECRUIT** (< 12 members): respect first, not money — power scales linearly
   with roster size, so unlocking all 12 slots is the biggest early lever. The
-  oldest 1–2 earners (lowest `g<N>` index) run Terrorism (highest respect);
-  everyone under the training threshold (avg combat stat 200) runs Train Combat.
-  The respect slots use a **stable identity** (oldest members), not the
-  live-strongest: Terrorism grants far less combat XP than training, so a
-  rank-based pick would reshuffle the top set every tick and flap tasks between
-  Terrorism and Train Combat — oldest ≈ strongest anyway. No equipment purchases
-  yet. Recruits are named `g0`, `g1`, … into the lowest free index (death-safe;
-  never named after an NS function — see the RAM-collision memory).
+  strongest 1–2 earners run Terrorism (highest respect); everyone under the
+  training threshold (avg combat stat 200) runs Train Combat. The respect slots
+  are held in **persisted state with hysteresis** (`updateRespectMembers`): a
+  challenger only takes a slot when it beats the weakest incumbent's avg combat
+  by ×(1 + `GANG_RESPECT_SWAP_MARGIN`, 0.10). Terrorism grants far less combat XP
+  than training, so a rank-only pick would reshuffle the top set every tick and
+  flap tasks; the margin makes it sticky (no flapping) yet **self-rotating** — a
+  lagging incumbent eventually cedes its slot to a stronger trainee and trains
+  back up, so no member is permanently sidelined. No equipment purchases yet.
+  Recruits are named `g0`, `g1`, … into the lowest free index (death-safe; never
+  named after an NS function — see the RAM-collision memory).
 - **POWER** (full roster, clashes OFF): all ready members go on the *Territory
   Warfare task* with `setTerritoryWarfare(false)`. Gang power — and hence win
   chance — grows **only** from members assigned to that task; this phase is what

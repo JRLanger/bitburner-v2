@@ -58,6 +58,7 @@ import {
     GANG_TERRITORY_DONE,
     GANG_MAX_MEMBERS,
     GANG_RECRUIT_RESPECT_SLOTS,
+    GANG_RESPECT_SWAP_MARGIN,
     GANG_REP_TARGET_EXCLUDE,
     MECH_SPEND_FRAC,
 } from "/config/constants.js";
@@ -115,6 +116,7 @@ export async function main(ns) {
     // ── Per-run state (advisory only — safe to lose on restart) ─────────────
     const equipped = new Set(); // members whose non-aug arming is complete
     const winHistory = [];      // [{ts, v}] min-win-chance samples, GANG_WIN_HISTORY_MS window
+    const respectMembers = new Set(); // RECRUIT Terrorism duty (hysteresis — persisted)
     let vigilantes = 0;         // wanted-penalty hysteresis target
     let phase = null;
 
@@ -190,7 +192,7 @@ export async function main(ns) {
         }
 
         // ── Task assignment ─────────────────────────────────────────────────
-        assignTasks(ns, phase, focus, names, info, vigilantes, moneyTasks);
+        assignTasks(ns, phase, focus, names, info, vigilantes, moneyTasks, respectMembers);
         ns.gang.setTerritoryWarfare(phase === "CLASH");
 
         // ── Status + tail ───────────────────────────────────────────────────
@@ -386,7 +388,7 @@ function buyEquipment(ns, phase, names, info, equipped, equipTarget, augEquip, g
  * weakest-first so vigilante duty (and money in DONE) lands on the weakest
  * while the strongest carry respect/territory.
  */
-function assignTasks(ns, phase, focus, names, info, vigilantes, moneyTasks) {
+function assignTasks(ns, phase, focus, names, info, vigilantes, moneyTasks, respectMembers) {
     const set = (n, task) => {
         if (info.get(n).task !== task) ns.gang.setMemberTask(n, task);
     };
@@ -397,24 +399,51 @@ function assignTasks(ns, phase, focus, names, info, vigilantes, moneyTasks) {
 
     const vigil = Math.min(vigilantes, earners.length);
 
-    // RECRUIT respect slots go to a STABLE set — the oldest members (lowest g<N>
-    // index) among the non-vigilante earners — not the live-strongest. Terrorism
-    // grants far less combat XP than training, so a rank-based pick would reshuffle
-    // every tick (the Terrorism member falls behind, a trainee overtakes it) and
-    // flap tasks; oldest≈strongest anyway, so this costs almost no respect rate.
-    const idx = (n) => parseInt(n.slice(1), 10) || 0;
-    const respectSet = phase !== "RECRUIT" ? null : new Set(
-        earners.slice(vigil).sort((a, b) => idx(a) - idx(b)).slice(0, GANG_RECRUIT_RESPECT_SLOTS));
+    // RECRUIT respect slots go to the strongest earners, but the set is held in
+    // persisted state and only swapped with hysteresis (see updateRespectMembers) —
+    // Terrorism grants little combat XP, so a rank-only pick would reshuffle (and flap
+    // tasks) every tick. The margin makes it sticky yet self-rotating.
+    if (phase === "RECRUIT") updateRespectMembers(respectMembers, earners.slice(vigil), info);
 
     for (let i = 0; i < earners.length; i++) {
         const n = earners[i];
         if (i < vigil) { set(n, TASK_VIGILANTE); continue; }
         if (phase === "RECRUIT") {
-            set(n, respectSet.has(n) ? TASK_RESPECT : TASK_TRAIN);
+            set(n, respectMembers.has(n) ? TASK_RESPECT : TASK_TRAIN);
         } else if (phase === "POWER" || phase === "CLASH") {
             set(n, TASK_TERRITORY);
         } else { // DONE
             set(n, focus === "respect" ? TASK_RESPECT : bestMoneyTask(info.get(n), moneyTasks));
+        }
+    }
+}
+
+/**
+ * Update the persisted RECRUIT respect set (members on Terrorism) with hysteresis.
+ * Prunes members that left the candidate pool (died / reassigned), fills empty slots
+ * with the strongest available, then allows AT MOST ONE swap per tick: the strongest
+ * challenger replaces the weakest incumbent only if it beats it by
+ * ×(1 + GANG_RESPECT_SWAP_MARGIN). The margin stops per-tick flapping while letting a
+ * lagging incumbent (Terrorism trains slowly) eventually cede its slot — so the duty
+ * self-rotates and no member is permanently sidelined from training.
+ */
+function updateRespectMembers(respectMembers, candidates, info) {
+    const avg = (n) => combatAvg(info.get(n));
+    const pool = new Set(candidates);
+    for (const n of respectMembers) if (!pool.has(n)) respectMembers.delete(n); // prune
+
+    const available = candidates
+        .filter((n) => !respectMembers.has(n))
+        .sort((a, b) => avg(b) - avg(a)); // strongest first
+    while (respectMembers.size < GANG_RECRUIT_RESPECT_SLOTS && available.length) {
+        respectMembers.add(available.shift());
+    }
+    if (respectMembers.size === GANG_RECRUIT_RESPECT_SLOTS && available.length) {
+        const weakestIn = [...respectMembers].reduce((w, n) => (avg(n) < avg(w) ? n : w));
+        const strongestOut = available[0];
+        if (avg(strongestOut) > avg(weakestIn) * (1 + GANG_RESPECT_SWAP_MARGIN)) {
+            respectMembers.delete(weakestIn);
+            respectMembers.add(strongestOut);
         }
     }
 }

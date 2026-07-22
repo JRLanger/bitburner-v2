@@ -653,6 +653,12 @@ export const GANG_TERRITORY_DONE = 0.99;
 export const GANG_MAX_MEMBERS = 12;
 /** Earners kept on the respect task (Terrorism) during RECRUIT phase. */
 export const GANG_RECRUIT_RESPECT_SLOTS = 2;
+/** RECRUIT respect-slot hysteresis: a challenger must beat the weakest incumbent's
+ *  avg combat by ×(1 + this) to take its Terrorism slot. Prevents per-tick flapping
+ *  (Terrorism grants little combat XP, so a rank-only pick reshuffles every tick)
+ *  while letting the duty self-rotate as incumbents fall behind. Relative, so it
+ *  self-scales with stat level; larger = stickier / slower rotation. */
+export const GANG_RESPECT_SWAP_MARGIN = 0.10;
 /** Repeatable augs excluded from the DONE-phase rep target. */
 export const GANG_REP_TARGET_EXCLUDE = ["NeuroFlux Governor"];
 
