@@ -33,6 +33,7 @@ import {
     LIFECYCLE_LOOP_SLEEP,
     LIFECYCLE_AUTO_INSTALL,
     LIFECYCLE_MIN_AUGS,
+    LIFECYCLE_MAX_AUGS,
     LIFECYCLE_STAGNANT_MS,
     LIFECYCLE_MAX_RUN_MS,
     LIFECYCLE_SPEND_DOWN,
@@ -110,6 +111,8 @@ function singularityAvailable(ns) {
  *
  * Install when:
  *   redPillReady (The Red Pill is rep-met) — install ASAP to claim it, OR
+ *   readyCount >= LIFECYCLE_MAX_AUGS — hard cap; install now regardless of stagnation,
+ *     no point accumulating more (effects only apply after installation), OR
  *   readyCount >= LIFECYCLE_MIN_AUGS AND stagnantMs >= LIFECYCLE_STAGNANT_MS
  *     (no new aug became acquirable for a while — money/rep progress plateaued), OR
  *   readyCount >= 1 AND !grindPending AND stagnantMs >= LIFECYCLE_STAGNANT_MS
@@ -140,6 +143,9 @@ function computeDecision(ns) {
     const redPillReady = pilotStatus?.redPillReady === true;
 
     const redPillTrigger = redPillReady; // claim The Red Pill as soon as it's rep-met
+    // Hard cap: enough augs are ready that waiting is pointless — install immediately,
+    // no stagnation required (applies to a big gang-unlocked real batch or piled-up NF).
+    const maxTrigger = readyCount >= LIFECYCLE_MAX_AUGS;
     const stagnantTrigger = readyCount >= LIFECYCLE_MIN_AUGS && stagnantMs >= LIFECYCLE_STAGNANT_MS;
     // Plateau: no real aug left to grind AND acquirableNow hasn't grown for a full
     // stagnation window (so money isn't unlocking more either) — installing even a
@@ -149,14 +155,15 @@ function computeDecision(ns) {
 
     let reason = null;
     if (redPillTrigger) reason = `The Red Pill is ready — installing to claim it`;
+    else if (maxTrigger) reason = `${readyCount} augs ready (hard cap ${LIFECYCLE_MAX_AUGS}) — installing now`;
     else if (stagnantTrigger) reason = `${readyCount} augs affordable, no progress ${Math.round(stagnantMs / 60000)}m`;
     else if (plateauTrigger) reason = `${readyCount} aug(s) ready, nothing left to grind — ${Math.round(stagnantMs / 60000)}m`;
     else if (runLengthTrigger) reason = `${readyCount} aug(s) affordable, run age ${Math.round(runMs / 3600000)}h`;
 
     return {
         readyCount, runMs, stagnantMs, grindPending, redPillReady,
-        redPillTrigger, stagnantTrigger, plateauTrigger, runLengthTrigger,
-        shouldInstall: redPillTrigger || stagnantTrigger || plateauTrigger || runLengthTrigger,
+        redPillTrigger, maxTrigger, stagnantTrigger, plateauTrigger, runLengthTrigger,
+        shouldInstall: redPillTrigger || maxTrigger || stagnantTrigger || plateauTrigger || runLengthTrigger,
         reason,
     };
 }
@@ -466,10 +473,12 @@ function logTick(ns, decision, armed) {
         stagMin: Math.round(decision.stagnantMs / 60000),
         runHr: Math.round(decision.runMs / 36000) / 100,
         tRedPill: decision.redPillTrigger ? 1 : 0,
+        tMax: decision.maxTrigger ? 1 : 0,
         tStag: decision.stagnantTrigger ? 1 : 0,
         tPlateau: decision.plateauTrigger ? 1 : 0,
         tRun: decision.runLengthTrigger ? 1 : 0,
         minAugs: LIFECYCLE_MIN_AUGS,
+        maxAugs: LIFECYCLE_MAX_AUGS,
         stagCfgMin: Math.round(LIFECYCLE_STAGNANT_MS / 60000),
         maxRunHr: Math.round(LIFECYCLE_MAX_RUN_MS / 36000) / 100,
         pilotAgeMs: pilotAgeMs ?? "-",

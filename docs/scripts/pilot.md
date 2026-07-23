@@ -218,13 +218,20 @@ the cycle by only ever subtracting the frozen floor the simulation doesn't itsel
 factions is owned (`anyUnownedReal` is false), `acquirableNow` switches to
 `countReadyNeuroflux` — how many NeuroFlux levels are **rep-met AND affordable** right
 now, simulating successive buys where price and rep-req each grow by `NF_LEVEL_MULT`
-(1.14). NeuroFlux thus behaves like any other aug: grinding its rep grows the ready
-count (keeping the run open), and when the count plateaus lifecycle installs (the
-`dumpNeuroflux` step banks the levels). This replaces the old deadlock where pilot
-ground NeuroFlux forever and lifecycle — seeing `readyCount 0` — never reset. The NF
-grind also **works for rep only, never donates money** (`startFactionWork`), so the
-cash `dumpNeuroflux` needs to actually buy the levels isn't spent away. `repUnlocked`
-and `nfAffordableLevels` report the same NF count in this state.
+(1.14). NeuroFlux is treated **exactly like a real-aug batch** in this state: grinding
+its rep grows the ready count (keeping the run open), and — crucially — its cost is
+**reserved** the same way real augs are. `countReadyNeuroflux` returns `{ levels, cost }`,
+and `phaseAugs` writes `cost` as the `augBatch` reservation just as the real-aug branch
+does. Without this, `phaseHomeRam`/hacknet/pservers freely drained the money the ready NF
+levels depend on, so `acquirableNow` collapsed to 0 and lifecycle's install triggers (all
+needing `readyCount >= 1`) never fired — pilot ground NeuroFlux forever. The reservation
+is released at reset by lifecycle's `liquidateAndFreeze` (clears `augBatch`), so
+`dumpNeuroflux` still buys freely under the freeze; during the run it only keeps the count
+stable. When rep is the binding constraint (the next NF level's rep requirement exceeds the
+faction's current rep), the ready count is legitimately 0 and pilot keeps grinding — a real
+"nothing installable yet" state, not the old starvation bug. The NF grind also **works for
+rep only, never donates money** (`startFactionWork`). `repUnlocked` and `nfAffordableLevels`
+report the same NF count in this state.
 
 **Phase 5 — player-activity arbitration ladder (`phaseWork`).** Implements
 `choosePlayerActivity()` from `docs/plans/arbitration.md`: an ordered array of

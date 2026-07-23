@@ -642,7 +642,7 @@ function phaseAugs(ns, snap) {
     // wallet-reservations.md: feed the aug simulation moneyForAugs (raw minus only
     // the frozen floor), never the fully-floored snap.money — see gatherState.
     const nfReady = countReadyNeuroflux(sing, snap.moneyForAugs, bestRepFaction(sing, snap.joinedFactions));
-    snap.nfAffordableLevels = nfReady;
+    snap.nfAffordableLevels = nfReady.levels;
 
     if (anyUnownedReal) {
         // Real augs still obtainable → readiness = what the reset batch would buy now:
@@ -660,15 +660,20 @@ function phaseAugs(ns, snap) {
         else clearReservation(ns, "augBatch");
         snap.reservedForAugs = cost;
     } else {
-        // Every real aug at joined factions is owned → NeuroFlux becomes the "real" aug:
-        // its rep+money-ready level count IS the readiness metric, so grinding NF rep
-        // grows readyCount (keeping the run open) and plateaus into an install (which
-        // banks the levels via dumpNeuroflux). Stops the old "grind NF forever, never
-        // install" deadlock. NF is bought under lifecycle's freeze, never reserved.
-        snap.repUnlocked = nfReady;
-        snap.acquirableNow = nfReady;
-        clearReservation(ns, "augBatch");
-        snap.reservedForAugs = 0;
+        // Every real aug at joined factions is owned → NeuroFlux becomes the "real" aug,
+        // treated EXACTLY like a real-aug batch: its rep+money-ready level count IS the
+        // readiness metric (grinding NF rep grows readyCount, keeping the run open until
+        // the install trigger fires), AND its cost is reserved so no other spender
+        // (home-RAM, hacknet, pserver) drains the money and un-readies levels — that
+        // starvation is what made readyCount collapse to 0. The reservation is released at
+        // reset by lifecycle's liquidateAndFreeze (clears "augBatch"), so dumpNeuroflux
+        // still buys freely under the freeze; during the run it just keeps the count stable.
+        const { levels, cost } = nfReady;
+        snap.repUnlocked = levels;
+        snap.acquirableNow = levels;
+        if (cost > 0) setReservation(ns, "augBatch", cost, "pilot", "neuroflux levels");
+        else clearReservation(ns, "augBatch");
+        snap.reservedForAugs = cost;
     }
 }
 
@@ -830,29 +835,33 @@ function bestRepFaction(sing, factions) {
 }
 
 /** How many NeuroFlux levels are READY now — rep met AND affordable — at the given
- *  faction. Simulates successive buys: each level's price and rep requirement grow by
- *  NF_LEVEL_MULT, stopping when the next level's rep exceeds current faction rep or its
- *  price exceeds remaining money. This is NF's analogue of countAcquirable, so when all
- *  real augs are owned NF becomes the "ready" metric that drives lifecycle's install. */
+ *  faction, plus the cumulative price of those levels (`cost`, so the caller can reserve
+ *  it, wallet-reservations.md). Simulates successive buys: each level's price and rep
+ *  requirement grow by NF_LEVEL_MULT, stopping when the next level's rep exceeds current
+ *  faction rep or its price exceeds remaining money. This is NF's analogue of
+ *  countAcquirable, so when all real augs are owned NF becomes the "ready" metric that
+ *  drives lifecycle's install AND the money-reservation, exactly like a real aug batch. */
 function countReadyNeuroflux(sing, money, faction) {
-    if (!faction) return 0;
+    if (!faction) return { levels: 0, cost: 0 };
     const rep = sing.getFactionRep(faction);
     let repReq, price;
     try {
         repReq = sing.getAugmentationRepReq(PILOT_NEUROFLUX);
         price = sing.getAugmentationPrice(PILOT_NEUROFLUX);
     } catch {
-        return 0;
+        return { levels: 0, cost: 0 };
     }
     let cash = money;
     let n = 0;
+    let cost = 0;
     while (n < NF_READY_CAP && repReq <= rep && price <= cash) {
         cash -= price;
+        cost += price;
         n++;
         repReq *= NF_LEVEL_MULT;
         price *= NF_LEVEL_MULT;
     }
-    return n;
+    return { levels: n, cost };
 }
 
 /** Core ETA selector: over augs matching `augFilter` that are rep-locked at a joined
