@@ -46,6 +46,7 @@ import {
 import { PRIORITY_AUGS } from "/config/aug-priority.js";
 import { publishStatus, readStatus } from "/lib/status.js";
 import { getFlag, setFlag, moneyFloor, clearReservation } from "/lib/flags.js";
+// setFlag is used by releaseFreeze (clearing the pre-install money freeze).
 import { debugLog } from "/lib/debug-log.js";
 
 /** How long runChecklist waits for the stocks manager to ack liquidation before
@@ -61,6 +62,12 @@ const FREEZE_MONEY_FLOOR = Infinity;
 
 export async function main(ns) {
     ns.disableLog("ALL");
+
+    // Defensive: a fresh lifecycle launch is never mid-checklist, so moneyFloor must not
+    // be the Infinity freeze here. Clear any residual freeze (e.g. a prior process killed
+    // mid-checklist, or a no-op install that stranded it) so a new run can never start
+    // frozen at money=0. This is also what recovers an already-stuck save on relaunch.
+    releaseFreeze(ns);
 
     while (true) {
         if (!singularityAvailable(ns)) {
@@ -187,6 +194,23 @@ async function runChecklist(ns, decision) {
 
     ns.print("Checklist complete — installing augmentations now.");
     ns.singularity.installAugmentations(BOOT_SCRIPT);
+
+    // installAugmentations() is a NO-OP when nothing is queued (no augs bought this
+    // checklist) — it returns without resetting, so reaching this line means the reset
+    // did NOT happen. Release the freeze that liquidateAndFreeze set, or money stays
+    // frozen (moneyFloor=Infinity) for the rest of the run and every spender stalls on
+    // money=0. The faction fixes above make an empty batch unlikely, but this guarantees
+    // a no-op can never wedge the economy again.
+    releaseFreeze(ns);
+    ns.print("installAugmentations was a no-op (nothing to install) — released money freeze.");
+}
+
+/** Lift the pre-install spending freeze: reset moneyFloor to 0 and drop the augBatch
+ *  reservation. Called after a no-op install and defensively at startup, so a stale
+ *  Infinity floor (which only a reset would otherwise clear) can never strand the run. */
+function releaseFreeze(ns) {
+    setFlag(ns, "moneyFloor", 0);
+    clearReservation(ns, "augBatch");
 }
 
 /**
@@ -347,7 +371,12 @@ function donationForRep(ns, repNeeded) {
 function dumpNeuroflux(ns) {
     const sing = ns.singularity;
     const NF = "NeuroFlux Governor";
-    const joined = ns.getPlayer().factions;
+    // Only factions that actually SELL NeuroFlux. The bare highest-rep faction is often
+    // the GANG faction (respect → huge rep) which does NOT offer NF, so buying from it
+    // fails and nothing gets queued — which turns installAugmentations into a no-op and
+    // strands the money freeze. Filtering here is what keeps the dump (and the install)
+    // real; pilot's readiness count filters identically (bestNeurofluxFaction).
+    const joined = ns.getPlayer().factions.filter((f) => sing.getAugmentationsFromFaction(f).includes(NF));
     if (joined.length === 0) return 0;
 
     let bestFaction = joined[0];

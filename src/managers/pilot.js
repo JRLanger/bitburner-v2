@@ -641,7 +641,7 @@ function phaseAugs(ns, snap) {
 
     // wallet-reservations.md: feed the aug simulation moneyForAugs (raw minus only
     // the frozen floor), never the fully-floored snap.money — see gatherState.
-    const nfReady = countReadyNeuroflux(sing, snap.moneyForAugs, bestRepFaction(sing, snap.joinedFactions));
+    const nfReady = countReadyNeuroflux(sing, snap.moneyForAugs, bestNeurofluxFaction(sing, snap.joinedFactions));
     snap.nfAffordableLevels = nfReady.levels;
 
     if (anyUnownedReal) {
@@ -820,6 +820,19 @@ function neurofluxGrindTarget(ns, snap) {
     const best = bestRepFaction(sing, workable);
     if (best === null) return null;
     return { aug: PILOT_NEUROFLUX, faction: best, workType: pickWorkType(sing, best), eta: Infinity };
+}
+
+/** Highest-rep joined faction that actually SELLS NeuroFlux — where lifecycle's
+ *  dumpNeuroflux buys it. The bare highest-rep faction is often the GANG faction
+ *  (respect converts to huge rep) which does NOT offer NeuroFlux, so counting NF
+ *  readiness against its rep over-reports levels that can never be bought — the
+ *  false-trigger that wedged the pre-install money freeze. Filtering to NF-selling
+ *  factions keeps the count honest and aligned with the grind + the buy. */
+function bestNeurofluxFaction(sing, factions) {
+    return bestRepFaction(
+        sing,
+        factions.filter((f) => sing.getAugmentationsFromFaction(f).includes(PILOT_NEUROFLUX)),
+    );
 }
 
 /** Joined faction with the highest current reputation — where NeuroFlux is grinded

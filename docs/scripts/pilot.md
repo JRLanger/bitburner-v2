@@ -229,7 +229,16 @@ is released at reset by lifecycle's `liquidateAndFreeze` (clears `augBatch`), so
 `dumpNeuroflux` still buys freely under the freeze; during the run it only keeps the count
 stable. When rep is the binding constraint (the next NF level's rep requirement exceeds the
 faction's current rep), the ready count is legitimately 0 and pilot keeps grinding — a real
-"nothing installable yet" state, not the old starvation bug. The NF grind also **works for
+"nothing installable yet" state, not the old starvation bug.
+
+The readiness count measures NF against `bestNeurofluxFaction` — the highest-rep joined
+faction that **actually sells NeuroFlux** — not the bare highest-rep faction. This matters
+because the **gang faction** often has the highest reputation (respect converts to rep) but
+does **not** offer NeuroFlux: counting against its rep over-reported levels that could never
+be bought, which fired a spurious install whose `dumpNeuroflux` then bought nothing — the
+no-op that stranded lifecycle's money freeze (see lifecycle.md). Filtering to NF-selling
+factions keeps the count, the grind (`neurofluxGrindTarget`, workable factions only), and
+lifecycle's buy all aligned on the same faction. The NF grind also **works for
 rep only, never donates money** (`startFactionWork`). `repUnlocked` and `nfAffordableLevels`
 report the same NF count in this state.
 

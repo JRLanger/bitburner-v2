@@ -135,8 +135,13 @@ alert line. **No purchase, no flag write, no reset call** happens on that path.
    prereq always install (prereqs are kept buyable). **The Red Pill** is a priority
    aug, so it's bought here the moment it's rep-met.
 1. **`dumpNeuroflux`** — donate-exact-then-buy (docs/plans/donation-sizing.md), not the old
-   plain buy-until-rep-cap loop. Finds the joined faction with the highest current
-   `getFactionRep`, then loops (bounded, 1000 iterations): read NF's live `price`
+   plain buy-until-rep-cap loop. Finds the highest-`getFactionRep` joined faction **that
+   actually sells NeuroFlux** (`getAugmentationsFromFaction(f)` includes it) — the bare
+   highest-rep faction is often the **gang faction** (respect → huge rep) which does **not**
+   offer NeuroFlux, so buying from it would fail and queue nothing. That was a real defect: an
+   empty batch makes `installAugmentations` a no-op (no reset), stranding the money freeze —
+   see the freeze-release note below. pilot's readiness count filters identically
+   (`bestNeurofluxFaction`). Then loops (bounded, 1000 iterations): read NF's live `price`
    (`getAugmentationPrice`) and `repReq` (`getAugmentationRepReq`, both reflecting the ~1.14×
    per-level ramp), compute the current rep `gap`. If `gap` is already 0, just buy
    (`purchaseAugmentation`); otherwise, **if** favor ≥ `getFavorToDonate()`
@@ -173,6 +178,19 @@ alert line. **No purchase, no flag write, no reset call** happens on that path.
    step has completed and only on the `armed` path. `BOOT_SCRIPT` is the plain
    filename constant (`"boot.js"`, not a path) — `installAugmentations`'s
    `cbScript` parameter is documented as looked up on home by bare filename.
+
+**Freeze-release safety net (`releaseFreeze`).** `installAugmentations` returns `void` and is
+a **no-op when nothing is queued** — if the checklist bought zero augs (e.g. all real augs
+owned and the NF dump found no NF-selling faction), it returns *without resetting*, so any code
+after it runs in the same un-reset process. Because `moneyFloor: Infinity` only ever clears via
+the reset's port wipe, a no-op install would otherwise leave the freeze on forever — every
+spender stuck at `money = 0` for the rest of the run (observed live as `floor=inf`,
+`money=0` with 77T in the bank). So the code immediately after the install call — and once
+defensively at lifecycle **startup** (a fresh launch is never mid-checklist) — calls
+`releaseFreeze`, which resets `moneyFloor` to 0 and clears the `augBatch` reservation. The
+startup call is also what recovers an already-stuck save when lifecycle is relaunched. The NF
+faction fix above makes the empty-batch no-op unlikely; `releaseFreeze` guarantees it can never
+wedge the economy regardless.
 
 No cleanup of other running scripts is needed — the game wipes all running
 scripts on install; ports and the flag store auto-clear (existing documented
