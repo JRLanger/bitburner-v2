@@ -238,9 +238,15 @@ does **not** offer NeuroFlux: counting against its rep over-reported levels that
 be bought, which fired a spurious install whose `dumpNeuroflux` then bought nothing — the
 no-op that stranded lifecycle's money freeze (see lifecycle.md). Filtering to NF-selling
 factions keeps the count, the grind (`neurofluxGrindTarget`, workable factions only), and
-lifecycle's buy all aligned on the same faction. The NF grind also **works for
-rep only, never donates money** (`startFactionWork`). `repUnlocked` and `nfAffordableLevels`
-report the same NF count in this state.
+lifecycle's buy all aligned on the same faction.
+
+`countReadyNeuroflux` is **donation-aware**: it mirrors `dumpNeuroflux`'s donate-exact-then-buy,
+so when favor ≥ `getFavorToDonate()` a rep-locked level still counts as ready by adding
+`donationForRep(gap)` to its cost (tracking a simulated rep that climbs the incremental ~14%/level
+gap). So `readyNow` reflects exactly what the reset dump will buy — not just the rep-met levels —
+and the reserved cost covers the donation money too. The NF grind **also donates in-run** when
+rep is binding (`startFactionWork`, above), rather than only working. `repUnlocked` and
+`nfAffordableLevels` report the same NF count in this state.
 
 **Phase 5 — player-activity arbitration ladder (`phaseWork`).** Implements
 `choosePlayerActivity()` from `docs/plans/arbitration.md`: an ordered array of
@@ -336,10 +342,14 @@ donation. Once the gap hits 0 it falls straight through to `workForFaction` — 
 donations for a target that's already unlocked. The **old code donated
 `money * PILOT_SPEND_FRAC` every single tick**, unconditionally, for as long as favor
 cleared the threshold — burning money long after the target's rep was already met, with no
-relationship between the amount donated and what was actually needed. NeuroFlux targets are
-still never donated to here: that cash is reserved for `dumpNeuroflux`'s own
-donate-exact-then-buy loop at reset (lifecycle.md); donating for NF's rep in-run would spend
-the very money the reset dump needs.
+relationship between the amount donated and what was actually needed. **NeuroFlux targets now
+donate too** (user decision): when NF rep is the binding constraint and favor clears the
+threshold, pilot donates to close the gap to the next NF level rather than only working. This
+is safe and non-duplicative because the readiness count (`countReadyNeuroflux`) and the reset
+dump (`dumpNeuroflux`) are both donation-aware — run-time donation just realizes the same
+donate-then-buy earlier, and it draws only on `snap.money` (surplus net of the reserved NF
+batch). At ample NF rep the gap is 0 and the row falls through to working, so nothing is
+over-spent.
 
 The row has a **`maintain()`** (`maintainFactionWork`) because the ladder tracks
 rows by *name*: when the lowest-ETA aug shifts to a **different faction**, the

@@ -60,7 +60,7 @@ Fires when ANY of:
 - **Red Pill:** pilot's `redPillReady` is true (**The Red Pill** is rep-met and
   unbought) — install ASAP to claim it. It's the BitNode win-enabler; there's no
   reason to let it sit. `batchBuyAugs` buys it (a priority aug); **or**
-- **hard cap:** `readyCount >= LIFECYCLE_MAX_AUGS` (16) — enough augs are ready that
+- **hard cap:** `readyCount >= LIFECYCLE_MAX_AUGS` (20) — enough augs are ready that
   waiting is pointless (aug effects only apply *after* installation), so install now
   **regardless of stagnation**. Applies to a big gang-unlocked real-aug batch or piled-up
   NeuroFlux levels alike. Sits above `MIN_AUGS`, which additionally requires stagnation; **or**
