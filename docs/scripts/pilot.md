@@ -324,7 +324,13 @@ unlock). Work uses `hacking` type when offered, else the faction's first, via
 faction** earns rep only through gang respect, not `workForFaction`, so `pickWorkType`
 returns `null` for it and both the ETA selector and the NeuroFlux grind exclude it
 (otherwise the gang faction — often the highest-rep one — would be handed to
-`workForFaction` with an `undefined` work type and throw). When no priority aug
+`workForFaction` with an `undefined` work type and throw). The gang faction's rep is
+still read for a different purpose, though: before choosing a grind target the ETA
+selector first collects every aug already **rep-met at _any_ joined faction, gang
+included**, and drops those from the grindable set. A gang faction whose respect has
+unlocked an aug means that aug is ready for lifecycle to _buy_ — grinding some other
+faction's rep for the same aug is wasted work (the "grind Aevum for an aug the gang
+already offers" bug). When no priority aug
 is rep-locked (all owned or rep-met, awaiting the reset batch buy), the row stays
 applicable via the fallback target below (non-priority aug → NeuroFlux) rather than going
 idle.
