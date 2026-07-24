@@ -231,14 +231,22 @@ stable. When rep is the binding constraint (the next NF level's rep requirement 
 faction's current rep), the ready count is legitimately 0 and pilot keeps grinding — a real
 "nothing installable yet" state, not the old starvation bug.
 
-The readiness count measures NF against `bestNeurofluxFaction` — the highest-rep joined
-faction that **actually sells NeuroFlux** — not the bare highest-rep faction. This matters
-because the **gang faction** often has the highest reputation (respect converts to rep) but
-does **not** offer NeuroFlux: counting against its rep over-reported levels that could never
-be bought, which fired a spurious install whose `dumpNeuroflux` then bought nothing — the
-no-op that stranded lifecycle's money freeze (see lifecycle.md). Filtering to NF-selling
-factions keeps the count, the grind (`neurofluxGrindTarget`, workable factions only), and
-lifecycle's buy all aligned on the same faction.
+The NF faction — used by the readiness count, the grind (`neurofluxGrindTarget`), and
+lifecycle's reset buy, all aligned on one choice (computed once per tick in `phaseAugs` and
+cached as `snap.nfFaction`) — is picked by `bestNeurofluxFaction`. Candidates must **sell
+NeuroFlux** (excludes the **gang faction**, whose respect gives huge rep but no NF — counting
+against it over-reported unbuyable levels and once stranded the money freeze; see lifecycle.md)
+and be **workable**. Candidates are ranked by **how many NF levels each could yield now**
+(`countReadyNeuroflux`, which already prices in the donation needed to clear the rep wall — so a
+higher-rep faction, needing less donation, naturally scores higher mid-run), **tie-broken by
+favor**. The tie-break is the case that matters right after a reset: every faction's rep is ~0
+so the level counts all tie, and **favor is the real discriminator**. Favor doesn't change
+*donated* rep, but it speeds *worked* rep (relevant before money builds up to donate), it
+compounds for future runs, and it persists across the reset so the choice doesn't flip-flop.
+This keeps donation-capable factions (favor ≥ `getFavorToDonate` → NF's million-scale rep wall
+is instantly clearable) ahead of low-favor ones — fixing the bug where, after a reset wiped rep,
+pilot latched onto the highest-rep faction (CyberSec, favor 76) and ground a 26M-rep wall
+forever while ignoring donation-ready Daedalus.
 
 `countReadyNeuroflux` is **donation-aware**: it mirrors `dumpNeuroflux`'s donate-exact-then-buy,
 so when favor ≥ `getFavorToDonate()` a rep-locked level still counts as ready by adding
@@ -317,8 +325,20 @@ rep-locked at a joined faction, it picks the lowest `ETA = max(moneyTime, repTim
   `basePrice` is the aug's base price from `aug-priority.js` (a cheap proxy that
   avoids a live `getAugmentationPrice` call).
 
-For each aug it grinds the joined faction where current rep is highest (closest to
-unlock). Work uses `hacking` type when offered, else the faction's first, via
+The ETA is **favor-aware**, evaluated per (aug, faction) pair — the same insight as the
+NeuroFlux fix. For a faction whose favor already unlocks donation
+(`getFactionFavor ≥ getFavorToDonate`), the rep is obtained **instantly by donating**, so
+`repTime = 0` and the only constraint is money: `moneyNeeded = basePrice + donationForRep(gap)`.
+For a low-favor faction the rep must be **ground**: `repTime = repGap / repRate` (and `repRate`
+itself rises with favor via `factionGains`). Pilot keeps the globally lowest-ETA pair, so it
+**donates the aug at a high-favor faction (e.g. Daedalus) instead of grinding a higher-rep but
+donation-locked one (e.g. CyberSec, which is always joined first via its low prerequisites)** —
+but only when the donation is actually affordable; if it isn't, the grind ETA can still win, so
+the choice is a real time comparison, not a blind preference. When a better (higher-favor)
+faction is joined mid-run, the recomputed pair wins and `maintainFactionWork` switches the
+worked faction that tick (no row hysteresis on a within-row faction change).
+
+Work uses `hacking` type when offered, else the faction's first, via
 `workForFaction(faction, type, false)` — **`focus` always `false`**. Factions whose
 `getFactionWorkTypes` is empty are skipped as work targets: the player's **gang
 faction** earns rep only through gang respect, not `workForFaction`, so `pickWorkType`

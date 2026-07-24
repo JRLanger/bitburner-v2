@@ -379,14 +379,22 @@ function dumpNeuroflux(ns) {
     const joined = ns.getPlayer().factions.filter((f) => sing.getAugmentationsFromFaction(f).includes(NF));
     if (joined.length === 0) return 0;
 
-    let bestFaction = joined[0];
+    // Prefer a faction whose favor already unlocks donation — NF's rep requirement runs
+    // into the millions, so a donation-capable faction can buy far more levels than a
+    // high-rep-but-low-favor one that's rep-capped. Mirrors pilot's bestNeurofluxFaction
+    // so the run's grind/count faction and the reset buy faction agree. Highest rep within
+    // the chosen tier (least donation needed).
+    const donateThreshold = ns.getFavorToDonate ? ns.getFavorToDonate() : 150;
+    const donatable = joined.filter((f) => sing.getFactionFavor(f) >= donateThreshold);
+    const pool = donatable.length > 0 ? donatable : joined;
+
+    let bestFaction = pool[0];
     let bestRep = sing.getFactionRep(bestFaction);
-    for (const f of joined.slice(1)) {
+    for (const f of pool.slice(1)) {
         const rep = sing.getFactionRep(f);
         if (rep > bestRep) { bestFaction = f; bestRep = rep; }
     }
 
-    const donateThreshold = ns.getFavorToDonate ? ns.getFavorToDonate() : 150;
     const canDonate = sing.getFactionFavor(bestFaction) >= donateThreshold;
 
     let bought = 0;

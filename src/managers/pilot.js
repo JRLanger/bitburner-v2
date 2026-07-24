@@ -641,7 +641,8 @@ function phaseAugs(ns, snap) {
 
     // wallet-reservations.md: feed the aug simulation moneyForAugs (raw minus only
     // the frozen floor), never the fully-floored snap.money — see gatherState.
-    const nfReady = countReadyNeuroflux(ns, sing, snap.moneyForAugs, bestNeurofluxFaction(sing, snap.joinedFactions));
+    snap.nfFaction = bestNeurofluxFaction(ns, sing, snap.moneyForAugs, snap.joinedFactions);
+    const nfReady = countReadyNeuroflux(ns, sing, snap.moneyForAugs, snap.nfFaction);
     snap.nfAffordableLevels = nfReady.levels;
 
     if (anyUnownedReal) {
@@ -810,29 +811,43 @@ function fallbackGrindTarget(ns, snap, state) {
     return neurofluxGrindTarget(ns, snap);
 }
 
-/** Grind target for NeuroFlux: the joined faction with the highest current rep — the
- *  same one dumpNeuroflux buys from — so earned rep maximizes the reset NF dump. */
+/** Grind target for NeuroFlux: the best NF faction (bestNeurofluxFaction) — so the
+ *  grind, the readiness count, and the reset dump all agree on one faction. Reuses the
+ *  per-tick choice cached by phaseAugs (snap.nfFaction) to avoid recomputing it. */
 function neurofluxGrindTarget(ns, snap) {
     const sing = ns.singularity;
-    // Only workable factions — the gang faction often has the highest rep (respect
-    // converts to rep) but can't be worked, so it must not win the NF grind slot.
-    const workable = snap.joinedFactions.filter((f) => pickWorkType(sing, f) !== null);
-    const best = bestRepFaction(sing, workable);
+    const best = snap.nfFaction ?? bestNeurofluxFaction(ns, sing, snap.moneyForAugs, snap.joinedFactions);
     if (best === null) return null;
     return { aug: PILOT_NEUROFLUX, faction: best, workType: pickWorkType(sing, best), eta: Infinity };
 }
 
-/** Highest-rep joined faction that actually SELLS NeuroFlux — where lifecycle's
- *  dumpNeuroflux buys it. The bare highest-rep faction is often the GANG faction
- *  (respect converts to huge rep) which does NOT offer NeuroFlux, so counting NF
- *  readiness against its rep over-reports levels that can never be bought — the
- *  false-trigger that wedged the pre-install money freeze. Filtering to NF-selling
- *  factions keeps the count honest and aligned with the grind + the buy. */
-function bestNeurofluxFaction(sing, factions) {
-    return bestRepFaction(
-        sing,
-        factions.filter((f) => sing.getAugmentationsFromFaction(f).includes(PILOT_NEUROFLUX)),
+/** The joined faction to obtain NeuroFlux from — where the grind works, the readiness
+ *  count measures, and the reset dump buys, all aligned on one choice. Candidates must
+ *  SELL NeuroFlux (excludes the gang faction, whose respect gives huge rep but no NF) and
+ *  be WORKABLE (so rep can be grinded and startFactionWork's fall-through can work it).
+ *  Ranked by how many NF levels each could yield NOW (countReadyNeuroflux, which already
+ *  prices in the donation to clear the rep wall — so a higher-rep faction, needing less
+ *  donation, naturally scores higher mid-run), tie-broken by FAVOR. The tie-break is the
+ *  post-reset case that matters: every faction's rep is ~0 so the level counts all tie at
+ *  ~0, and favor is the real discriminator — it doesn't change DONATED rep, but it speeds
+ *  WORKED rep (relevant before money builds up to donate) and compounds for future runs,
+ *  and it's stable across the reset (favor persists) so the pick doesn't flip-flop. This
+ *  also keeps donation-capable factions (favor ≥ getFavorToDonate → NF's million-scale rep
+ *  wall is instantly clearable) ahead of low-favor ones, which otherwise leave readyNow
+ *  stuck at 0 while their rep is ground by hand forever. */
+function bestNeurofluxFaction(ns, sing, money, factions) {
+    const candidates = factions.filter(
+        (f) => sing.getAugmentationsFromFaction(f).includes(PILOT_NEUROFLUX) && pickWorkType(sing, f) !== null,
     );
+    let best = null, bestLevels = -1, bestFavor = -1;
+    for (const f of candidates) {
+        const levels = countReadyNeuroflux(ns, sing, money, f).levels;
+        const favor = sing.getFactionFavor(f);
+        if (levels > bestLevels || (levels === bestLevels && favor > bestFavor)) {
+            best = f; bestLevels = levels; bestFavor = favor;
+        }
+    }
+    return best;
 }
 
 /** Joined faction with the highest current reputation — where NeuroFlux is grinded
@@ -888,12 +903,15 @@ function countReadyNeuroflux(ns, sing, money, faction) {
 }
 
 /** Core ETA selector: over augs matching `augFilter` that are rep-locked at a joined
- *  faction and not owned, pick the lowest ETA = max(moneyTime, repTime). */
+ *  faction and not owned, pick the lowest-ETA (aug, faction) pair, where ETA =
+ *  max(moneyTime, repTime) and — favor-aware — a donation-capable faction unlocks the
+ *  rep instantly (repTime 0, money = price + donation) while a low-favor one grinds it. */
 function bestAugByEta(ns, snap, state, augFilter) {
     const sing = ns.singularity;
     const ownedOrPurchased = new Set(sing.getOwnedAugmentations(true));
     const income = state.income.ema; // $/s (null until two samples exist)
     const money = snap.money;
+    const threshold = ns.getFavorToDonate ? ns.getFavorToDonate() : 150;
 
     // First, augs already rep-met at ANY joined faction — including the gang faction,
     // whose respect-derived rep unlocks its augs without any grinding. Such an aug is
@@ -908,49 +926,55 @@ function bestAugByEta(ns, snap, state, augFilter) {
         }
     }
 
-    // Per aug: the joined faction with the highest current rep (closest to unlock).
-    const perAug = new Map(); // aug -> { faction, rep, repReq }
+    // Cache rep-rate per faction — several augs share a faction, and each rate read
+    // is a Formulas call; compute once per distinct faction. (Used only on the grind
+    // path, i.e. non-donatable factions.)
+    const rateCache = new Map(); // faction -> rate/sec
+    const factionRate = (faction, workType) => {
+        let r = rateCache.get(faction);
+        if (r === undefined) { r = repRatePerSec(ns, faction, workType, state); rateCache.set(faction, r); }
+        return r;
+    };
+
+    // For each unowned, rep-locked aug, find the fastest faction to unlock it and keep the
+    // globally lowest-ETA (aug, faction) pair. Favor-aware, mirroring bestNeurofluxFaction:
+    // a DONATABLE faction (favor >= getFavorToDonate) unlocks the rep INSTANTLY by donating,
+    // so its rep-time is ~0 and the only constraint is money (price + donationForRep(gap)); a
+    // low-favor faction must GRIND, rep-time = gap / rep-rate (and that rate itself rises with
+    // favor). So pilot donates the aug at a high-favor faction (e.g. Daedalus) instead of
+    // grinding a higher-rep but donation-locked one (e.g. CyberSec, always joined first).
+    let winner = null;
     for (const faction of snap.joinedFactions) {
-        // Skip factions whose rep can't be worked (e.g. the gang faction) — their
-        // augs are unlockable only through that mechanic, never via workForFaction.
-        if (pickWorkType(sing, faction) === null) continue;
+        // Skip factions whose rep can't be worked (e.g. the gang faction) — their augs are
+        // unlockable only through that mechanic, never via workForFaction/donate.
+        const workType = pickWorkType(sing, faction);
+        if (workType === null) continue;
         const rep = sing.getFactionRep(faction);
+        const canDonate = sing.getFactionFavor(faction) >= threshold;
         for (const aug of sing.getAugmentationsFromFaction(faction)) {
             if (!augFilter(aug) || aug === PILOT_NEUROFLUX || ownedOrPurchased.has(aug)) continue;
             if (alreadyUnlockable.has(aug)) continue; // rep-met elsewhere → buy, don't grind
             const repReq = sing.getAugmentationRepReq(aug);
-            if (rep >= repReq) continue; // already unlocked → not a grind target
-            const cur = perAug.get(aug);
-            if (!cur || rep > cur.rep) perAug.set(aug, { faction, rep, repReq });
+            if (rep >= repReq) continue; // already unlocked here → not a grind target
+            const repGap = repReq - rep;
+            const price = AUG_BASE_PRICE[aug] ?? 0;
+            let repTime, moneyNeeded;
+            if (canDonate) {
+                moneyNeeded = price + donationForRep(ns, repGap) * DONATE_SLOP;
+                repTime = 0; // donation unlocks the rep once the money is in hand
+            } else {
+                const rate = factionRate(faction, workType);
+                // rate unknown (no Formulas + no empirical sample yet) → order by raw gap.
+                repTime = rate > 0 ? repGap / rate : repGap;
+                moneyNeeded = price;
+            }
+            let moneyTime;
+            if (moneyNeeded <= money) moneyTime = 0;
+            else if (income && income > 0) moneyTime = (moneyNeeded - money) / income;
+            else moneyTime = Infinity;
+            const eta = Math.max(moneyTime, repTime);
+            if (!winner || eta < winner.eta) winner = { aug, faction, workType, eta };
         }
-    }
-
-    // Cache rep-rate per faction — several augs share a faction, and each rate read
-    // is a Formulas call; compute once per distinct faction.
-    const rateCache = new Map(); // faction -> { workType, rate }
-    const factionRate = (faction) => {
-        let r = rateCache.get(faction);
-        if (!r) {
-            const workType = pickWorkType(sing, faction);
-            r = { workType, rate: repRatePerSec(ns, faction, workType, state) };
-            rateCache.set(faction, r);
-        }
-        return r;
-    };
-
-    let winner = null;
-    for (const [aug, info] of perAug) {
-        const { workType, rate } = factionRate(info.faction);
-        const repGap = Math.max(0, info.repReq - info.rep);
-        // rate unknown (no Formulas + no empirical sample yet) → order by raw gap.
-        const repTime = rate > 0 ? repGap / rate : repGap;
-        const price = AUG_BASE_PRICE[aug] ?? 0;
-        let moneyTime;
-        if (price <= money) moneyTime = 0;
-        else if (income && income > 0) moneyTime = (price - money) / income;
-        else moneyTime = Infinity;
-        const eta = Math.max(moneyTime, repTime);
-        if (!winner || eta < winner.eta) winner = { aug, faction: info.faction, workType, eta };
     }
     return winner;
 }
