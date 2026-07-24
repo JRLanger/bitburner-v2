@@ -751,6 +751,11 @@ export const LIFECYCLE_AUTO_INSTALL = true;
 /** Minimum purchased-but-not-installed aug count before an install is considered
  *  worthwhile (paired with LIFECYCLE_STAGNANT_MS). */
 export const LIFECYCLE_MIN_AUGS = 8;
+/** Hard cap on ready augs before an install fires REGARDLESS of stagnation. Once this
+ *  many augs (real or NeuroFlux levels) are rep-met + affordable + reserved, there's no
+ *  point accumulating more — aug effects only apply AFTER installation — so install now.
+ *  Sits above LIFECYCLE_MIN_AUGS: MIN_AUGS needs stagnation too, MAX_AUGS never waits. */
+export const LIFECYCLE_MAX_AUGS = 20;
 /** How long aug purchases must have stalled (no new purchase) before pending
  *  augs alone justify an install, ms. */
 export const LIFECYCLE_STAGNANT_MS = 30 * 60_000;

@@ -641,8 +641,8 @@ function phaseAugs(ns, snap) {
 
     // wallet-reservations.md: feed the aug simulation moneyForAugs (raw minus only
     // the frozen floor), never the fully-floored snap.money — see gatherState.
-    const nfReady = countReadyNeuroflux(sing, snap.moneyForAugs, bestRepFaction(sing, snap.joinedFactions));
-    snap.nfAffordableLevels = nfReady;
+    const nfReady = countReadyNeuroflux(ns, sing, snap.moneyForAugs, bestNeurofluxFaction(sing, snap.joinedFactions));
+    snap.nfAffordableLevels = nfReady.levels;
 
     if (anyUnownedReal) {
         // Real augs still obtainable → readiness = what the reset batch would buy now:
@@ -660,15 +660,20 @@ function phaseAugs(ns, snap) {
         else clearReservation(ns, "augBatch");
         snap.reservedForAugs = cost;
     } else {
-        // Every real aug at joined factions is owned → NeuroFlux becomes the "real" aug:
-        // its rep+money-ready level count IS the readiness metric, so grinding NF rep
-        // grows readyCount (keeping the run open) and plateaus into an install (which
-        // banks the levels via dumpNeuroflux). Stops the old "grind NF forever, never
-        // install" deadlock. NF is bought under lifecycle's freeze, never reserved.
-        snap.repUnlocked = nfReady;
-        snap.acquirableNow = nfReady;
-        clearReservation(ns, "augBatch");
-        snap.reservedForAugs = 0;
+        // Every real aug at joined factions is owned → NeuroFlux becomes the "real" aug,
+        // treated EXACTLY like a real-aug batch: its rep+money-ready level count IS the
+        // readiness metric (grinding NF rep grows readyCount, keeping the run open until
+        // the install trigger fires), AND its cost is reserved so no other spender
+        // (home-RAM, hacknet, pserver) drains the money and un-readies levels — that
+        // starvation is what made readyCount collapse to 0. The reservation is released at
+        // reset by lifecycle's liquidateAndFreeze (clears "augBatch"), so dumpNeuroflux
+        // still buys freely under the freeze; during the run it just keeps the count stable.
+        const { levels, cost } = nfReady;
+        snap.repUnlocked = levels;
+        snap.acquirableNow = levels;
+        if (cost > 0) setReservation(ns, "augBatch", cost, "pilot", "neuroflux levels");
+        else clearReservation(ns, "augBatch");
+        snap.reservedForAugs = cost;
     }
 }
 
@@ -817,6 +822,19 @@ function neurofluxGrindTarget(ns, snap) {
     return { aug: PILOT_NEUROFLUX, faction: best, workType: pickWorkType(sing, best), eta: Infinity };
 }
 
+/** Highest-rep joined faction that actually SELLS NeuroFlux — where lifecycle's
+ *  dumpNeuroflux buys it. The bare highest-rep faction is often the GANG faction
+ *  (respect converts to huge rep) which does NOT offer NeuroFlux, so counting NF
+ *  readiness against its rep over-reports levels that can never be bought — the
+ *  false-trigger that wedged the pre-install money freeze. Filtering to NF-selling
+ *  factions keeps the count honest and aligned with the grind + the buy. */
+function bestNeurofluxFaction(sing, factions) {
+    return bestRepFaction(
+        sing,
+        factions.filter((f) => sing.getAugmentationsFromFaction(f).includes(PILOT_NEUROFLUX)),
+    );
+}
+
 /** Joined faction with the highest current reputation — where NeuroFlux is grinded
  *  and dumped (dumpNeuroflux picks the same). */
 function bestRepFaction(sing, factions) {
@@ -829,30 +847,44 @@ function bestRepFaction(sing, factions) {
     return best;
 }
 
-/** How many NeuroFlux levels are READY now — rep met AND affordable — at the given
- *  faction. Simulates successive buys: each level's price and rep requirement grow by
- *  NF_LEVEL_MULT, stopping when the next level's rep exceeds current faction rep or its
- *  price exceeds remaining money. This is NF's analogue of countAcquirable, so when all
- *  real augs are owned NF becomes the "ready" metric that drives lifecycle's install. */
-function countReadyNeuroflux(sing, money, faction) {
-    if (!faction) return 0;
-    const rep = sing.getFactionRep(faction);
+/** How many NeuroFlux levels are READY now — buyable AND affordable — at the given
+ *  faction, plus the cumulative money those levels cost (`cost`, so the caller can reserve
+ *  it, wallet-reservations.md). Mirrors lifecycle's dumpNeuroflux donate-exact-then-buy:
+ *  each level's price and rep requirement grow by NF_LEVEL_MULT; when the level's rep isn't
+ *  met AND favor allows donating (getFactionFavor >= getFavorToDonate), the level is still
+ *  reachable by paying donationForRep(gap) on top of the price — so `cost` includes the
+ *  donation and `simRep` climbs with it (the incremental ~14%/level gap, not double-counted).
+ *  Stops when a level is rep-locked and can't be donated for (a hard rep ceiling) or the
+ *  remaining money can't fund the next unlock+buy. This makes readyNow reflect exactly what
+ *  the reset dump will purchase, and the reservation cover the donation money too. */
+function countReadyNeuroflux(ns, sing, money, faction) {
+    if (!faction) return { levels: 0, cost: 0 };
+    const threshold = ns.getFavorToDonate ? ns.getFavorToDonate() : 150;
+    const canDonate = sing.getFactionFavor(faction) >= threshold;
     let repReq, price;
     try {
         repReq = sing.getAugmentationRepReq(PILOT_NEUROFLUX);
         price = sing.getAugmentationPrice(PILOT_NEUROFLUX);
     } catch {
-        return 0;
+        return { levels: 0, cost: 0 };
     }
+    let simRep = sing.getFactionRep(faction);
     let cash = money;
     let n = 0;
-    while (n < NF_READY_CAP && repReq <= rep && price <= cash) {
-        cash -= price;
+    let cost = 0;
+    while (n < NF_READY_CAP) {
+        const gap = Math.max(0, repReq - simRep);
+        if (gap > 0 && !canDonate) break;                 // rep-locked, can't donate → ceiling
+        const donation = gap > 0 ? donationForRep(ns, gap) * DONATE_SLOP : 0;
+        if (price + donation > cash) break;               // can't fund unlock + buy → stop
+        cash -= price + donation;
+        cost += price + donation;
         n++;
+        if (gap > 0) simRep = repReq;                     // donation raised rep to meet this level
         repReq *= NF_LEVEL_MULT;
         price *= NF_LEVEL_MULT;
     }
-    return n;
+    return { levels: n, cost };
 }
 
 /** Core ETA selector: over augs matching `augFilter` that are rep-locked at a joined
@@ -1158,18 +1190,20 @@ function donationForRep(ns, repNeeded) {
  *  is still capped by PILOT_SPEND_FRAC per tick, so a huge gap closes over several
  *  ticks rather than a single giant donation; once the gap hits 0 this falls
  *  through to working (no more donations for a target that's already unlocked).
- *  NeuroFlux is bought with money at the reset dump, so DON'T donate for its rep —
- *  that would spend the very cash dumpNeuroflux needs (and NF rep is usually
- *  already ample); just work for the (free) rep. snap.money is already net of
- *  floor + reservations (wallet-reservations.md), so donations can never raid the
- *  acquirable-aug batch. */
+ *  This runs for NeuroFlux too (user decision): when NF rep is the binding constraint
+ *  and favor allows, donate to close the gap to the next NF level rather than only
+ *  working — the readiness count (countReadyNeuroflux) and the reset dump (dumpNeuroflux)
+ *  are both donation-aware, so this just realizes the same donation earlier. At ample NF
+ *  rep the gap is 0 and it falls through to working, so nothing is over-spent. snap.money
+ *  is already net of floor + reservations (wallet-reservations.md), so donations always
+ *  come from surplus and can never raid the reserved NF/aug batch. */
 function startFactionWork(ns, snap) {
     const target = snap.workTarget;
     if (!target) return false;
     const sing = ns.singularity;
     const favor = sing.getFactionFavor(target.faction);
     const donateThreshold = ns.getFavorToDonate ? ns.getFavorToDonate() : 150;
-    if (target.aug !== PILOT_NEUROFLUX && favor >= donateThreshold) {
+    if (favor >= donateThreshold) {
         const gap = Math.max(0, sing.getAugmentationRepReq(target.aug) - sing.getFactionRep(target.faction));
         if (gap > 0) {
             const amount = Math.min(snap.money * PILOT_SPEND_FRAC, donationForRep(ns, gap) * DONATE_SLOP);
@@ -1354,9 +1388,8 @@ function logTick(ns, snap, workState, state) {
         tgt = `${wt.aug}@${wt.faction}`;
         favor = sing.getFactionFavor(wt.faction);
         rep = sing.getFactionRep(wt.faction);
-        repReq = wt.aug === PILOT_NEUROFLUX ? "-" : Math.round(sing.getAugmentationRepReq(wt.aug));
-        const willDonate = wt.aug !== PILOT_NEUROFLUX &&
-            favor >= (ns.getFavorToDonate ? ns.getFavorToDonate() : 150);
+        repReq = Math.round(sing.getAugmentationRepReq(wt.aug));
+        const willDonate = favor >= (ns.getFavorToDonate ? ns.getFavorToDonate() : 150);
         if (willDonate) {
             const gap = Math.max(0, sing.getAugmentationRepReq(wt.aug) - rep);
             donate = gap > 0
