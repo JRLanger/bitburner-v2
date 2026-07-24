@@ -641,7 +641,8 @@ function phaseAugs(ns, snap) {
 
     // wallet-reservations.md: feed the aug simulation moneyForAugs (raw minus only
     // the frozen floor), never the fully-floored snap.money — see gatherState.
-    const nfReady = countReadyNeuroflux(ns, sing, snap.moneyForAugs, bestNeurofluxFaction(sing, snap.joinedFactions));
+    snap.nfFaction = bestNeurofluxFaction(ns, sing, snap.moneyForAugs, snap.joinedFactions);
+    const nfReady = countReadyNeuroflux(ns, sing, snap.moneyForAugs, snap.nfFaction);
     snap.nfAffordableLevels = nfReady.levels;
 
     if (anyUnownedReal) {
@@ -810,29 +811,43 @@ function fallbackGrindTarget(ns, snap, state) {
     return neurofluxGrindTarget(ns, snap);
 }
 
-/** Grind target for NeuroFlux: the joined faction with the highest current rep — the
- *  same one dumpNeuroflux buys from — so earned rep maximizes the reset NF dump. */
+/** Grind target for NeuroFlux: the best NF faction (bestNeurofluxFaction) — so the
+ *  grind, the readiness count, and the reset dump all agree on one faction. Reuses the
+ *  per-tick choice cached by phaseAugs (snap.nfFaction) to avoid recomputing it. */
 function neurofluxGrindTarget(ns, snap) {
     const sing = ns.singularity;
-    // Only workable factions — the gang faction often has the highest rep (respect
-    // converts to rep) but can't be worked, so it must not win the NF grind slot.
-    const workable = snap.joinedFactions.filter((f) => pickWorkType(sing, f) !== null);
-    const best = bestRepFaction(sing, workable);
+    const best = snap.nfFaction ?? bestNeurofluxFaction(ns, sing, snap.moneyForAugs, snap.joinedFactions);
     if (best === null) return null;
     return { aug: PILOT_NEUROFLUX, faction: best, workType: pickWorkType(sing, best), eta: Infinity };
 }
 
-/** Highest-rep joined faction that actually SELLS NeuroFlux — where lifecycle's
- *  dumpNeuroflux buys it. The bare highest-rep faction is often the GANG faction
- *  (respect converts to huge rep) which does NOT offer NeuroFlux, so counting NF
- *  readiness against its rep over-reports levels that can never be bought — the
- *  false-trigger that wedged the pre-install money freeze. Filtering to NF-selling
- *  factions keeps the count honest and aligned with the grind + the buy. */
-function bestNeurofluxFaction(sing, factions) {
-    return bestRepFaction(
-        sing,
-        factions.filter((f) => sing.getAugmentationsFromFaction(f).includes(PILOT_NEUROFLUX)),
+/** The joined faction to obtain NeuroFlux from — where the grind works, the readiness
+ *  count measures, and the reset dump buys, all aligned on one choice. Candidates must
+ *  SELL NeuroFlux (excludes the gang faction, whose respect gives huge rep but no NF) and
+ *  be WORKABLE (so rep can be grinded and startFactionWork's fall-through can work it).
+ *  Ranked by how many NF levels each could yield NOW (countReadyNeuroflux, which already
+ *  prices in the donation to clear the rep wall — so a higher-rep faction, needing less
+ *  donation, naturally scores higher mid-run), tie-broken by FAVOR. The tie-break is the
+ *  post-reset case that matters: every faction's rep is ~0 so the level counts all tie at
+ *  ~0, and favor is the real discriminator — it doesn't change DONATED rep, but it speeds
+ *  WORKED rep (relevant before money builds up to donate) and compounds for future runs,
+ *  and it's stable across the reset (favor persists) so the pick doesn't flip-flop. This
+ *  also keeps donation-capable factions (favor ≥ getFavorToDonate → NF's million-scale rep
+ *  wall is instantly clearable) ahead of low-favor ones, which otherwise leave readyNow
+ *  stuck at 0 while their rep is ground by hand forever. */
+function bestNeurofluxFaction(ns, sing, money, factions) {
+    const candidates = factions.filter(
+        (f) => sing.getAugmentationsFromFaction(f).includes(PILOT_NEUROFLUX) && pickWorkType(sing, f) !== null,
     );
+    let best = null, bestLevels = -1, bestFavor = -1;
+    for (const f of candidates) {
+        const levels = countReadyNeuroflux(ns, sing, money, f).levels;
+        const favor = sing.getFactionFavor(f);
+        if (levels > bestLevels || (levels === bestLevels && favor > bestFavor)) {
+            best = f; bestLevels = levels; bestFavor = favor;
+        }
+    }
+    return best;
 }
 
 /** Joined faction with the highest current reputation — where NeuroFlux is grinded

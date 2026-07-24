@@ -135,13 +135,14 @@ alert line. **No purchase, no flag write, no reset call** happens on that path.
    prereq always install (prereqs are kept buyable). **The Red Pill** is a priority
    aug, so it's bought here the moment it's rep-met.
 1. **`dumpNeuroflux`** — donate-exact-then-buy (docs/plans/donation-sizing.md), not the old
-   plain buy-until-rep-cap loop. Finds the highest-`getFactionRep` joined faction **that
-   actually sells NeuroFlux** (`getAugmentationsFromFaction(f)` includes it) — the bare
-   highest-rep faction is often the **gang faction** (respect → huge rep) which does **not**
-   offer NeuroFlux, so buying from it would fail and queue nothing. That was a real defect: an
-   empty batch makes `installAugmentations` a no-op (no reset), stranding the money freeze —
-   see the freeze-release note below. pilot's readiness count filters identically
-   (`bestNeurofluxFaction`). Then loops (bounded, 1000 iterations): read NF's live `price`
+   plain buy-until-rep-cap loop. Picks the NF faction the **same way pilot does**
+   (`bestNeurofluxFaction`): among joined factions that **sell NeuroFlux**
+   (`getAugmentationsFromFaction(f)` includes it — excludes the **gang faction**, whose respect
+   gives huge rep but no NF; buying from it queues nothing and no-ops the install, stranding the
+   money freeze, see the freeze-release note below), it **prefers factions whose favor unlocks
+   donation** (`getFactionFavor ≥ getFavorToDonate`) since NF's million-scale rep requirement is
+   only reachable by donating, and takes the highest rep within that tier. Then loops (bounded,
+   1000 iterations): read NF's live `price`
    (`getAugmentationPrice`) and `repReq` (`getAugmentationRepReq`, both reflecting the ~1.14×
    per-level ramp), compute the current rep `gap`. If `gap` is already 0, just buy
    (`purchaseAugmentation`); otherwise, **if** favor ≥ `getFavorToDonate()`
