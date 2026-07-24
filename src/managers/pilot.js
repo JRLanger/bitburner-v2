@@ -903,12 +903,15 @@ function countReadyNeuroflux(ns, sing, money, faction) {
 }
 
 /** Core ETA selector: over augs matching `augFilter` that are rep-locked at a joined
- *  faction and not owned, pick the lowest ETA = max(moneyTime, repTime). */
+ *  faction and not owned, pick the lowest-ETA (aug, faction) pair, where ETA =
+ *  max(moneyTime, repTime) and — favor-aware — a donation-capable faction unlocks the
+ *  rep instantly (repTime 0, money = price + donation) while a low-favor one grinds it. */
 function bestAugByEta(ns, snap, state, augFilter) {
     const sing = ns.singularity;
     const ownedOrPurchased = new Set(sing.getOwnedAugmentations(true));
     const income = state.income.ema; // $/s (null until two samples exist)
     const money = snap.money;
+    const threshold = ns.getFavorToDonate ? ns.getFavorToDonate() : 150;
 
     // First, augs already rep-met at ANY joined faction — including the gang faction,
     // whose respect-derived rep unlocks its augs without any grinding. Such an aug is
@@ -923,49 +926,55 @@ function bestAugByEta(ns, snap, state, augFilter) {
         }
     }
 
-    // Per aug: the joined faction with the highest current rep (closest to unlock).
-    const perAug = new Map(); // aug -> { faction, rep, repReq }
+    // Cache rep-rate per faction — several augs share a faction, and each rate read
+    // is a Formulas call; compute once per distinct faction. (Used only on the grind
+    // path, i.e. non-donatable factions.)
+    const rateCache = new Map(); // faction -> rate/sec
+    const factionRate = (faction, workType) => {
+        let r = rateCache.get(faction);
+        if (r === undefined) { r = repRatePerSec(ns, faction, workType, state); rateCache.set(faction, r); }
+        return r;
+    };
+
+    // For each unowned, rep-locked aug, find the fastest faction to unlock it and keep the
+    // globally lowest-ETA (aug, faction) pair. Favor-aware, mirroring bestNeurofluxFaction:
+    // a DONATABLE faction (favor >= getFavorToDonate) unlocks the rep INSTANTLY by donating,
+    // so its rep-time is ~0 and the only constraint is money (price + donationForRep(gap)); a
+    // low-favor faction must GRIND, rep-time = gap / rep-rate (and that rate itself rises with
+    // favor). So pilot donates the aug at a high-favor faction (e.g. Daedalus) instead of
+    // grinding a higher-rep but donation-locked one (e.g. CyberSec, always joined first).
+    let winner = null;
     for (const faction of snap.joinedFactions) {
-        // Skip factions whose rep can't be worked (e.g. the gang faction) — their
-        // augs are unlockable only through that mechanic, never via workForFaction.
-        if (pickWorkType(sing, faction) === null) continue;
+        // Skip factions whose rep can't be worked (e.g. the gang faction) — their augs are
+        // unlockable only through that mechanic, never via workForFaction/donate.
+        const workType = pickWorkType(sing, faction);
+        if (workType === null) continue;
         const rep = sing.getFactionRep(faction);
+        const canDonate = sing.getFactionFavor(faction) >= threshold;
         for (const aug of sing.getAugmentationsFromFaction(faction)) {
             if (!augFilter(aug) || aug === PILOT_NEUROFLUX || ownedOrPurchased.has(aug)) continue;
             if (alreadyUnlockable.has(aug)) continue; // rep-met elsewhere → buy, don't grind
             const repReq = sing.getAugmentationRepReq(aug);
-            if (rep >= repReq) continue; // already unlocked → not a grind target
-            const cur = perAug.get(aug);
-            if (!cur || rep > cur.rep) perAug.set(aug, { faction, rep, repReq });
+            if (rep >= repReq) continue; // already unlocked here → not a grind target
+            const repGap = repReq - rep;
+            const price = AUG_BASE_PRICE[aug] ?? 0;
+            let repTime, moneyNeeded;
+            if (canDonate) {
+                moneyNeeded = price + donationForRep(ns, repGap) * DONATE_SLOP;
+                repTime = 0; // donation unlocks the rep once the money is in hand
+            } else {
+                const rate = factionRate(faction, workType);
+                // rate unknown (no Formulas + no empirical sample yet) → order by raw gap.
+                repTime = rate > 0 ? repGap / rate : repGap;
+                moneyNeeded = price;
+            }
+            let moneyTime;
+            if (moneyNeeded <= money) moneyTime = 0;
+            else if (income && income > 0) moneyTime = (moneyNeeded - money) / income;
+            else moneyTime = Infinity;
+            const eta = Math.max(moneyTime, repTime);
+            if (!winner || eta < winner.eta) winner = { aug, faction, workType, eta };
         }
-    }
-
-    // Cache rep-rate per faction — several augs share a faction, and each rate read
-    // is a Formulas call; compute once per distinct faction.
-    const rateCache = new Map(); // faction -> { workType, rate }
-    const factionRate = (faction) => {
-        let r = rateCache.get(faction);
-        if (!r) {
-            const workType = pickWorkType(sing, faction);
-            r = { workType, rate: repRatePerSec(ns, faction, workType, state) };
-            rateCache.set(faction, r);
-        }
-        return r;
-    };
-
-    let winner = null;
-    for (const [aug, info] of perAug) {
-        const { workType, rate } = factionRate(info.faction);
-        const repGap = Math.max(0, info.repReq - info.rep);
-        // rate unknown (no Formulas + no empirical sample yet) → order by raw gap.
-        const repTime = rate > 0 ? repGap / rate : repGap;
-        const price = AUG_BASE_PRICE[aug] ?? 0;
-        let moneyTime;
-        if (price <= money) moneyTime = 0;
-        else if (income && income > 0) moneyTime = (price - money) / income;
-        else moneyTime = Infinity;
-        const eta = Math.max(moneyTime, repTime);
-        if (!winner || eta < winner.eta) winner = { aug, faction: info.faction, workType, eta };
     }
     return winner;
 }

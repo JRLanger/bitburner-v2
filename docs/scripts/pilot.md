@@ -325,8 +325,20 @@ rep-locked at a joined faction, it picks the lowest `ETA = max(moneyTime, repTim
   `basePrice` is the aug's base price from `aug-priority.js` (a cheap proxy that
   avoids a live `getAugmentationPrice` call).
 
-For each aug it grinds the joined faction where current rep is highest (closest to
-unlock). Work uses `hacking` type when offered, else the faction's first, via
+The ETA is **favor-aware**, evaluated per (aug, faction) pair — the same insight as the
+NeuroFlux fix. For a faction whose favor already unlocks donation
+(`getFactionFavor ≥ getFavorToDonate`), the rep is obtained **instantly by donating**, so
+`repTime = 0` and the only constraint is money: `moneyNeeded = basePrice + donationForRep(gap)`.
+For a low-favor faction the rep must be **ground**: `repTime = repGap / repRate` (and `repRate`
+itself rises with favor via `factionGains`). Pilot keeps the globally lowest-ETA pair, so it
+**donates the aug at a high-favor faction (e.g. Daedalus) instead of grinding a higher-rep but
+donation-locked one (e.g. CyberSec, which is always joined first via its low prerequisites)** —
+but only when the donation is actually affordable; if it isn't, the grind ETA can still win, so
+the choice is a real time comparison, not a blind preference. When a better (higher-favor)
+faction is joined mid-run, the recomputed pair wins and `maintainFactionWork` switches the
+worked faction that tick (no row hysteresis on a within-row faction change).
+
+Work uses `hacking` type when offered, else the faction's first, via
 `workForFaction(faction, type, false)` — **`focus` always `false`**. Factions whose
 `getFactionWorkTypes` is empty are skipped as work targets: the player's **gang
 faction** earns rep only through gang respect, not `workForFaction`, so `pickWorkType`
