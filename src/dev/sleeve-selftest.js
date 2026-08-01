@@ -4,7 +4,7 @@
  * Prints PASS/FAIL per case to the terminal and appends to the log file.
  * (This project has no node test runner; this is the validate-model.js pattern.)
  */
-import { chooseTask, lowestCombatStat, matchesCurrent, GYM_STAT } from "/managers/sleeves.js";
+import { chooseTask, lowestCombatStat, matchesCurrent, scoreCrimes, GYM_STAT } from "/managers/sleeves.js";
 import { SLEEVE_SYNC_MIN, SLEEVE_SHOCK_MAX, SLEEVE_STAT_FLOOR } from "/config/constants.js";
 
 const LOG = "/data/sleeve-selftest.txt";
@@ -62,6 +62,30 @@ export async function main(ns) {
     check("matchesCurrent gym same stat",
         matchesCurrent({ type: "CLASS", classType: "str" }, { row: "gym", stat: "strength" }) === true);
     check("matchesCurrent null task false", matchesCurrent(null, { row: "sync" }) === false);
+
+    // scoreCrimes (crime laddering). Times equal so EV ranks on value×chance.
+    check("scoreCrimes prefers reliable over high-value-low-chance",
+        // Homicide: value 3 × chance 0.02 = 0.06; Mug: value 1 × 0.9 = 0.9 → Mug wins
+        scoreCrimes([
+            { crime: "Homicide", value: 3, time: 1, chance: 0.02 },
+            { crime: "Mug", value: 1, time: 1, chance: 0.9 },
+        ], 0.5).crime === "Mug");
+    check("scoreCrimes trains when nothing clears the floor",
+        scoreCrimes([
+            { crime: "Homicide", value: 3, time: 1, chance: 0.02 },
+            { crime: "Mug", value: 1, time: 1, chance: 0.3 },
+        ], 0.5).train === true);
+    check("scoreCrimes picks highest EV among those above floor",
+        // both above floor 0.5: Homicide 3×0.6=1.8 beats Mug 1×0.9=0.9
+        scoreCrimes([
+            { crime: "Homicide", value: 3, time: 1, chance: 0.6 },
+            { crime: "Mug", value: 1, time: 1, chance: 0.9 },
+        ], 0.5).crime === "Homicide");
+    check("scoreCrimes ignores zero-value crimes",
+        scoreCrimes([
+            { crime: "Shoplift", value: 0, time: 1, chance: 1 },
+            { crime: "Mug", value: 1, time: 1, chance: 0.9 },
+        ], 0.5).crime === "Mug");
 
     ns.tprint(`\n=== ${pass} passed, ${fail} failed ===`);
 }

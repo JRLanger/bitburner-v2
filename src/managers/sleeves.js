@@ -9,7 +9,7 @@
  */
 import {
     STATUS_PORT_SLEEVES, SLEEVE_LOOP_SLEEP, SLEEVE_SHOCK_MAX, SLEEVE_SYNC_MIN,
-    SLEEVE_STAT_FLOOR, SLEEVE_DEBUG, SLEEVE_DEBUG_LOG, MECH_SPEND_FRAC,
+    SLEEVE_STAT_FLOOR, SLEEVE_CRIME_MIN_CHANCE, SLEEVE_DEBUG, SLEEVE_DEBUG_LOG, MECH_SPEND_FRAC,
 } from "/config/constants.js";
 import { publishStatus, readStatus } from "/lib/status.js";
 import { debugLog } from "/lib/debug-log.js";
@@ -19,6 +19,18 @@ import { STATUS_PORT_GANG, STATUS_PORT_PILOT } from "/config/constants.js";
 export const GYM_STAT = { strength: "str", defense: "def", dexterity: "dex", agility: "agi" };
 
 const COMBAT_STATS = ["strength", "defense", "dexterity", "agility"];
+
+/** Crimes considered for karma/money laddering (CrimeType enum values, verified). */
+const CRIME_CANDIDATES = [
+    "Shoplift", "Rob Store", "Mug", "Larceny", "Deal Drugs", "Bond Forgery",
+    "Traffick Arms", "Homicide", "Grand Theft Auto", "Kidnap", "Assassination", "Heist",
+];
+
+/** Human-readable dashboard label per ladder row (the `action` head shows this). */
+const ROW_LABEL = {
+    sync: "synchronizing", recovery: "shock recovery", karma: "karma farming",
+    faction: "faction work", gym: "training", crime: "crime",
+};
 
 /** Lowest of the four combat stats. Ties resolve to the earliest in COMBAT_STATS order. */
 export function lowestCombatStat(skills) {
@@ -59,6 +71,54 @@ export function matchesCurrent(task, decision) {
         case "gym": return task.type === "CLASS" && task.classType === GYM_STAT[decision.stat];
         default: return false;
     }
+}
+
+/**
+ * Pure crime picker. From `candidates` (each { crime, value, time, chance } where
+ * value is karma OR money) choose the highest expected-value-per-second crime among
+ * those meeting `minChance`. Filter by chance FIRST so a high-value but unreliable
+ * crime (e.g. Homicide at 2%) never wins over a reliable one — this is the fix for
+ * sleeves diving straight into Homicide. Returns { crime } or { train: true } when
+ * nothing clears the chance floor (caller trains stats instead).
+ */
+export function scoreCrimes(candidates, minChance) {
+    let best = null;
+    for (const c of candidates) {
+        if (c.value <= 0 || c.time <= 0 || c.chance < minChance) continue;
+        const ev = (c.value * c.chance) / c.time;
+        if (!best || ev > best.ev) best = { crime: c.crime, ev };
+    }
+    return best ? { crime: best.crime } : { train: true };
+}
+
+/** Smart crime laddering needs SF4 (getCrimeStats) and Formulas.exe (crimeSuccessChance).
+ *  Without both, callers fall back to a fixed crime. */
+function smartCrimeAvailable(ns) {
+    const info = ns.getResetInfo();
+    const sf4 = (info.ownedSF.get(4) ?? 0) > 0 || info.currentNode === 4;
+    return sf4 && ns.fileExists("Formulas.exe", "home");
+}
+
+/**
+ * Resolve a crime row to a concrete action for this sleeve. `metric` is "karma" or
+ * "money". Returns { crime } to commit, or { train: stat } to train the weakest combat
+ * stat (when no crime clears the chance floor). Falls back to a fixed crime when smart
+ * laddering isn't available (no SF4/Formulas).
+ */
+function resolveCrime(ns, sleeve, metric) {
+    if (!smartCrimeAvailable(ns)) return { crime: metric === "karma" ? "Homicide" : "Heist" };
+    const candidates = CRIME_CANDIDATES.map((crime) => {
+        const stats = ns.singularity.getCrimeStats(crime);
+        return {
+            crime,
+            value: metric === "karma" ? stats.karma : stats.money,
+            time: stats.time,
+            chance: ns.formulas.work.crimeSuccessChance(sleeve, crime),
+        };
+    });
+    const pick = scoreCrimes(candidates, SLEEVE_CRIME_MIN_CHANCE);
+    if (pick.train) return { train: lowestCombatStat(sleeve.skills).stat };
+    return { crime: pick.crime };
 }
 
 /** Append one sleeve debug line, gated on SLEEVE_DEBUG. read/write are 0-GB — no added RAM. */
@@ -160,6 +220,14 @@ export async function main(ns) {
             const ctx = { ...base, claimedFactions };
             let d = chooseTask(sleeve, ctx);
 
+            // Crime rows (karma/fallback) pick a concrete crime by chance-weighted
+            // value, or divert to training when no crime is reliable enough — mirrors
+            // pilot's crime row. chooseTask stays pure; the ns-aware step lives here.
+            if (d.row === "karma" || d.row === "crime") {
+                const r = resolveCrime(ns, sleeve, d.row === "karma" ? "karma" : "money");
+                d = r.train ? { row: "gym", stat: r.train } : { row: d.row, crime: r.crime };
+            }
+
             // Assign; on falsy return, fall through by re-choosing with this faction
             // treated as claimed (so a failed faction row can't be re-picked forever).
             const current = ns.sleeve.getTask(i);
@@ -186,7 +254,8 @@ export async function main(ns) {
 
         spentThisRun += spendTick(ns);
 
-        const action = Object.entries(counts).sort((a, b) => b[1] - a[1])[0][0];
+        const dominantRow = Object.entries(counts).sort((a, b) => b[1] - a[1])[0][0];
+        const action = ROW_LABEL[dominantRow] ?? dominantRow;
 
         publishStatus(ns, STATUS_PORT_SLEEVES, {
             ts: Date.now(),
