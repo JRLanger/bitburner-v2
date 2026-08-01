@@ -93,7 +93,9 @@ function spendTick(ns) {
     let budget = ns.getServerMoneyAvailable("home") * MECH_SPEND_FRAC;
     let spent = 0;
     const buy = (kind, sleeve, cost, doBuy) => {
-        if (cost > budget || !doBuy()) return false;
+        if (cost > budget) return false;
+        const r = doBuy();
+        if (r !== true && r?.success !== true) return false;
         budget -= cost; spent += cost;
         log(ns, { ev: "buy", kind, sleeve, cost: Math.round(cost), spentTick: Math.round(spent) });
         return true;
@@ -184,12 +186,15 @@ export async function main(ns) {
 
         spentThisRun += spendTick(ns);
 
+        const action = Object.entries(counts).sort((a, b) => b[1] - a[1])[0][0];
+
         publishStatus(ns, STATUS_PORT_SLEEVES, {
             ts: Date.now(),
             count: n,
             avgShock: Math.round(shockSum / n),
             avgSync: Math.round(syncSum / n),
             tasks: counts,
+            action,
             spentThisRun: Math.round(spentThisRun),
         });
         log(ns, { ev: "tick", count: n, avgShock: Math.round(shockSum / n),
