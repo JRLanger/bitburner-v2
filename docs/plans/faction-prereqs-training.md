@@ -51,6 +51,14 @@ New helper `computeFactionPlans(ns, snap, owned)`:
    for the dashboard, and keep the aggregated training/company demands in the
    snapshot for the ladder.
 
+> **Note (2026-08-01):** the sleeve manager
+> (`docs/superpowers/specs/2026-08-01-sleeves-design.md`) shipped WITHOUT a
+> company-work row, because pilot's status publishes no company target for sleeves
+> to mirror (it exposes only `augs.workTarget.faction`). To let sleeves mirror the
+> company grind, add a `companyTarget` (the currently-worked company name, or null)
+> to pilot's status object, then re-add a company-work row to the sleeve ladder
+> (below faction, above gym) with the same one-sleeve-per-company claim as row 4.
+
 RAM note: `getFactionInviteRequirements` is one new singularity function on pilot.
 
 ## Part B — Training row: fill ladder row 5
