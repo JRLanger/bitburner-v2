@@ -114,8 +114,13 @@ const MANAGERS = [
     { file: CONTRACTS_MANAGER, gate: () => true },
     { file: PILOT_MANAGER, gate: pilotGate },
     { file: LIFECYCLE_MANAGER, gate: pilotGate },
-    { file: GANG_MANAGER, gate: gangGate },
+    // Sleeves BEFORE gang: sleeves farm the karma that forms the gang (ladder row 3),
+    // so gang's gate stays closed until they've done that work. A closed gang gate
+    // halts the chain, so sleeve must precede it or it would never launch in a fresh
+    // BN10. Sleeve has no hard dependency on gang/pilot — it reads their status
+    // opportunistically and degrades to null when absent.
     { file: SLEEVE_MANAGER, gate: sleeveGate },
+    { file: GANG_MANAGER, gate: gangGate },
     { file: HACKNET_MANAGER, gate: pserverFleetBuilt },
 ];
 
