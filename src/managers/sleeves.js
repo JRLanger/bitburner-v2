@@ -85,6 +85,46 @@ function applyTask(ns, i, d) {
     }
 }
 
+/** Spend under the shared per-tick MECH_SPEND_FRAC cap. Returns money spent this tick.
+ *  Order: buy a sleeve (BN10) → cheapest memory upgrade → cheapest affordable augs.
+ *  Cheapest-first so a big-ticket item can't starve several small wins. */
+function spendTick(ns) {
+    const n = ns.sleeve.getNumSleeves();
+    let budget = ns.getServerMoneyAvailable("home") * MECH_SPEND_FRAC;
+    let spent = 0;
+    const buy = (kind, sleeve, cost, doBuy) => {
+        if (cost > budget || !doBuy()) return false;
+        budget -= cost; spent += cost;
+        log(ns, { ev: "buy", kind, sleeve, cost: Math.round(cost), spentTick: Math.round(spent) });
+        return true;
+    };
+
+    // 1) Buy a new sleeve (BN10 only; returns false/throws-free otherwise).
+    const sleeveCost = ns.sleeve.getSleeveCost();
+    if (Number.isFinite(sleeveCost)) buy("sleeve", "-", sleeveCost, () => ns.sleeve.purchaseSleeve());
+
+    // 2) Cheapest single memory upgrade across all sleeves.
+    let memBest = null;
+    for (let i = 0; i < n; i++) {
+        const c = ns.sleeve.getMemoryUpgradeCost(i, 1);
+        if (Number.isFinite(c) && (!memBest || c < memBest.c)) memBest = { i, c };
+    }
+    if (memBest) buy("memory", memBest.i, memBest.c, () => ns.sleeve.upgradeMemory(memBest.i, 1));
+
+    // 3) Cheapest affordable aug across sleeves at shock 0 (batch happens naturally
+    //    over ticks — one purchase per tick keeps within the cap and re-reads prices).
+    let augBest = null;
+    for (let i = 0; i < n; i++) {
+        if (ns.sleeve.getSleeve(i).shock !== 0) continue;
+        for (const a of ns.sleeve.getSleevePurchasableAugs(i)) {
+            if (!augBest || a.cost < augBest.cost) augBest = { i, name: a.name, cost: a.cost };
+        }
+    }
+    if (augBest) buy("aug", augBest.i, augBest.cost, () => ns.sleeve.purchaseSleeveAug(augBest.i, augBest.name));
+
+    return spent;
+}
+
 /** Read cross-manager signals once per tick (peek — non-consuming). */
 function gatherContext(ns) {
     const gang = readStatus(ns, STATUS_PORT_GANG);
@@ -142,7 +182,7 @@ export async function main(ns) {
                       reason: d.faction ?? d.crime ?? d.stat ?? d.row, ok: !!ok });
         }
 
-        // spendTick(ns) — added in Task 4
+        spentThisRun += spendTick(ns);
 
         publishStatus(ns, STATUS_PORT_SLEEVES, {
             ts: Date.now(),
