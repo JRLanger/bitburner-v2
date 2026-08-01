@@ -93,9 +93,46 @@ export const SLEEVE_LOOP_SLEEP = 20_000;
 export const SLEEVE_SHOCK_MAX = 90;   // only actively recover when shock is high; low shock decays passively
 export const SLEEVE_SYNC_MIN = 95;    // sync scales exp transfer linearly (sync/100) — keep near max
 export const SLEEVE_STAT_FLOOR = 100;
+export const SLEEVE_DEBUG = true;     // gate for the rolling debug log (turn off without deleting call sites)
+export const SLEEVE_DEBUG_LOG = "/data/sleeve-log.txt";
 ```
 
+## Logging & verification
+
+The point of the log is machine-checkable evidence the ladder and spending behave —
+not eyeballing the dashboard. Reuse `lib/debug-log.js` (`debugLog(ns, file, fields)`,
+rolling `key=value` lines, last ~400 kept, **0-GB** — `ns.read`/`ns.write` add no
+static RAM). Wrap it in a local helper gated on `SLEEVE_DEBUG`, mirroring gang.js:
+
+```js
+function log(ns, fields) { if (SLEEVE_DEBUG) debugLog(ns, SLEEVE_DEBUG_LOG, fields); }
+```
+
+**RAM rule:** only log data already in hand each tick (`getSleeve`/`getTask` results,
+spend amounts). Never make an extra `ns.sleeve.*` call purely to log — that WOULD add
+static RAM.
+
+**Events to emit** (short `ev=` label so grep isolates one concern):
+
+| `ev` | When | Fields |
+|------|------|--------|
+| `tick` | once per loop | `count, avgShock, avgSync, sync, recovery, karma, faction, gym, crime` (row counts), `spentThisRun` |
+| `assign` | a sleeve's task actually changes (not on no-op ticks) | `sleeve` (index), `from` (prev task), `to` (new task/row), `reason` (e.g. `sync<95`, `shock>90`, `faction=X`, `fallthrough`) |
+| `claim` | faction claimed / fell through | `sleeve, faction, ok` (bool) |
+| `buy` | any purchase fires | `kind` (`sleeve`/`memory`/`aug`), `sleeve` (index, or `-`), `cost`, `spentThisRun` |
+
+**How Claude verifies:** read `/data/sleeve-log.txt` and assert against it, e.g.:
+- Post-reset high-shock sleeves show `ev=assign to=recovery reason=shock>90`, then
+  later `ev=assign to=faction`/`crime` as shock decays.
+- Exactly one `ev=claim ok=true` per distinct faction per tick (one-per-faction rule);
+  extras show `ok=false` + a `fallthrough` assign.
+- No `ev=assign` on ticks where state is unchanged (thrash guard).
+- `ev=buy` lines never push `spentThisRun` past the `MECH_SPEND_FRAC` cash cap.
+
 ## Testing
+
+Each check is asserted against `/data/sleeve-log.txt` (see Logging & verification),
+not by eyeballing the dashboard.
 
 1. Post-reset: sleeves with high shock → recovery first; watch ladder rows progress.
 2. Karma coordination: gang in karma phase → sleeves flip to homicide; gang formed
