@@ -60,3 +60,101 @@ export function matchesCurrent(task, decision) {
         default: return false;
     }
 }
+
+/** Append one sleeve debug line, gated on SLEEVE_DEBUG. read/write are 0-GB — no added RAM. */
+function log(ns, fields) { if (SLEEVE_DEBUG) debugLog(ns, SLEEVE_DEBUG_LOG, fields); }
+
+/** Apply a decision to sleeve i. Returns truthy on success (treat undefined as failure).
+ *  Faction work tries each work type until one is accepted (setToFactionWork returns
+ *  undefined when the faction doesn't offer that type). */
+function applyTask(ns, i, d) {
+    switch (d.row) {
+        case "sync": return ns.sleeve.setToSynchronize(i);
+        case "recovery": return ns.sleeve.setToShockRecovery(i);
+        case "karma":
+        case "crime": return ns.sleeve.setToCommitCrime(i, d.crime);
+        case "faction":
+            for (const wt of ["field", "hacking", "security"]) {
+                if (ns.sleeve.setToFactionWork(i, d.faction, wt)) return true;
+            }
+            return false;
+        case "gym":
+            ns.sleeve.travel(i, "Sector-12");
+            return ns.sleeve.setToGymWorkout(i, "Powerhouse Gym", GYM_STAT[d.stat]);
+        default: return false;
+    }
+}
+
+/** Read cross-manager signals once per tick (peek — non-consuming). */
+function gatherContext(ns) {
+    const gang = readStatus(ns, STATUS_PORT_GANG);
+    const pilot = readStatus(ns, STATUS_PORT_PILOT);
+    const pilotFaction = (pilot && pilot.working) ? (pilot.augs?.workTarget?.faction ?? null) : null;
+    return {
+        gangKarmaPhase: gang?.phase === "karma",
+        pilotFaction,
+    };
+}
+
+export async function main(ns) {
+    ns.disableLog("ALL");
+    ns.print("sleeves manager started");
+
+    let spentThisRun = 0; // carried across ticks; Task 4 increments it
+
+    while (true) {
+        const n = ns.sleeve.getNumSleeves();
+        if (n === 0) { await ns.sleep(SLEEVE_LOOP_SLEEP); continue; } // gate races: nothing to do
+
+        const base = gatherContext(ns);
+        const claimedFactions = new Set();
+        const counts = { sync: 0, recovery: 0, karma: 0, faction: 0, gym: 0, crime: 0 };
+        let shockSum = 0, syncSum = 0;
+
+        for (let i = 0; i < n; i++) {
+            const sleeve = ns.sleeve.getSleeve(i);
+            shockSum += sleeve.shock; syncSum += sleeve.sync;
+
+            const ctx = { ...base, claimedFactions };
+            let d = chooseTask(sleeve, ctx);
+
+            // Assign; on falsy return, fall through by re-choosing with this faction
+            // treated as claimed (so a failed faction row can't be re-picked forever).
+            const current = ns.sleeve.getTask(i);
+            if (matchesCurrent(current, d)) {                 // thrash guard: no-op
+                if (d.row === "faction") claimedFactions.add(d.faction);
+                counts[d.row]++;
+                continue;
+            }
+            let ok = applyTask(ns, i, d);
+            if (!ok && d.row === "faction") {                 // faction failed → retry below it
+                claimedFactions.add(d.faction);               // block re-pick this tick
+                log(ns, { ev: "claim", sleeve: i, faction: d.faction, ok: false });
+                d = chooseTask(sleeve, { ...base, claimedFactions });
+                ok = applyTask(ns, i, d);
+            }
+            if (d.row === "faction" && ok) {
+                claimedFactions.add(d.faction);
+                log(ns, { ev: "claim", sleeve: i, faction: d.faction, ok: true });
+            }
+            counts[d.row]++;
+            log(ns, { ev: "assign", sleeve: i, from: current?.type ?? "-", to: d.row,
+                      reason: d.faction ?? d.crime ?? d.stat ?? d.row, ok: !!ok });
+        }
+
+        // spendTick(ns) — added in Task 4
+
+        publishStatus(ns, STATUS_PORT_SLEEVES, {
+            ts: Date.now(),
+            count: n,
+            avgShock: Math.round(shockSum / n),
+            avgSync: Math.round(syncSum / n),
+            tasks: counts,
+            spentThisRun: Math.round(spentThisRun),
+        });
+        log(ns, { ev: "tick", count: n, avgShock: Math.round(shockSum / n),
+                  avgSync: Math.round(syncSum / n), ...counts, spentThisRun: Math.round(spentThisRun) });
+
+        await ns.sleep(SLEEVE_LOOP_SLEEP);
+    }
+}
