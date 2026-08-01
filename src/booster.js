@@ -64,6 +64,7 @@ import {
     PILOT_MANAGER,
     LIFECYCLE_MANAGER,
     GANG_MANAGER,
+    SLEEVE_MANAGER,
     PSERVER_PREFIX,
     HACKNET_GATE,
     STATUS_PORT_CONTROLLER,
@@ -114,6 +115,7 @@ const MANAGERS = [
     { file: PILOT_MANAGER, gate: pilotGate },
     { file: LIFECYCLE_MANAGER, gate: pilotGate },
     { file: GANG_MANAGER, gate: gangGate },
+    { file: SLEEVE_MANAGER, gate: sleeveGate },
     { file: HACKNET_MANAGER, gate: pserverFleetBuilt },
 ];
 
@@ -823,6 +825,16 @@ function pilotGate(servers, ns) {
     const info = ns.getResetInfo();
     const sf4Level = info.ownedSF.get(4) ?? 0;
     return sf4Level > 0 || info.currentNode === 4;
+}
+
+/**
+ * Sleeve gate: sleeves only exist with SF10 owned or inside BN10. Checked without
+ * any ns.sleeve.* reference so the controller pays no sleeve-API RAM; the manager
+ * itself self-checks getNumSleeves() === 0 and idles if none exist.
+ */
+function sleeveGate(servers, ns) {
+    const info = ns.getResetInfo();
+    return (info.ownedSF.get(10) ?? 0) > 0 || info.currentNode === 10;
 }
 
 // ── Classification ──────────────────────────────────────────────────────────

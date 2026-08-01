@@ -23,6 +23,7 @@ import {
     STATUS_PORT_PILOT,
     STATUS_PORT_LIFECYCLE,
     STATUS_PORT_GANG,
+    STATUS_PORT_SLEEVES,
     GANG_MAX_MEMBERS,
     PILOT_LOOP_SLEEP,
     LIFECYCLE_LOOP_SLEEP,
@@ -69,6 +70,7 @@ export async function main(ns) {
             pilot: readStatus(ns, STATUS_PORT_PILOT),
             lifecycle: readStatus(ns, STATUS_PORT_LIFECYCLE),
             gang: readStatus(ns, STATUS_PORT_GANG),
+            sleeves: readStatus(ns, STATUS_PORT_SLEEVES),
         };
         // Live title: "Dashboard - <Controller> · <income>/s · <n> tgt".
         const c = snaps.ctrl;
@@ -325,6 +327,7 @@ function renderScripts(snaps, now) {
             ["auto-install", snaps.lifecycle.autoInstallArmed ? "ARMED" : "off"],
         ] : [], LIFECYCLE_STALE_MS));
     rows.push(managerRow("gang", snaps.gang, now, gangStats(snaps.gang)));
+    rows.push(managerRow("sleeves", snaps.sleeves, now, sleeveStats(snaps.sleeves)));
 
     // Share row: state lives on the controller snapshot, not its own port.
     const shareState = !c ? "off" : c.shareOff ? "paused" : c.shareThreads > 0 ? "live" : "idle";
@@ -355,6 +358,19 @@ function gangStats(g) {
         ["territory", pct(g.territory)],
         ["respect", fmtCount(g.respect)],
         ["wanted", pct(g.wantedPenalty)],
+    ];
+}
+
+/** Sleeve stat pairs: shock/sync averages, per-sleeve task tally, and spend. */
+function sleeveStats(s) {
+    if (!s) return [];
+    const t = s.tasks || {};
+    return [
+        ["count", fmtCount(s.count)],
+        ["shock", `${s.avgShock ?? 0}%`],
+        ["sync", `${s.avgSync ?? 0}%`],
+        ["tasks", `sync${t.sync ?? 0} rec${t.recovery ?? 0} karma${t.karma ?? 0} fac${t.faction ?? 0} gym${t.gym ?? 0} crime${t.crime ?? 0}`],
+        ["spent", fmtMoney(s.spentThisRun)],
     ];
 }
 
@@ -392,7 +408,7 @@ function renderAlerts(snaps, now) {
         if (c.totalRam > 0 && c.poolFree / c.totalRam < 0.03) alerts.push("Pool nearly full");
         if (c.shareOff) alerts.push("Share manually paused");
     }
-    for (const [name, staleMs] of [["contracts", MGR_STALE_MS], ["pserver", MGR_STALE_MS], ["hacknet", MGR_STALE_MS], ["pilot", PILOT_STALE_MS], ["lifecycle", LIFECYCLE_STALE_MS], ["gang", MGR_STALE_MS]]) {
+    for (const [name, staleMs] of [["contracts", MGR_STALE_MS], ["pserver", MGR_STALE_MS], ["hacknet", MGR_STALE_MS], ["pilot", PILOT_STALE_MS], ["lifecycle", LIFECYCLE_STALE_MS], ["gang", MGR_STALE_MS], ["sleeves", MGR_STALE_MS]]) {
         const s = snaps[name];
         if (s && now - (s.ts || 0) > staleMs && !/done|maxed|exit|exhaust/i.test(s.action || "")) {
             alerts.push(`${name} not reporting`);
