@@ -695,7 +695,7 @@ export const SLEEVE_LOOP_SLEEP = 20_000;   // fixed tick; no nextUpdate() in thi
 export const SLEEVE_SHOCK_MAX = 90;        // only actively recover when shock is high; low shock decays passively
 export const SLEEVE_SYNC_MIN = 95;         // sync scales exp transfer linearly (sync/100) — keep near max
 export const SLEEVE_STAT_FLOOR = 100;      // gym any combat stat below this
-export const SLEEVE_CRIME_MIN_CHANCE = 0.5; // crime laddering: only commit crimes at/above this success chance; else train (needs SF4 + Formulas.exe)
+export const SLEEVE_CRIME_MIN_CHANCE = 0.5; // commit Homicide once its success chance ≥ this; below it, gym-train up instead (needs Formulas.exe)
 export const SLEEVE_DEBUG = true;          // gate for the rolling debug log
 export const SLEEVE_DEBUG_LOG = "/data/sleeve-log.txt";
 

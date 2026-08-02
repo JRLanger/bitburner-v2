@@ -47,22 +47,18 @@ claimedFactions }` and returns `{ row, crime?, faction?, stat? }`. It is pure
 (no `ns` calls), which is what makes it independently unit-testable in
 `sleeve-selftest.js` without booting the game.
 
-**Chance-aware crime laddering (rows 3 and 6).** `chooseTask` only names the
-*row*; the concrete crime is resolved by the ns-aware `decide()` → `resolveCrime()`
-step in the tick loop (so `chooseTask` stays pure). Candidates are limited to
-**Mug → Traffick Arms → Homicide** — the three crimes that grant XP in all four
-combat stats, so laddering also trains the sleeve evenly toward the next crime up.
-The pure `scoreCrimes(candidates, minChance)` core filters to crimes whose success
-chance ≥ `SLEEVE_CRIME_MIN_CHANCE` (0.5) **first**, then picks the highest expected
-value-per-second (`value × chance / time`, where `value` is karma for row 3, money
-for row 6). If *nothing* clears the chance floor, it returns `{train}` and the sleeve
-diverts to gym on the weakest combat stat — re-evaluated every tick, so it hands
-back to crime as soon as a crime becomes reliable. This is why a fresh low-stat
-sleeve trains or Mugs instead of diving into a 2%-success Homicide. `decide()` is
-applied to both the initial pick and the post-faction-failure re-pick, so neither
-path bypasses laddering. Smart laddering needs **SF4** (`getCrimeStats`) and
-**Formulas.exe** (`crimeSuccessChance`); without both, `resolveCrime` falls back to
-plain Homicide (karma) / Heist (money).
+**Crime rows: train up to Homicide (rows 3 and 6).** `chooseTask` only names the
+*row*; the concrete action is resolved by the ns-aware `decide()` → `resolveCrime()`
+step in the tick loop (so `chooseTask` stays pure). The target crime is always
+**Homicide** — best karma, good money, and it trains all four combat stats. If the
+sleeve's Homicide success chance is below `SLEEVE_CRIME_MIN_CHANCE` (0.5),
+`resolveCrime` returns `{train}` and the sleeve **gym-trains its weakest combat
+stat** instead. Gym XP is far faster than grinding low-tier crimes, so the sleeve
+trains straight up to a viable Homicide rather than laddering through Mug/Traffick
+Arms. Re-evaluated every tick, so it flips to Homicide the moment the chance clears
+the floor. `decide()` is applied to both the initial pick and the post-faction-failure
+re-pick, so neither path bypasses the train-up. Needs **Formulas.exe**
+(`crimeSuccessChance`); without it, `resolveCrime` commits Homicide blind.
 
 **Why sync goes first, ahead of shock/karma/faction:** sync is a multiplier on
 every downstream gain (exp shared to the player and to other sleeves), so a

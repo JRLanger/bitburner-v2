@@ -20,11 +20,6 @@ export const GYM_STAT = { strength: "str", defense: "def", dexterity: "dex", agi
 
 const COMBAT_STATS = ["strength", "defense", "dexterity", "agility"];
 
-/** Crimes considered for karma/money laddering (CrimeType enum values, verified).
- *  Limited to the three that grant XP in ALL four combat stats — so laddering also
- *  trains the sleeve evenly toward the next crime up. Ordered easy→hard. */
-const CRIME_CANDIDATES = ["Mug", "Traffick Arms", "Homicide"];
-
 /** Human-readable dashboard label per ladder row (the `action` head shows this). */
 const ROW_LABEL = {
     sync: "synchronizing", recovery: "shock recovery", karma: "karma farming",
@@ -72,61 +67,35 @@ export function matchesCurrent(task, decision) {
     }
 }
 
-/**
- * Pure crime picker. From `candidates` (each { crime, value, time, chance } where
- * value is karma OR money) choose the highest expected-value-per-second crime among
- * those meeting `minChance`. Filter by chance FIRST so a high-value but unreliable
- * crime (e.g. Homicide at 2%) never wins over a reliable one — this is the fix for
- * sleeves diving straight into Homicide. Returns { crime } or { train: true } when
- * nothing clears the chance floor (caller trains stats instead).
- */
-export function scoreCrimes(candidates, minChance) {
-    let best = null;
-    for (const c of candidates) {
-        if (c.value <= 0 || c.time <= 0 || c.chance < minChance) continue;
-        const ev = (c.value * c.chance) / c.time;
-        if (!best || ev > best.ev) best = { crime: c.crime, ev };
-    }
-    return best ? { crime: best.crime } : { train: true };
-}
-
-/** Smart crime laddering needs SF4 (getCrimeStats) and Formulas.exe (crimeSuccessChance).
- *  Without both, callers fall back to a fixed crime. */
-function smartCrimeAvailable(ns) {
-    const info = ns.getResetInfo();
-    const sf4 = (info.ownedSF.get(4) ?? 0) > 0 || info.currentNode === 4;
-    return sf4 && ns.fileExists("Formulas.exe", "home");
+/** Whether per-sleeve crime success chance is computable — needs Formulas.exe
+ *  (ns.formulas.work.crimeSuccessChance). Without it, callers commit Homicide blind. */
+function crimeChanceAvailable(ns) {
+    return ns.fileExists("Formulas.exe", "home");
 }
 
 /**
- * Resolve a crime row to a concrete action for this sleeve. `metric` is "karma" or
- * "money". Returns { crime } to commit, or { train: stat } to train the weakest combat
- * stat (when no crime clears the chance floor). Falls back to a fixed crime when smart
- * laddering isn't available (no SF4/Formulas).
+ * Resolve a crime row (karma or money fallback) to a concrete action for this sleeve.
+ * Target crime is always Homicide (best karma, good money, and trains all combat
+ * stats). If its success chance is below SLEEVE_CRIME_MIN_CHANCE, GYM-train the
+ * weakest combat stat instead — gym XP is much faster than grinding low-tier crimes,
+ * so we train straight up to a viable Homicide rather than laddering through Mug etc.
+ * Re-evaluated every tick, so it flips to Homicide the moment the chance clears the
+ * floor. Falls back to committing Homicide blind when Formulas.exe isn't owned.
  */
-function resolveCrime(ns, sleeve, metric) {
-    if (!smartCrimeAvailable(ns)) return { crime: metric === "karma" ? "Homicide" : "Heist" };
-    const candidates = CRIME_CANDIDATES.map((crime) => {
-        const stats = ns.singularity.getCrimeStats(crime);
-        return {
-            crime,
-            value: metric === "karma" ? stats.karma : stats.money,
-            time: stats.time,
-            chance: ns.formulas.work.crimeSuccessChance(sleeve, crime),
-        };
-    });
-    const pick = scoreCrimes(candidates, SLEEVE_CRIME_MIN_CHANCE);
-    if (pick.train) return { train: lowestCombatStat(sleeve.skills).stat };
-    return { crime: pick.crime };
+function resolveCrime(ns, sleeve) {
+    if (!crimeChanceAvailable(ns)) return { crime: "Homicide" };
+    const chance = ns.formulas.work.crimeSuccessChance(sleeve, "Homicide");
+    if (chance < SLEEVE_CRIME_MIN_CHANCE) return { train: lowestCombatStat(sleeve.skills).stat };
+    return { crime: "Homicide" };
 }
 
 /** Full per-sleeve decision: the pure `chooseTask` ladder, then crime-row resolution
- *  (a concrete crime, or divert-to-training) for karma/crime rows. Used for both the
- *  initial pick and the post-faction-failure re-pick so neither bypasses laddering. */
+ *  (Homicide, or divert-to-training) for karma/crime rows. Used for both the initial
+ *  pick and the post-faction-failure re-pick so neither bypasses the train-up logic. */
 function decide(ns, sleeve, ctx) {
     const d = chooseTask(sleeve, ctx);
     if (d.row === "karma" || d.row === "crime") {
-        const r = resolveCrime(ns, sleeve, d.row === "karma" ? "karma" : "money");
+        const r = resolveCrime(ns, sleeve);
         return r.train ? { row: "gym", stat: r.train } : { row: d.row, crime: r.crime };
     }
     return d;
