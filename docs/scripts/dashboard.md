@@ -30,9 +30,11 @@ The panel shows, top to bottom:
   when admission is ranking by absolute earning power (RAM-rich), or `$/GB·s` when ranking
   by efficiency (RAM-limited) — so the row order always reads sensibly against the metric.
 - **Scripts row** — one chip per script (controller, contracts, pserver, hacknet, pilot,
-  lifecycle, gang, share) with a live/stale/done dot and its headline stat (fleet size, hacknet
+  lifecycle, sleeves, gang, share) with a live/stale/done dot and its headline stat (fleet size, hacknet
   production, pilot's grind target `aug - faction` + acquirable/rep aug counts, lifecycle's
-  augs-ready + auto-install state, etc.). The slow-tick managers (pilot 30s, lifecycle 60s)
+  augs-ready + auto-install state, etc.). The **sleeves** chip shows the dominant activity
+  (`karma farming`, `training`, `faction work`, …) plus per-row counts, average shock/sync,
+  and run spend. The slow-tick managers (pilot 30s, lifecycle 60s)
   use higher staleness thresholds (2.5× their own loop) so they aren't falsely flagged
   "not reporting". The **gang** chip is phase-aware: in formation it shows karma remaining,
   and once running shows phase / members `n/12` / income / territory / respect / wanted

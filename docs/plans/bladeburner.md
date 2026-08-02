@@ -22,6 +22,12 @@ Exception that needs no focus: **sleeve support** — it publishes
 `sleeveRequest: {action}` for the sleeve manager (sleeves ladder row 5), since
 `setToBladeburnerAction` runs on sleeves, not the player.
 
+> **Note (2026-08-01):** the sleeve manager (`docs/superpowers/specs/2026-08-01-sleeves-design.md`)
+> shipped WITHOUT a Bladeburner row, because no bladeburner manager exists yet to
+> publish `sleeveRequest`. When this manager is built, re-add the Bladeburner row to
+> the sleeve ladder (between karma/faction and gym): read `sleeveRequest` off this
+> manager's status port and `setToBladeburnerAction` on idle sleeves.
+
 Everything that is NOT a player action, the manager does directly each tick:
 `upgradeSkill`, `switchCity`, `setActionAutolevel`, team sizing.
 

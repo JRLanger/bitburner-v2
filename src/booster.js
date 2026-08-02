@@ -64,6 +64,7 @@ import {
     PILOT_MANAGER,
     LIFECYCLE_MANAGER,
     GANG_MANAGER,
+    SLEEVE_MANAGER,
     PSERVER_PREFIX,
     HACKNET_GATE,
     STATUS_PORT_CONTROLLER,
@@ -90,10 +91,12 @@ const WORKER_FILES = new Set(WORKERS.map(stripSlash));
 const PLACED_WORKERS = [...WORKERS, SHARE_WORKER];
 
 /**
- * Managers booster orchestrates, in fixed dependency order. Each tick booster
- * launches the FIRST not-yet-running manager whose gate passes, and won't consider
- * a later one until every earlier one is already running (see launchManagers).
- * The manager's live RAM cost (ns.getScriptRam — always current, tracking both
+ * Managers booster orchestrates, in fixed priority order. Each tick booster
+ * launches the FIRST not-yet-running, gate-open manager (one per tick). A manager
+ * whose gate is CLOSED (its feature is unavailable this save — e.g. no SF10) is
+ * SKIPPED so it never blocks the managers behind it; a gate-open manager that
+ * can't fit home RAM yet is retried next tick rather than skipped (see
+ * launchManagers). The manager's live RAM cost (ns.getScriptRam — always current, tracking both
  * code edits and SF-level singularity multipliers) is reserved on home so the
  * exec always fits.
  *
@@ -113,6 +116,12 @@ const MANAGERS = [
     { file: CONTRACTS_MANAGER, gate: () => true },
     { file: PILOT_MANAGER, gate: pilotGate },
     { file: LIFECYCLE_MANAGER, gate: pilotGate },
+    // Sleeves BEFORE gang: sleeves farm the karma that forms the gang (ladder row 3),
+    // so they're the higher-priority karma producer and should launch first. (Closed
+    // gates are now skipped, not blocking — see launchManagers — so this is a priority
+    // choice, not a workaround.) Sleeve has no hard dependency on gang/pilot: it reads
+    // their status opportunistically and degrades to null when absent.
+    { file: SLEEVE_MANAGER, gate: sleeveGate },
     { file: GANG_MANAGER, gate: gangGate },
     { file: HACKNET_MANAGER, gate: pserverFleetBuilt },
 ];
@@ -382,7 +391,7 @@ export async function main(ns) {
 
         // Reserve home headroom for the next pending manager, then launch it if its
         // gate trips. Done before buildPool so the pool already excludes that reserve.
-        const homeReserveExtra = nextManagerReserve(ns);
+        const homeReserveExtra = nextManagerReserve(ns, servers);
         launchManagers(ns, servers);
         const pool = buildPool(ns, rootedHosts, homeReserveExtra);
         const inFlight = inFlightByTarget(ns, rootedHosts);
@@ -746,20 +755,22 @@ function launchManagers(ns, servers) {
             dbg(`  mgr ${m.file}: SUPPRESSED (seen running earlier this run, now gone)`);
             continue; // was running, now gone → stopped/done
         }
-        const gateOpen = m.gate(servers, ns);
-        if (gateOpen) {
-            const pid = ns.exec(m.file, "home");
-            dbg(`  mgr ${m.file}: gate=open exec pid=${pid}`);
-            // Only mark it accounted-for if the exec actually started a process. exec()
-            // fails silently (returns 0, no exception) when home lacks free RAM at that
-            // instant — e.g. right after a reset, before the reserve has caught up.
-            // Without this check a single failed launch looked like "user stopped it".
-            if (pid !== 0) seen.add(m.file);
-            else ns.print(`WARN: failed to launch ${m.file} (insufficient RAM on home?) — will retry`);
-        } else {
-            dbg(`  mgr ${m.file}: gate=closed`);
+        if (!m.gate(servers, ns)) {
+            // Gate closed = this feature isn't available in this save (e.g. no SF10
+            // for sleeves). Skip to the next manager instead of blocking the chain —
+            // an unavailable dependency must not stall the managers behind it.
+            dbg(`  mgr ${m.file}: gate=closed (skip)`);
+            continue;
         }
-        break; // first pending manager is the only candidate this tick
+        const pid = ns.exec(m.file, "home");
+        dbg(`  mgr ${m.file}: gate=open exec pid=${pid}`);
+        // Only mark it accounted-for if the exec actually started a process. exec()
+        // fails silently (returns 0, no exception) when home lacks free RAM at that
+        // instant — e.g. right after a reset, before the reserve has caught up.
+        // Without this check a single failed launch looked like "user stopped it".
+        if (pid !== 0) seen.add(m.file);
+        else ns.print(`WARN: failed to launch ${m.file} (insufficient RAM on home?) — will retry`);
+        break; // launched (or tried, RAM-blocked) one gate-open manager this tick
     }
 
     if (seen.size !== sizeBefore) writeFlags(ns, { ...flags, [MANAGERS_SEEN_FLAG]: [...seen] });
@@ -768,11 +779,12 @@ function launchManagers(ns, servers) {
 /** RAM to reserve on home for the next pending manager, GB. Skips managers that are
  *  running or already accounted for (stopped/done) — none of those will be (re)launched,
  *  so reserving for them would needlessly shrink the worker pool. */
-function nextManagerReserve(ns) {
+function nextManagerReserve(ns, servers) {
     const seen = new Set(readFlags(ns)[MANAGERS_SEEN_FLAG] ?? []);
     for (const m of MANAGERS) {
         if (isRunning(ns, m.file)) continue;
         if (seen.has(m.file)) continue;
+        if (!m.gate(servers, ns)) continue; // gate closed → won't launch → don't reserve for it
         return ns.getScriptRam(m.file, "home");
     }
     return 0; // nothing left to launch → no reserve needed
@@ -823,6 +835,16 @@ function pilotGate(servers, ns) {
     const info = ns.getResetInfo();
     const sf4Level = info.ownedSF.get(4) ?? 0;
     return sf4Level > 0 || info.currentNode === 4;
+}
+
+/**
+ * Sleeve gate: sleeves only exist with SF10 owned or inside BN10. Checked without
+ * any ns.sleeve.* reference so the controller pays no sleeve-API RAM; the manager
+ * itself self-checks getNumSleeves() === 0 and idles if none exist.
+ */
+function sleeveGate(servers, ns) {
+    const info = ns.getResetInfo();
+    return (info.ownedSF.get(10) ?? 0) > 0 || info.currentNode === 10;
 }
 
 // ── Classification ──────────────────────────────────────────────────────────

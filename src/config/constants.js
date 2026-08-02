@@ -354,6 +354,7 @@ export const PSERVER_MANAGER = "/managers/pserver.js";
 export const HACKNET_MANAGER = "/managers/hacknet.js";
 export const PILOT_MANAGER = "/managers/pilot.js";
 export const GANG_MANAGER = "/managers/gang.js";
+export const SLEEVE_MANAGER = "/managers/sleeves.js";
 
 // Manager RAM footprints used to be hardcoded here (measured with `mem`), but the
 // numbers went stale on every code edit AND every SF4-level change (singularity
@@ -470,6 +471,8 @@ export const STATUS_PORT_LIFECYCLE = 8;
 export const STATUS_PORT_STOCKS = 9;
 /** gang manager status snapshot (docs/plans/gang.md). */
 export const STATUS_PORT_GANG = 10;
+/** sleeves manager status snapshot. */
+export const STATUS_PORT_SLEEVES = 11;
 
 /** Recorded run (aug-reset) durations + last-seen aug-reset timestamp, for hacknet's
  *  ROI horizon. Survives aug installs (a soft reset keeps files); delete on a full
@@ -686,6 +689,15 @@ export const GRAFT_PATIENCE_MS = 30 * 60_000;
  *  (gang equipment, sleeve augs/memory, hacknet) — see arbitration.md's money
  *  class table. */
 export const MECH_SPEND_FRAC = 0.25;
+
+// ── sleeves (docs/superpowers/specs/2026-08-01-sleeves-design.md) ────────────
+export const SLEEVE_LOOP_SLEEP = 20_000;   // fixed tick; no nextUpdate() in this API. Tick rate never saves RAM.
+export const SLEEVE_SHOCK_MAX = 90;        // only actively recover when shock is high; low shock decays passively
+export const SLEEVE_SYNC_MIN = 95;         // sync scales exp transfer linearly (sync/100) — keep near max
+export const SLEEVE_STAT_FLOOR = 100;      // gym any combat stat below this
+export const SLEEVE_CRIME_MIN_CHANCE = 0.5; // commit Homicide once its success chance ≥ this; below it, gym-train up instead (needs Formulas.exe)
+export const SLEEVE_DEBUG = true;          // gate for the rolling debug log
+export const SLEEVE_DEBUG_LOG = "/data/sleeve-log.txt";
 
 /** Combined RAM budget for ALL mechanic managers running on home, as a fraction
  *  of home's total RAM. launchManagers checks candidates against remaining budget
