@@ -61,10 +61,20 @@ import {
     GANG_TERRITORY_DONE,
     GANG_MAX_MEMBERS,
     GANG_REP_TARGET_EXCLUDE,
+    GANG_DEBUG,
+    GANG_DEBUG_LOG,
     MECH_SPEND_FRAC,
 } from "/config/constants.js";
 import { publishStatus } from "/lib/status.js";
 import { moneyFloor } from "/lib/flags.js";
+import { debugLog } from "/lib/debug-log.js";
+
+/** Append one gang debug line, gated on GANG_DEBUG. `ev` is a short event label
+ *  (phase transition, recruit, ascend, buy, vigilante change) so grepping the log
+ *  for `ev=vigil` etc. isolates one concern. read/write are 0-GB — no added RAM. */
+function log(ns, fields) {
+    if (GANG_DEBUG) debugLog(ns, GANG_DEBUG_LOG, fields);
+}
 
 /** Formation-loop poll interval, ms — used only before the gang exists, where
  *  there is no nextUpdate() to await. The running loop awaits ns.gang.nextUpdate()
@@ -138,6 +148,10 @@ export async function main(ns) {
         // ── Phase (recomputed from live state) ──────────────────────────────
         const prev = phase;
         phase = pickPhase(names.length, gi.territory, minWin);
+        if (prev !== phase) {
+            log(ns, { ev: "phase", from: prev ?? "-", to: phase,
+                members: names.length, territory: gi.territory, minWin });
+        }
         if (prev === "CLASH" && phase === "POWER") {
             equipped.clear(); // rivals grew — re-verify everyone's arming
             ns.print(`WARN: reverted CLASH→POWER (min win ${(minWin * 100).toFixed(1)}%)`);
@@ -176,6 +190,7 @@ export async function main(ns) {
                 equipped.delete(n); // upgrades[] wiped — needs re-arming
                 info.set(n, ns.gang.getMemberInformation(n));
                 ns.print(`ascended ${n}: ×${ratio.toFixed(2)} (mult ${cur.toFixed(2)}→${(cur * ratio).toFixed(2)})`);
+                log(ns, { ev: "ascend", member: n, ratio, multFrom: cur, multTo: cur * ratio });
             }
         }
 
@@ -189,10 +204,21 @@ export async function main(ns) {
         // wanted, let alone with Terrorism running) — ramp up until it drops. Only
         // release once the penalty has actually recovered above the floor; releasing
         // merely because wanted stopped rising would strand a catastrophic penalty.
+        // Cap at names.length - 1 (not names.length): at low respect the penalty
+        // floor is unreachable (penalty ≈ respect/(respect+wanted), wanted pinned at
+        // its minimum), so without this cap the ramp puts EVERY member on vigilante
+        // duty and no respect is ever earned — the gang locks in RECRUIT. Keeping one
+        // earner guarantees respect always flows.
+        const prevVig = vigilantes;
         if (gi.wantedPenalty < GANG_WANTED_PENALTY_FLOOR) {
-            if (gi.wantedLevelGainRate >= 0) vigilantes = Math.min(vigilantes + 1, names.length);
+            if (gi.wantedLevelGainRate >= 0) vigilantes = Math.min(vigilantes + 1, Math.max(0, names.length - 1));
         } else if (vigilantes > 0) {
             vigilantes--;
+        }
+        if (vigilantes !== prevVig) {
+            log(ns, { ev: "vigil", from: prevVig, to: vigilantes,
+                penalty: gi.wantedPenalty, floor: GANG_WANTED_PENALTY_FLOOR,
+                rate: gi.wantedLevelGainRate, wanted: gi.wantedLevel, respect: gi.respect });
         }
 
         // ── Task assignment ─────────────────────────────────────────────────
@@ -225,6 +251,7 @@ export async function main(ns) {
             focusRequest: null,
         });
         render(ns, phase, gi, names, minWin, equipped, equipTarget, focus, factionRep, repTarget, vigilantes, clashEarning);
+        logTick(ns, phase, gi, names, info, minWin, vigilantes, focus, clashEarning, equipped);
 
         await ns.gang.nextUpdate();
     }
@@ -303,6 +330,7 @@ function recruit(ns) {
         if (!ns.gang.recruitMember(`g${i}`)) break;
         ns.gang.setMemberTask(`g${i}`, TASK_TRAIN);
         ns.print(`recruited g${i}`);
+        log(ns, { ev: "recruit", member: `g${i}`, members: names.length + 1 });
         names = ns.gang.getMemberNames();
     }
     return names;
@@ -361,6 +389,7 @@ function buyEquipment(ns, phase, names, info, equipped, equipTarget, augEquip, g
         spent += cost;
         info.set(n, ns.gang.getMemberInformation(n));
         ns.print(`bought ${eq} → ${n}`);
+        log(ns, { ev: "buy", member: n, item: eq, cost });
         return true;
     };
 
@@ -376,6 +405,7 @@ function buyEquipment(ns, phase, names, info, equipped, equipTarget, augEquip, g
         if (gearEquip.every((eq) => have.has(eq))) {
             equipped.add(equipTarget);
             ns.print(`${equipTarget} fully armed`);
+            log(ns, { ev: "armed", member: equipTarget, armed: equipped.size });
         }
     }
 
@@ -425,6 +455,39 @@ function assignTasks(ns, phase, focus, names, info, vigilantes, moneyTasks, clas
             set(n, focus === "respect" ? TASK_RESPECT : bestMoneyTask(info.get(n), moneyTasks));
         }
     }
+}
+
+// ── File log ──────────────────────────────────────────────────────────────
+
+/** One per-tick decision-trace line to GANG_DEBUG_LOG (gated on GANG_DEBUG). Captures
+ *  the phase-machine and vigilante-hysteresis inputs plus a task histogram, so the log
+ *  alone explains why the roster is on the tasks it's on. Uses only data already in
+ *  hand (0-GB — no extra NS calls). */
+function logTick(ns, phase, gi, names, info, minWin, vigilantes, focus, clashEarning, equipped) {
+    if (!GANG_DEBUG) return;
+    const tasks = {};
+    for (const n of names) {
+        const t = info.get(n).task;
+        tasks[t] = (tasks[t] ?? 0) + 1;
+    }
+    const histo = Object.entries(tasks).map(([t, c]) => `${t.replace(/ /g, "")}:${c}`).join(",") || "-";
+    log(ns, {
+        phase,
+        members: names.length,
+        vigil: vigilantes,
+        penalty: gi.wantedPenalty,
+        floor: GANG_WANTED_PENALTY_FLOOR,
+        wantedRate: gi.wantedLevelGainRate,
+        wanted: gi.wantedLevel,
+        respect: gi.respect,
+        minWin,
+        territory: gi.territory,
+        armed: equipped.size,
+        focus: focus ?? "-",
+        earning: clashEarning ? 1 : 0,
+        income: gi.moneyGainRate * 5,
+        tasks: histo,
+    });
 }
 
 // ── Tail display ────────────────────────────────────────────────────────────

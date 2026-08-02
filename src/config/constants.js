@@ -793,5 +793,7 @@ export const LIFECYCLE_LOG_FILE = "/data/lifecycle-log.txt";
  *  silence once behavior is confirmed. read/write are 0-GB, so this costs no RAM. */
 export const PILOT_DEBUG = true;
 export const LIFECYCLE_DEBUG = true;
+export const GANG_DEBUG = true;
 export const PILOT_DEBUG_LOG = "/data/pilot-debug.txt";
 export const LIFECYCLE_DEBUG_LOG = "/data/lifecycle-debug.txt";
+export const GANG_DEBUG_LOG = "/data/gang-debug.txt";
