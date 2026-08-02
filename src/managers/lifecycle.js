@@ -75,6 +75,21 @@ export async function main(ns) {
             return;
         }
 
+        // Manual force (utils/force-install.js): run the FULL pre-reset checklist NOW,
+        // bypassing BOTH the install-decision thresholds AND the autonomy guard. This is
+        // the player explicitly asking to install right now — buy augs, donate for rep,
+        // dump NeuroFlux, spend down favor, then installAugmentations. Consume the flag
+        // FIRST so a no-op install (nothing queued) can't re-fire it every tick, and so a
+        // successful reset never lands with the flag still set (the port is wiped on reset
+        // anyway, but clearing here also covers the no-op path).
+        if (getFlag(ns, "forceInstall", false)) {
+            setFlag(ns, "forceInstall", false);
+            await runChecklist(ns, { reason: "manual force-install (utils/force-install.js)" });
+            // If the install actually happened, all scripts (this one) are already gone.
+            // If it was a no-op, runChecklist released the freeze; fall through to normal
+            // monitoring below.
+        }
+
         const decision = computeDecision(ns);
         const armed = LIFECYCLE_AUTO_INSTALL || getFlag(ns, "autoInstall", false);
 
