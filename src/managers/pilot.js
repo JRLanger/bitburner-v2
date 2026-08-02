@@ -201,13 +201,20 @@ function sampleIncome(ns, state) {
 }
 
 /** Stamp state.acquire.lastAcquireTs whenever the ACQUIRABLE priority-aug count
- *  grows (rep met AND affordable under the ramp) — lifecycle's install stagnation
- *  signal. Growth from either rep or money, so it stalls on the binding constraint.
- *  A DROP (money spent elsewhere) doesn't reset the clock — only progress does. */
+ *  reaches a NEW HIGH (rep met AND affordable under the ramp) — lifecycle's install
+ *  stagnation signal. Growth from either rep or money, so it stalls on the binding
+ *  constraint. knownCount is a monotonic HIGH-WATER MARK: it only ratchets up, so a
+ *  DROP-then-reclimb (acquirableNow sawtooths as the reserve floor steps up) is NOT
+ *  counted as new progress. Ratcheting knownCount down on every dip — the old bug —
+ *  let each re-climb to an already-seen level re-stamp the clock, so stagnation could
+ *  never reach LIFECYCLE_STAGNANT_MS and the plateau install never fired (the run
+ *  drifted to the 12h backstop while a full batch of augs sat rep-met and affordable). */
 function trackAcquire(state, snap) {
     const count = snap.acquirableNow ?? 0;
-    if (count > state.acquire.knownCount) state.acquire.lastAcquireTs = Date.now();
-    state.acquire.knownCount = count;
+    if (count > state.acquire.knownCount) {
+        state.acquire.lastAcquireTs = Date.now();
+        state.acquire.knownCount = count; // high-water mark — only a genuine new high resets the clock
+    }
     snap.lastAcquireTs = state.acquire.lastAcquireTs;
 }
 
@@ -446,12 +453,20 @@ function reqCheapness(req) {
     return 3;
 }
 
-/** Stats the training row can actually raise (gym: combat, university: charisma/
- *  hacking). A skills demand for anything else (e.g. intelligence) must stay
- *  report-only: an untrainable demand would keep the training row applicable while
- *  startTraining has nothing to start — pilot would idle forever on it. */
+/** Stats the training row can actively raise: combat (gym) and charisma (university).
+ *  A skills demand for anything else must stay report-only — a demand recorded here
+ *  keeps the stat-training row applicable and monopolizing the focus slot.
+ *
+ *  Hacking is deliberately EXCLUDED even though a university course (Algorithms) can
+ *  raise it: hacking level already grows on its own from the orbiter's hacking
+ *  operations, so training it at university is far slower than natural XP AND steals
+ *  focus from aug-rep grinding. Planned endgame factions demand very high hacking
+ *  (BitRunners 500 … Daedalus 2500); left trainable, pilot sits in Algorithms class
+ *  for hours instead of grinding rep. Same rationale as intelligence — a stat we
+ *  don't actively train. Hacking requirements are still surfaced report-only via the
+ *  byFaction.unmet list. */
 const TRAINABLE_STATS = new Set([
-    ...COMBAT_SKILLS.map(([full]) => full), "charisma", "hacking",
+    ...COMBAT_SKILLS.map(([full]) => full), "charisma",
 ]);
 
 /** Records demands (training/backdoors/company) for an UNMET requirement into
