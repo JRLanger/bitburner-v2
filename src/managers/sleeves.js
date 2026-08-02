@@ -120,6 +120,18 @@ function resolveCrime(ns, sleeve, metric) {
     return { crime: pick.crime };
 }
 
+/** Full per-sleeve decision: the pure `chooseTask` ladder, then crime-row resolution
+ *  (a concrete crime, or divert-to-training) for karma/crime rows. Used for both the
+ *  initial pick and the post-faction-failure re-pick so neither bypasses laddering. */
+function decide(ns, sleeve, ctx) {
+    const d = chooseTask(sleeve, ctx);
+    if (d.row === "karma" || d.row === "crime") {
+        const r = resolveCrime(ns, sleeve, d.row === "karma" ? "karma" : "money");
+        return r.train ? { row: "gym", stat: r.train } : { row: d.row, crime: r.crime };
+    }
+    return d;
+}
+
 /** Append one sleeve debug line, gated on SLEEVE_DEBUG. read/write are 0-GB — no added RAM. */
 function log(ns, fields) { if (SLEEVE_DEBUG) debugLog(ns, SLEEVE_DEBUG_LOG, fields); }
 
@@ -217,15 +229,7 @@ export async function main(ns) {
             shockSum += sleeve.shock; syncSum += sleeve.sync;
 
             const ctx = { ...base, claimedFactions };
-            let d = chooseTask(sleeve, ctx);
-
-            // Crime rows (karma/fallback) pick a concrete crime by chance-weighted
-            // value, or divert to training when no crime is reliable enough — mirrors
-            // pilot's crime row. chooseTask stays pure; the ns-aware step lives here.
-            if (d.row === "karma" || d.row === "crime") {
-                const r = resolveCrime(ns, sleeve, d.row === "karma" ? "karma" : "money");
-                d = r.train ? { row: "gym", stat: r.train } : { row: d.row, crime: r.crime };
-            }
+            let d = decide(ns, sleeve, ctx);
 
             // Assign; on falsy return, fall through by re-choosing with this faction
             // treated as claimed (so a failed faction row can't be re-picked forever).
@@ -239,7 +243,7 @@ export async function main(ns) {
             if (!ok && d.row === "faction") {                 // faction failed → retry below it
                 claimedFactions.add(d.faction);               // block re-pick this tick
                 log(ns, { ev: "claim", sleeve: i, faction: d.faction, ok: false });
-                d = chooseTask(sleeve, { ...base, claimedFactions });
+                d = decide(ns, sleeve, { ...base, claimedFactions });
                 ok = applyTask(ns, i, d);
             }
             if (d.row === "faction" && ok) {
