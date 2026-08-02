@@ -781,7 +781,7 @@ export const LIFECYCLE_SPEND_DOWN = true;
  *  Lifecycle installs ASAP once it's rep-met (redPillReady) to claim it. */
 export const RED_PILL_AUG = "The Red Pill";
 /** Home RAM target boot.js's grind loop upgrades toward (devlog 01). */
-export const BOOT_TARGET_HOME_GB = 32;
+export const BOOT_TARGET_HOME_GB = 128;
 /** Minimum Mug success chance boot.js requires before skipping the gym-training
  *  pre-step (devlog 01: gym first only helps when Mug's chance is poor). */
 export const BOOT_MUG_MIN_CHANCE = 0.6;
