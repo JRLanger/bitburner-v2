@@ -68,15 +68,6 @@ import {
     CONTROLLER_DEBUG,
     ORBITER_DEBUG_LOG,
     DEBUG_LOG_MAX_BYTES,
-    CONTRACTS_MANAGER,
-    PSERVER_MANAGER,
-    HACKNET_MANAGER,
-    PILOT_MANAGER,
-    LIFECYCLE_MANAGER,
-    GANG_MANAGER,
-    SLEEVE_MANAGER,
-    PSERVER_PREFIX,
-    HACKNET_GATE,
     STATUS_PORT_CONTROLLER,
     DASHBOARD,
     DASHBOARD_MIN_HOME_RAM_GB,
@@ -84,9 +75,11 @@ import {
     TELEMETRY_SAMPLE,
     TELEMETRY_ERR_WARN_MS,
 } from "/config/constants.js";
-import { readFlags, writeFlags } from "/lib/flags.js";
+import { readFlags } from "/lib/flags.js";
 import { publishStatus } from "/lib/status.js";
 import { renderTail } from "/lib/tail-ui.js";
+import { launchManagers, nextManagerReserve, isRunning } from "/lib/manager-launch.js";
+import { discoverAndRoot } from "/lib/server-provision.js";
 
 /** HWGW worker paths that must exist on home and get copied to every rooted server. */
 const WORKERS = [HACK_WORKER, GROW_WORKER, WEAKEN_WORKER];
@@ -100,59 +93,13 @@ const WORKER_FILES = new Set(WORKERS.map(stripSlash));
  *  worker. Used for the prerequisite check and per-host provisioning. */
 const PLACED_WORKERS = [...WORKERS, SHARE_WORKER];
 
-/**
- * Managers orbiter orchestrates, in fixed priority order. Each tick orbiter
- * launches the FIRST not-yet-running, gate-open manager (one per tick). A manager
- * whose gate is CLOSED (its feature is unavailable this save — e.g. no SF10) is
- * SKIPPED so it never blocks the managers behind it; a gate-open manager that
- * can't fit home RAM yet is retried next tick rather than skipped (see
- * launchManagers). The manager's live RAM cost (ns.getScriptRam — always current, tracking both
- * code edits and SF-level singularity multipliers) is reserved on home so the
- * exec always fits.
- *
- *  1. pserver — grows the RAM pool; launch immediately (it waits internally to
- *     afford). Highest compounding ROI: purchased servers feed the batch pool that
- *     everything else runs on — and it's the cheapest manager (5.85 GB), so it fits
- *     a small early home where contracts (16.8 GB) wouldn't (launchManagers only
- *     considers the FIRST pending manager, so a too-big one at the front would
- *     block the whole chain).
- *  2. contracts — solves coding contracts for free money/rep; no prerequisites
- *     (network is rooted). Gate always true.
- *  3. hacknet — weak ROI; deferred until the pserver fleet is fully built (counted
- *     from topology data booster already has — no extra NS call).
- */
-const MANAGERS = [
-    { file: PSERVER_MANAGER, gate: () => true },
-    { file: CONTRACTS_MANAGER, gate: () => true },
-    { file: PILOT_MANAGER, gate: pilotGate },
-    { file: LIFECYCLE_MANAGER, gate: pilotGate },
-    // Sleeves BEFORE gang: sleeves farm the karma that forms the gang (ladder row 3),
-    // so they're the higher-priority karma producer and should launch first. (Closed
-    // gates are now skipped, not blocking — see launchManagers — so this is a priority
-    // choice, not a workaround.) Sleeve has no hard dependency on gang/pilot: it reads
-    // their status opportunistically and degrades to null when absent.
-    { file: SLEEVE_MANAGER, gate: sleeveGate },
-    { file: GANG_MANAGER, gate: gangGate },
-    { file: HACKNET_MANAGER, gate: pserverFleetBuilt },
-];
-
-/**
- * Manager-launch suppression now lives in the shared flag port (lib/flags.js) under the
- * `managersSeen` key — a list of manager filenames booster has seen running this run. A
- * manager that was seen running and is now gone (user-stopped or self-completed) is not
- * relaunched. The port is wiped on aug/soft reset, so a wiped infra always rebuilds even
- * if this booster process survives the reset — no in-memory set, no reset detection. See
- * launchManagers / nextManagerReserve.
- */
-const MANAGERS_SEEN_FLAG = "managersSeen";
+/** Manager orchestration (MANAGERS list, launchManagers, nextManagerReserve, the
+ *  gates, isRunning) lives in lib/manager-launch.js — shared byte-for-byte with
+ *  booster.js. Network discovery/rooting/provisioning lives in lib/server-provision.js.
+ *  See docs/scripts/manager-launch.md and docs/scripts/server-provision.md. */
 
 /** Monotonic id appended to every worker exec so concurrent workers are unique. */
 let batchSeq = 0;
-
-/** Hosts this controller PROCESS has already scp'd the workers to. Forces one
- *  overwrite-scp per host per controller run, so worker-code updates propagate
- *  on restart (file presence alone can't detect a stale worker). */
-const provisionedThisRun = new Set();
 
 /**
  * Landing-telemetry state (drift diagnosis, CONTROLLER_DEBUG only — see the
@@ -390,7 +337,7 @@ export async function main(ns) {
         // Reserve home headroom for the next pending manager, then launch it if its
         // gate trips. Done before buildPool so the pool already excludes that reserve.
         const homeReserveExtra = nextManagerReserve(ns, servers);
-        launchManagers(ns, servers);
+        launchManagers(ns, servers, dbg);
         const pool = buildPool(ns, rootedHosts, homeReserveExtra);
         const inFlight = inFlightByTarget(ns, rootedHosts);
 
@@ -523,98 +470,6 @@ export async function main(ns) {
         flushDebug(ns);
         await ns.sleep(LOOP_SLEEP);
     }
-}
-
-// ── Discovery / rooting ─────────────────────────────────────────────────────
-
-/**
- * Breadth-first scan from home. Roots every reachable server it can, copies the
- * workers onto newly rooted hosts, and returns an array of static info objects.
- */
-function discoverAndRoot(ns) {
-    const seen = new Set(["home"]);
-    const queue = ["home"];
-    // BFS parent of each discovered host, captured for free during the scan already
-    // done here every tick. Stamped into servers.json (via gatherInfo) so pilot.js
-    // can reconstruct a home->target hop path (lib/netpath.js) without re-scanning
-    // the network itself — see docs/plans/pilot-singularity.md phase 2.
-    const parentOf = new Map();
-    const result = [];
-
-    while (queue.length > 0) {
-        const host = queue.shift();
-        for (const next of ns.scan(host)) {
-            if (!seen.has(next)) {
-                seen.add(next);
-                parentOf.set(next, host);
-                queue.push(next);
-            }
-        }
-
-        // home is always rooted and already holds the worker scripts (it's the
-        // copy source). Include it as a normal pool host — buildPool keeps the
-        // safety + manager reserve free on it — so batches and prep use its RAM.
-        // gatherInfo reports maxMoney 0 for home, so classify never targets it.
-        if (host === "home") {
-            result.push(gatherInfo(ns, "home", true, null));
-            continue;
-        }
-
-        const rooted = ns.hasRootAccess(host) || tryRoot(ns, host);
-        // Self-healing provisioning: scp the workers when the host is missing them
-        // (an aug/soft reset wipes copied scripts — file presence re-provisions with
-        // no cache to clear) OR once per controller run (provisionedThisRun): file
-        // presence alone can't tell an up-to-date worker from a STALE one, so a
-        // worker-code change would never reach already-provisioned hosts. The
-        // once-per-run scp overwrites them on every controller (re)start instead.
-        if (rooted && (!ns.fileExists(HACK_WORKER, host) || !provisionedThisRun.has(host))) {
-            provisionWorkers(ns, host);
-            provisionedThisRun.add(host);
-        }
-
-        result.push(gatherInfo(ns, host, rooted, parentOf.get(host) ?? null));
-    }
-
-    return result;
-}
-
-/** Open ports we have crackers for, then nuke. Returns true if rooted. */
-function tryRoot(ns, host) {
-    if (ns.fileExists("BruteSSH.exe", "home")) ns.brutessh(host);
-    if (ns.fileExists("FTPCrack.exe", "home")) ns.ftpcrack(host);
-    if (ns.fileExists("relaySMTP.exe", "home")) ns.relaysmtp(host);
-    if (ns.fileExists("HTTPWorm.exe", "home")) ns.httpworm(host);
-    if (ns.fileExists("SQLInject.exe", "home")) ns.sqlinject(host);
-
-    try {
-        ns.nuke(host);
-    } catch {
-        return false;
-    }
-    return ns.hasRootAccess(host);
-}
-
-/** Copy the workers (HWGW + share) onto a rooted host so it can run them. */
-function provisionWorkers(ns, host) {
-    ns.scp(PLACED_WORKERS, host, "home");
-}
-
-/** Collect static / slow-changing fields for a server. `parent` (this host's BFS
- *  predecessor from home, null for home itself) is stamped purely for pilot.js's
- *  benefit (see lib/netpath.js) — this controller never uses it itself. It is free;
- *  backdoor state deliberately is NOT stamped here (ns.getServer would add ~2 GB
- *  to this controller; pilot checks its few targets itself). */
-function gatherInfo(ns, host, rooted, parent) {
-    return {
-        hostname: host,
-        hasRoot: rooted,
-        parent,
-        portsRequired: ns.getServerNumPortsRequired(host),
-        hackLevelReq: ns.getServerRequiredHackingLevel(host),
-        maxMoney: ns.getServerMaxMoney(host),
-        minSecurity: ns.getServerMinSecurityLevel(host),
-        maxRam: ns.getServerMaxRam(host),
-    };
 }
 
 // ── RAM pool & in-flight accounting ─────────────────────────────────────────
@@ -800,124 +655,6 @@ function teleSummary(target) {
     const gm = s.growMin === Infinity ? "-" : s.growMin.toFixed(2);
     return `tele n=${s.n} off=${s.offSlot} maxErr=${Math.round(s.maxErr)}ms ` +
         `hLow=${s.hackLow} h0=${s.hackZero} wCl=${s.wClamp} gMin=${gm}`;
-}
-
-// ── Manager orchestration ───────────────────────────────────────────────────
-
-/**
- * Launch managers in fixed dependency order. Each tick, find the FIRST manager that is
- * not running and hasn't already been accounted for this run, and if its gate passes,
- * exec it. A later manager is never launched until every earlier one is accounted for,
- * which makes the order "fixed." Checks ns.ps("home") (not just stored state) so a
- * booster restart never double-launches a persistent manager.
- *
- * The "seen running" set lives in the shared flag port (MANAGERS_SEEN_FLAG): a manager
- * booster saw running that is now gone — user-stopped or self-completed (nothing worth
- * buying) — stays down for the rest of the run. Because the port is wiped on aug/soft
- * reset, the managers relaunch and rebuild the wiped infra automatically, even if this
- * booster process survived the reset (no reset detection needed). A suppressed manager
- * is treated as "accounted for" so the loop moves past it to later managers (e.g.
- * hacknet still launches after pserver finishes).
- */
-function launchManagers(ns, servers) {
-    const flags = readFlags(ns);
-    const seen = new Set(flags[MANAGERS_SEEN_FLAG] ?? []);
-    const sizeBefore = seen.size;
-
-    for (const m of MANAGERS) {
-        if (isRunning(ns, m.file)) {
-            seen.add(m.file); // remember it's up so a later disappearance is detectable
-            dbg(`  mgr ${m.file}: running`);
-            continue;
-        }
-        if (seen.has(m.file)) {
-            dbg(`  mgr ${m.file}: SUPPRESSED (seen running earlier this run, now gone)`);
-            continue; // was running, now gone → stopped/done
-        }
-        if (!m.gate(servers, ns)) {
-            // Gate closed = this feature isn't available in this save (e.g. no SF10
-            // for sleeves). Skip to the next manager instead of blocking the chain —
-            // an unavailable dependency must not stall the managers behind it.
-            dbg(`  mgr ${m.file}: gate=closed (skip)`);
-            continue;
-        }
-        const pid = ns.exec(m.file, "home");
-        dbg(`  mgr ${m.file}: gate=open exec pid=${pid}`);
-        // Only mark it accounted-for if the exec actually started a process. exec()
-        // fails silently (returns 0, no exception) when home lacks free RAM at that
-        // instant — e.g. right after a reset, before the reserve has caught up.
-        // Without this check a single failed launch looked like "user stopped it".
-        if (pid !== 0) seen.add(m.file);
-        else ns.print(`WARN: failed to launch ${m.file} (insufficient RAM on home?) — will retry`);
-        break; // launched (or tried, RAM-blocked) one gate-open manager this tick
-    }
-
-    if (seen.size !== sizeBefore) writeFlags(ns, { ...flags, [MANAGERS_SEEN_FLAG]: [...seen] });
-}
-
-/** RAM to reserve on home for the next pending manager, GB. Skips managers that are
- *  running or already accounted for (stopped/done) — none of those will be (re)launched,
- *  so reserving for them would needlessly shrink the worker pool. */
-function nextManagerReserve(ns, servers) {
-    const seen = new Set(readFlags(ns)[MANAGERS_SEEN_FLAG] ?? []);
-    for (const m of MANAGERS) {
-        if (isRunning(ns, m.file)) continue;
-        if (seen.has(m.file)) continue;
-        if (!m.gate(servers, ns)) continue; // gate closed → won't launch → don't reserve for it
-        return ns.getScriptRam(m.file, "home");
-    }
-    return 0; // nothing left to launch → no reserve needed
-}
-
-/** True if a script with this filename is already running on home. */
-function isRunning(ns, file) {
-    const name = stripSlash(file);
-    return ns.ps("home").some((proc) => stripSlash(proc.filename) === name);
-}
-
-/**
- * Hacknet gate: the pserver fleet is fully built — at least serverCount purchased
- * servers, each at or above ramEachGB. Counted from the topology booster already
- * gathered (hostnames starting with PSERVER_PREFIX), so no extra NS calls.
- */
-function pserverFleetBuilt(servers) {
-    const built = servers.filter(
-        (s) => s.hostname.startsWith(PSERVER_PREFIX) && s.maxRam >= HACKNET_GATE.ramEachGB
-    ).length;
-    return built >= HACKNET_GATE.serverCount;
-}
-
-/**
- * Pilot gate: player owns SF4 (ns.singularity.* usable outside BN4) OR the current
- * run IS BitNode 4 (singularity is free there even at SF4 level 0). getResetInfo is
- * a cheap top-level NS call (not under singularity), so this costs nothing extra to
- * check every tick while pilot is still pending. ownedSF is a Map<sfNumber, level>;
- * a present, >0 entry for key 4 means SF4 is active. If the gate can never pass this
- * run (no SF4, not BN4), pilot simply stays "pending" forever — launchManagers logs
- * once (gate=closed) and moves on; later managers behind it in the list still launch.
- * Takes `ns` (unlike the other gates) because it's the only one that needs a live NS
- * call rather than pre-gathered topology data — see launchManagers' `m.gate(servers, ns)`.
- */
-/**
- * Gang gate: a gang is only ever creatable with SF2 owned or inside BN2, and
- * the manager's rep gate needs singularity (pilotGate). Checked without any
- * ns.gang.* reference so the controller pays no gang-API RAM; the manager
- * itself idles in its karma phase until createGang succeeds.
- */
-function gangGate(servers, ns) {
-    const info = ns.getResetInfo();
-    const sf2 = (info.ownedSF.get(2) ?? 0) > 0 || info.currentNode === 2;
-    return sf2 && pilotGate(servers, ns);
-}
-
-function pilotGate(servers, ns) {
-    const info = ns.getResetInfo();
-    const sf4Level = info.ownedSF.get(4) ?? 0;
-    return sf4Level > 0 || info.currentNode === 4;
-}
-function sleeveGate(servers, ns) {
-    const info = ns.getResetInfo();
-    return (info.ownedSF.get(10) ?? 0) > 0 || info.currentNode === 10;
 }
 
 // ── Classification ──────────────────────────────────────────────────────────

@@ -25,11 +25,18 @@ debug bucket was briefly named `share` (`att.share`) and inflated the footprint 
 ## How it works
 
 orbiter is a **fork of booster**. Everything except the planning core is carried
-over unchanged: `discoverAndRoot`/`tryRoot`/`provisionWorkers`, the RAM pool
-(`buildPool`/`placeThreads`), manager orchestration
-(`launchManagers`/`nextManagerReserve`), `sharePhase`, the self-pacing scheduler
-shell (`batchPhase`/`fireBatch`), `selectBatchers` admission + the per-target
-waterfall ramp, and the status table. See [booster.md](booster.md) for those.
+over unchanged. Two carried-over pieces now live in shared libraries that both
+controllers import, so a fix lands once instead of twice:
+
+- `discoverAndRoot`/`tryRoot`/`provisionWorkers` — `src/lib/server-provision.js`
+  (see [server-provision.md](server-provision.md)).
+- The `MANAGERS` list, `launchManagers`, `nextManagerReserve`, `isRunning`, and the
+  gates — `src/lib/manager-launch.js` (see [manager-launch.md](manager-launch.md)).
+
+The rest is still forked in place: the RAM pool (`buildPool`/`placeThreads`),
+`sharePhase`, the self-pacing scheduler shell (`batchPhase`/`fireBatch`),
+`selectBatchers` admission + the per-target waterfall ramp, and the status table.
+See [booster.md](booster.md) for those.
 
 The Formulas core is what differs:
 
