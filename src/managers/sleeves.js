@@ -20,11 +20,10 @@ export const GYM_STAT = { strength: "str", defense: "def", dexterity: "dex", agi
 
 const COMBAT_STATS = ["strength", "defense", "dexterity", "agility"];
 
-/** Crimes considered for karma/money laddering (CrimeType enum values, verified). */
-const CRIME_CANDIDATES = [
-    "Shoplift", "Rob Store", "Mug", "Larceny", "Deal Drugs", "Bond Forgery",
-    "Traffick Arms", "Homicide", "Grand Theft Auto", "Kidnap", "Assassination", "Heist",
-];
+/** Crimes considered for karma/money laddering (CrimeType enum values, verified).
+ *  Limited to the three that grant XP in ALL four combat stats — so laddering also
+ *  trains the sleeve evenly toward the next crime up. Ordered easy→hard. */
+const CRIME_CANDIDATES = ["Mug", "Traffick Arms", "Homicide"];
 
 /** Human-readable dashboard label per ladder row (the `action` head shows this). */
 const ROW_LABEL = {
