@@ -37,6 +37,13 @@ is too scarce to spend on the overlay.
 
 ## How it works
 
+`discoverAndRoot` and the manager launcher now live in shared libraries that
+`booster` and `orbiter` both import: `discoverAndRoot` is in
+`src/lib/server-provision.js` (see `server-provision.md`), and the `MANAGERS` list,
+`launchManagers`, `nextManagerReserve`, `isRunning`, and the gates are in
+`src/lib/manager-launch.js` (see `manager-launch.md`). The behavior below is
+unchanged — the code just has one home now instead of two copies.
+
 The main loop (`main`) each tick:
 
 1. `discoverAndRoot` — BFS from home, root what it can, copy workers onto newly
