@@ -11,8 +11,15 @@ recovery → karma → faction → gym → crime), spends under the shared
 evidence. Sleeves never contend for player focus — they run in parallel with
 pilot and gang, coordinating only through two read-only status peeks (gang's
 karma phase, pilot's worked faction) and one intra-tick rule (one sleeve per
-faction). Gate: `MECHANIC_ENABLE[bn].sleeves && ns.sleeve.getNumSleeves() > 0`;
-publishes status on port 11 (`STATUS_PORT_SLEEVES`).
+faction). Publishes status on port 11 (`STATUS_PORT_SLEEVES`).
+
+**Launch & gate.** Launched by the controller (booster early-game, orbiter once
+Formulas.exe is owned) via its `sleeveGate`: SF10 owned OR currently in BN10. The
+manager itself no-ops a tick when `ns.sleeve.getNumSleeves() === 0` (gate races).
+It is ordered **before gang** in the controller's manager list: sleeves farm the
+karma that forms the gang (row 3), so they're the higher-priority karma producer.
+A closed gate no longer blocks the chain — the controller skips an unavailable
+manager and launches the ones behind it (see `launchManagers` in booster/orbiter).
 
 ## How it works
 
@@ -30,15 +37,32 @@ crime — the only cross-sleeve rule is the faction claim (row 4).
 |---|-----|------------------|-----|
 | 1 | `sync` | `sleeve.sync < SLEEVE_SYNC_MIN` (95) | Sync scales exp transfer to the player and other sleeves **linearly** (`sync/100`, confirmed in game source `Sleeve/Work/Work.ts applySleeveGains`) — every other row's gains are multiplied by it, so it's raised before anything else is worth doing |
 | 2 | `recovery` | `sleeve.shock > SLEEVE_SHOCK_MAX` (90) | Shock also multiplies down gains; only actively recovered when high — low shock is left to decay passively while the sleeve does useful work instead of babysitting it to zero |
-| 3 | `karma` | `ctx.gangKarmaPhase` (gang status `phase === "karma"`) | Sleeves are gang formation's primary karma grinders (Homicide) while the gang plan waits out its karma requirement |
+| 3 | `karma` | `ctx.gangKarmaPhase` (gang status `phase === "karma"`) | Sleeves are gang formation's primary karma grinders while the gang plan waits out its karma requirement (crime chosen by the ladder below, not always Homicide) |
 | 4 | `faction` | `ctx.pilotFaction` set and not yet in `ctx.claimedFactions` | Stacks rep on pilot's current grind target — the single biggest sleeve payoff, since it's the same rep gate gating the run's next aug |
 | 5 | `gym` | any combat stat `< SLEEVE_STAT_FLOOR` (100), lowest stat first | Feeds crime success chance and karma speed for the rows below |
-| 6 | `crime` | fallback | Heist — money and modest stats, no downside |
+| 6 | `crime` | fallback | Money — crime chosen by the ladder below |
 
 `chooseTask(sleeve, ctx)` takes `ctx = { gangKarmaPhase, pilotFaction,
 claimedFactions }` and returns `{ row, crime?, faction?, stat? }`. It is pure
 (no `ns` calls), which is what makes it independently unit-testable in
 `sleeve-selftest.js` without booting the game.
+
+**Chance-aware crime laddering (rows 3 and 6).** `chooseTask` only names the
+*row*; the concrete crime is resolved by the ns-aware `decide()` → `resolveCrime()`
+step in the tick loop (so `chooseTask` stays pure). Candidates are limited to
+**Mug → Traffick Arms → Homicide** — the three crimes that grant XP in all four
+combat stats, so laddering also trains the sleeve evenly toward the next crime up.
+The pure `scoreCrimes(candidates, minChance)` core filters to crimes whose success
+chance ≥ `SLEEVE_CRIME_MIN_CHANCE` (0.5) **first**, then picks the highest expected
+value-per-second (`value × chance / time`, where `value` is karma for row 3, money
+for row 6). If *nothing* clears the chance floor, it returns `{train}` and the sleeve
+diverts to gym on the weakest combat stat — re-evaluated every tick, so it hands
+back to crime as soon as a crime becomes reliable. This is why a fresh low-stat
+sleeve trains or Mugs instead of diving into a 2%-success Homicide. `decide()` is
+applied to both the initial pick and the post-faction-failure re-pick, so neither
+path bypasses laddering. Smart laddering needs **SF4** (`getCrimeStats`) and
+**Formulas.exe** (`crimeSuccessChance`); without both, `resolveCrime` falls back to
+plain Homicide (karma) / Heist (money).
 
 **Why sync goes first, ahead of shock/karma/faction:** sync is a multiplier on
 every downstream gain (exp shared to the player and to other sleeves), so a
