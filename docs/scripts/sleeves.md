@@ -36,11 +36,11 @@ crime — the only cross-sleeve rule is the faction claim (row 4).
 | # | Row | Applicable when | Why |
 |---|-----|------------------|-----|
 | 1 | `sync` | `sleeve.sync < SLEEVE_SYNC_MIN` (95) | Sync scales exp transfer to the player and other sleeves **linearly** (`sync/100`, confirmed in game source `Sleeve/Work/Work.ts applySleeveGains`) — every other row's gains are multiplied by it, so it's raised before anything else is worth doing |
-| 2 | `recovery` | `sleeve.shock > SLEEVE_SHOCK_MAX` (90) | Shock also multiplies down gains; only actively recovered when high — low shock is left to decay passively while the sleeve does useful work instead of babysitting it to zero |
-| 3 | `karma` | `ctx.gangKarmaPhase` (gang status `phase === "karma"`) | Sleeves are gang formation's primary karma grinders while the gang plan waits out its karma requirement (crime chosen by the ladder below, not always Homicide) |
-| 4 | `faction` | `ctx.pilotFaction` set and not yet in `ctx.claimedFactions` | Stacks rep on pilot's current grind target — the single biggest sleeve payoff, since it's the same rep gate gating the run's next aug |
+| 2 | `recovery` | `sleeve.shock > SLEEVE_SHOCK_MAX` (90) | Shock also multiplies down gains, but the manager only recovers it when high — low shock decays on its own while the sleeve does useful work, instead of babysitting it to zero |
+| 3 | `karma` | `ctx.gangKarmaPhase` (gang status `phase === "karma"`) | Sleeves are gang formation's primary karma grinders while the gang plan waits out its karma requirement. `resolveCrime` picks the action below (Homicide, or gym-train toward it) |
+| 4 | `faction` | `ctx.pilotFaction` set and not yet in `ctx.claimedFactions` | Stacks rep on pilot's current grind target — the single biggest sleeve payoff, because it is the same rep gate that gates the run's next aug |
 | 5 | `gym` | any combat stat `< SLEEVE_STAT_FLOOR` (100), lowest stat first | Feeds crime success chance and karma speed for the rows below |
-| 6 | `crime` | fallback | Money — crime chosen by the ladder below |
+| 6 | `crime` | fallback | `resolveCrime` picks the action below (Homicide, or gym-train toward it) for money and karma |
 
 `chooseTask(sleeve, ctx)` takes `ctx = { gangKarmaPhase, pilotFaction,
 claimedFactions }` and returns `{ row, crime?, faction?, stat? }`. It is pure
@@ -48,8 +48,8 @@ claimedFactions }` and returns `{ row, crime?, faction?, stat? }`. It is pure
 `sleeve-selftest.js` without booting the game.
 
 **Crime rows: train up to Homicide (rows 3 and 6).** `chooseTask` only names the
-*row*; the concrete action is resolved by the ns-aware `decide()` → `resolveCrime()`
-step in the tick loop (so `chooseTask` stays pure). The target crime is always
+*row* — the concrete action is resolved by the ns-aware `decide()` → `resolveCrime()`
+step in the tick loop, so `chooseTask` stays pure. The target crime is always
 **Homicide** — best karma, good money, and it trains all four combat stats. If the
 sleeve's Homicide success chance is below `SLEEVE_CRIME_MIN_CHANCE` (0.5),
 `resolveCrime` returns `{train}` and the sleeve **gym-trains its weakest combat
@@ -57,8 +57,9 @@ stat** instead. Gym XP is far faster than grinding low-tier crimes, so the sleev
 trains straight up to a viable Homicide rather than laddering through Mug/Traffick
 Arms. Re-evaluated every tick, so it flips to Homicide the moment the chance clears
 the floor. `decide()` is applied to both the initial pick and the post-faction-failure
-re-pick, so neither path bypasses the train-up. Needs **Formulas.exe**
-(`crimeSuccessChance`); without it, `resolveCrime` commits Homicide blind.
+re-pick, so neither path bypasses the train-up. Smart selection needs
+**Formulas.exe** (`crimeSuccessChance`). Without it, `resolveCrime` commits
+Homicide blind.
 
 **Why sync goes first, ahead of shock/karma/faction:** sync is a multiplier on
 every downstream gain (exp shared to the player and to other sleeves), so a
@@ -75,14 +76,14 @@ target (pilot works one faction at a time), so absent coordination every idle
 sleeve would try to grind the same faction, wasting all but one sleeve's rep
 (the game doesn't stack multiple sleeves' rep gains on one target usefully
 beyond the first). The loop tracks `claimedFactions` as a `Set` built fresh
-each tick; the first sleeve to reach row 4 claims the faction, every
-subsequent sleeve's `chooseTask` sees it already claimed and falls through to
+each tick. The first sleeve to reach row 4 claims the faction, and every
+later sleeve's `chooseTask` sees it already claimed and falls through to
 row 5/6. If the *claiming* sleeve's `setToFactionWork` call itself fails
 (returns falsy — `undefined` when the faction doesn't offer that work type),
-the loop still adds the faction to `claimedFactions` before re-choosing for
-that same sleeve, so a failed claim can't be retried forever by the same
-sleeve or picked up speculatively by a later one; the sleeve falls through to
-whatever row applies next. `applyTask`'s faction case itself tries
+the loop still adds the faction to `claimedFactions` before it re-chooses for
+that same sleeve. So a failed claim can't be retried forever by the same
+sleeve, nor picked up speculatively by a later one — the sleeve falls through
+to whatever row applies next. `applyTask`'s faction case itself tries
 `["field", "hacking", "security"]` work types in order until one is accepted,
 so a "failure" only happens when a faction offers none of the three.
 
@@ -102,7 +103,7 @@ kinds. Three paths, tried cheapest-first within a purchase kind and in this
 fixed order:
 
 1. **Buy a sleeve** (`purchaseSleeve()`, BN10 only) — `getSleeveCost()`
-   checked against remaining budget; the call is a no-op (returns falsy, no
+   checked against remaining budget. The call is a no-op (returns falsy, no
    throw) outside BN10, so no separate BN-check is needed.
 2. **Cheapest memory upgrade** across all sleeves — one point of
    `upgradeMemory(i, 1)` on whichever sleeve has the lowest
@@ -118,7 +119,7 @@ sleeve, or an expensive aug) could otherwise consume the whole tick's budget
 and starve several smaller, equally valuable wins. Augs reset a sleeve's raw
 stats to 0 on purchase (its multipliers apply immediately, per the spec) —
 expect a sleeve to drop right back into the sync/gym rows the tick after an
-aug buy; this is expected ladder behavior, not a bug.
+aug buy. This is expected ladder behavior, not a bug.
 
 **Cross-manager context (`gatherContext`).** A single read-only peek per
 tick at two other managers' status ports (`STATUS_PORT_GANG`,
@@ -190,7 +191,7 @@ decision core without needing a live sleeve to exist.
 - **Log-based verification over dashboard eyeballing:** with multiple
   sleeves independently landing on different rows plus one cross-sleeve rule,
   a snapshot dashboard view can't prove the fallthrough or thrash-guard logic
-  actually fired correctly over time; a grep-able event log can.
+  actually fired correctly over time. A grep-able event log can.
 
 ## Dropped rows (deliberately out of scope for this build)
 
@@ -223,7 +224,7 @@ a new row slotted in and a new status field read.
 - **Maintaining shock at 0 continuously** instead of only recovering above a
   threshold — rejected: shock decays passively at low levels, so actively
   fighting it there wastes ladder priority that could go to karma/faction/
-  crime; the 90 ceiling only intervenes once it's actually hurting gains.
+  crime. The 90 ceiling only intervenes once shock is actually hurting gains.
 - **Batching aug purchases into one multi-aug transaction per tick** —
   rejected in favor of one cheapest-affordable aug per tick: simpler spend
   accounting under the shared cap, and re-reading live prices each tick
