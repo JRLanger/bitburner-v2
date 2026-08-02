@@ -16,12 +16,16 @@ extraction via HWGW batching:
   whole fleet is engaged and pool RAM still sits idle, trading efficiency for
   absolute income.
 
-- **Manager orchestration** launches the pserver/contracts/pilot/lifecycle/gang/
-  hacknet managers on home, in a fixed dependency order, once each one's gate passes.
-  `pilot` and `lifecycle` gate on `pilotGate` (SF4 owned or currently in BitNode 4);
-  `gang` gates on `gangGate` (SF2 owned or currently BN2, plus `pilotGate` for its
-  rep-gate singularity calls) — both use only a live `getResetInfo`, so the
-  controller pays no gang-API RAM.
+- **Manager orchestration** launches the pserver/contracts/pilot/lifecycle/sleeve/
+  gang/hacknet managers on home, in a fixed priority order, one per tick, once each
+  one's gate passes. `pilot` and `lifecycle` gate on `pilotGate` (SF4 owned or
+  currently in BitNode 4). `gang` gates on `gangGate` (SF2 owned or currently BN2,
+  plus `pilotGate` for its rep-gate singularity calls). `sleeve` gates on `sleeveGate`
+  (SF10 owned or currently BN10). All gates use only a live `getResetInfo`, so the
+  controller pays no gang-API or sleeve-API RAM. `sleeve` sits before `gang` because
+  sleeves farm the karma that forms the gang, so they are the higher-priority karma
+  producer. A manager whose gate is closed is **skipped**, not blocked — an
+  unavailable feature no longer stalls the managers behind it.
 
 It also writes `/data/servers.json` (topology for managers — now including each host's
 BFS `parent`, stamped for free during discovery so `pilot` can reconstruct backdoor
@@ -39,15 +43,16 @@ The main loop (`main`) each tick:
    rooted hosts once. **home is included as a rooted pool host** (it already holds
    the worker scripts, being the copy source) with `maxMoney 0` so `classify` never
    targets it for hacking — only its RAM is used.
-2. `launchManagers` — exec's the first not-yet-running manager (pserver →
-   contracts → hacknet, fixed order) on home, if its gate passes. pserver leads
-   because it buys the RAM everything else runs on, and — since only the FIRST
-   pending manager is ever considered — its small footprint (5.85 GB) can't block
-   the chain on a tiny early home the way contracts (16.8 GB) could when it led
-   the order. `nextManagerReserve`
-   (called just before this) returns the RAM the *next* pending manager needs, fed
-   into `buildPool` below so that headroom is walled off from workers before they
-   can claim it.
+2. `launchManagers` — exec's the first not-yet-running, gate-open manager (pserver →
+   contracts → pilot → lifecycle → sleeve → gang → hacknet, fixed order) on home,
+   one per tick. pserver leads because it buys the RAM everything else runs on, and
+   its small footprint (5.85 GB) can't block the chain on a tiny early home the way
+   contracts (16.8 GB) could when it led the order. A manager whose gate is **closed**
+   is skipped so it never blocks the ones behind it. A gate-open manager that can't
+   fit home RAM yet is retried next tick, not skipped. `nextManagerReserve`
+   (called just before this) returns the RAM the *next* gate-open pending manager
+   needs, fed into `buildPool` below so that headroom is walled off from workers
+   before they can claim it.
 3. `buildPool` — one entry per rooted host with free RAM, largest-first; home
    keeps the safety buffer **plus the next pending manager's RAM reservation** free,
    and contributes the rest to the pool.
