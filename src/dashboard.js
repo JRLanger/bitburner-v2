@@ -361,15 +361,26 @@ function gangStats(g) {
     ];
 }
 
-/** Sleeve stat pairs: shock/sync averages, per-sleeve task tally, and spend. */
+/** Readable label per sleeve ladder row (matches the manager's action labels). */
+const SLEEVE_ROW_LABEL = {
+    sync: "synchronizing", recovery: "shock recovery", karma: "karma farming",
+    faction: "faction work", gym: "training", crime: "crime",
+};
+
+/** Sleeve stat pairs: shock/sync averages, a readable per-row breakdown (non-zero
+ *  rows only), and spend. */
 function sleeveStats(s) {
     if (!s) return [];
     const t = s.tasks || {};
+    const doing = Object.entries(t)
+        .filter(([, c]) => c > 0)
+        .map(([row, c]) => `${c} ${SLEEVE_ROW_LABEL[row] ?? row}`)
+        .join(", ") || "idle";
     return [
         ["count", fmtCount(s.count)],
         ["shock", `${s.avgShock ?? 0}%`],
         ["sync", `${s.avgSync ?? 0}%`],
-        ["tasks", `sync${t.sync ?? 0} rec${t.recovery ?? 0} karma${t.karma ?? 0} fac${t.faction ?? 0} gym${t.gym ?? 0} crime${t.crime ?? 0}`],
+        ["doing", doing],
         ["spent", fmtMoney(s.spentThisRun)],
     ];
 }
